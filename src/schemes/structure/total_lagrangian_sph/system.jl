@@ -84,7 +84,7 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
 """
 struct TotalLagrangianSPHSystem{BM, NDIMS, ELTYPE <: Real, IC, ARRAY1D, ARRAY2D, ARRAY3D,
                                 YM, PR, LL, LM, K, PF, V, ST, M, IM, NHS,
-                                C} <: AbstractStructureSystem{NDIMS}
+                                C, temp, temp_ref} <: AbstractStructureSystem{NDIMS}
     initial_condition   :: IC
     initial_coordinates :: ARRAY2D # Array{ELTYPE, 2}: [dimension, particle]
     # `current_coordinates` contains `u` plus coordinates of the fixed particles
@@ -93,6 +93,7 @@ struct TotalLagrangianSPHSystem{BM, NDIMS, ELTYPE <: Real, IC, ARRAY1D, ARRAY2D,
     correction_matrix        :: ARRAY3D # Array{ELTYPE, 3}: [i, j, particle]
     pk1_rho2                 :: ARRAY3D # PK1 corrected divided by rho^2: [i, j, particle]
     deformation_grad         :: ARRAY3D # Array{ELTYPE, 3}: [i, j, particle]
+    #deformation_grad_init    :: ARRAY3D # Array{ELTYPE, 3}: [i, j, particle]
     material_density         :: ARRAY1D # Array{ELTYPE, 1}: [particle]
     n_integrated_particles   :: Int64
     young_modulus            :: YM
@@ -110,10 +111,20 @@ struct TotalLagrangianSPHSystem{BM, NDIMS, ELTYPE <: Real, IC, ARRAY1D, ARRAY2D,
     clamped_particles_moving :: IM
     self_interaction_nhs     :: NHS
     cache                    :: C
+    beta                     :: Float64
+    alpha                    :: Float64
+    temp                     :: temp
+    temp_ref                 :: temp_ref
+    cp                       :: Float64
+    k                        :: Float64      
+    temp_liq                 :: Float64
+    h                        :: Float64
+    hardening                :: Float64
+    tmelt                    :: Float64
 end
 
 function TotalLagrangianSPHSystem(initial_condition, smoothing_kernel, smoothing_length,
-                                  young_modulus, poisson_ratio;
+                                  young_modulus, poisson_ratio, beta ,alpha, temp, temp_ref, cp, k, temp_liq,h,hardening,tmelt;
                                   n_clamped_particles=0,
                                   clamped_particles=Int[],
                                   clamped_particles_motion=nothing,
@@ -158,22 +169,31 @@ function TotalLagrangianSPHSystem(initial_condition, smoothing_kernel, smoothing
         initial_condition_sorted = deepcopy(initial_condition)
         young_modulus_sorted = copy(young_modulus)
         poisson_ratio_sorted = copy(poisson_ratio)
+        beta_sorted = copy(beta)
+        alpha_sorted = copy(alpha)
         move_particles_to_end!(initial_condition_sorted, clamped_particles)
         move_particles_to_end!(young_modulus_sorted, clamped_particles)
         move_particles_to_end!(poisson_ratio_sorted, clamped_particles)
+        move_particles_to_end!(beta_sorted, clamped_particle)
+        move_particles_to_end!(alpha_sorted, clamped_particles)
     else
         initial_condition_sorted = initial_condition
         young_modulus_sorted = young_modulus
         poisson_ratio_sorted = poisson_ratio
+        beta_sorted = beta
+        alpha_sorted = alpha
     end
 
     initial_coordinates = copy(initial_condition_sorted.coordinates)
     current_coordinates = copy(initial_condition_sorted.coordinates)
     mass = copy(initial_condition_sorted.mass)
     material_density = copy(initial_condition_sorted.density)
+    temp = fill(temp, n_particles)
+    temp_ref = fill(temp_ref, n_particles)
     correction_matrix = Array{ELTYPE, 3}(undef, NDIMS, NDIMS, n_particles)
     pk1_rho2 = Array{ELTYPE, 3}(undef, NDIMS, NDIMS, n_particles)
     deformation_grad = Array{ELTYPE, 3}(undef, NDIMS, NDIMS, n_particles)
+    # deformation_grad_init = Array{ELTYPE, 3}(undef, NDIMS, NDIMS, n_particles)
 
     n_integrated_particles = n_particles - n_clamped_particles
 
@@ -197,7 +217,8 @@ function TotalLagrangianSPHSystem(initial_condition, smoothing_kernel, smoothing
                                     smoothing_length, acceleration_, boundary_model,
                                     penalty_force, viscosity, source_terms,
                                     clamped_particles_motion, ismoving,
-                                    self_interaction_nhs, cache)
+                                    self_interaction_nhs, cache, beta_sorted ,alpha_sorted, temp, temp_ref, cp, k, temp_liq,
+                                    h,hardening,tmelt)
 end
 
 # Initialize self-interaction neighborhood search if not provided by the user
@@ -259,7 +280,8 @@ function initialize_self_interaction_nhs(system::TotalLagrangianSPHSystem,
                                     system.viscosity, system.source_terms,
                                     system.clamped_particles_motion,
                                     system.clamped_particles_moving,
-                                    self_interaction_nhs, system.cache)
+                                    self_interaction_nhs, system.cache, system.beta, system.alpha, system.temp, system.temp_ref,
+                                    system.cp, system.k, system.temp_liq, system.h, system.hardening, system.tmelt)
 end
 
 extract_periodic_box(::Nothing) = nothing
@@ -458,11 +480,266 @@ end
     end
 end
 
+@inline function update_properties!(system, semi)
+    (; b, temp, temp_ref, young_modulus, poisson_ratio, hardening, Tmelt, alpha, viscosity) = system
+    young_modulus_min = 10
+    poisson_ratio_min = 0.1
+    hardening_min = 0.0
+    H = 1/(Tmelt-temp_ref)         #thermal softening modulus
+    young_modulus= max(young_modulus_min, young_modulus * (1 - H*(temp-temp_ref) )  )
+    poisson_ratio= max(poisson_ratio_min, poisson_ratio * (1 - H*(temp-temp_ref) )  )
+    hardening = max(hardening_min, hardening*(1 - H*(temp-temp_ref) )*alpha)
+    E=100000
+    R=8.314
+    viscosity = viscosity.*exp(E/R*temp)
+end
+
+@inline function update_temperature_sph!(system, dt, ext_heat ,particle_spacing, bound_coordinate, semi)
+    # Unpack system properties
+    (; mass, material_density, temp, temp_ref, cp, k, current_coordinates) = system
+
+    # Temporary storage for ΔT
+    dT = zeros(length(temp_ref))
+
+    dx = particle_spacing
+
+    for i in 1:length(temp)
+        if current_coordinates[1,i] < bound_coordinate
+            dq = ext_heat   # W/m²
+            dT[i] += dq / (material_density[i] * cp * dx)
+        end
+    end
+
+    # Loop over all particles and neighbors (SPH)
+    initial_coords = initial_coordinates(system)
+    foreach_point_neighbor(system, system, initial_coords, initial_coords,
+                           semi) do particle, neighbor, r, initial_distance2
+
+
+        # Particle volumes
+        rho = material_density[1]
+        volume = @inbounds mass[neighbor] / rho
+
+        ##artificial thermal diffusion to reduce oscillations
+        temp[particle] += 0.005 * (temp[neighbor] - temp[particle])
+
+        # Distance vector
+
+        @views r_vec =
+            current_coordinates[:, particle] .-
+            current_coordinates[:, neighbor]     
+            
+        r_vec = convert.(eltype(system), r_vec)
+
+        initial_distance2 = TrixiParticles.dot(r_vec, r_vec)
+        
+        initial_distance2 < eps(smoothing_length^2) && return
+        r = sqrt(initial_distance2)
+
+        # Kernel gradient
+        grad_kernel = smoothing_kernel_grad(system, r_vec,
+                                            r, particle)
+
+        # # Multiply by correction matrix (optional, improves consistency)
+        #L = @inbounds correction_matrix(system, particle)
+
+        # gradW = L' * grad_kernel   # corrected gradient
+        
+        gradW = grad_kernel
+    
+        _eps = 1e-3                # regularisation factor
+        h2 = system.smoothing_length^2
+        r2= initial_distance2 + _eps * h2
+
+        val = TrixiParticles.dot(r_vec, gradW)
+
+        if val > 0
+            @warn "Positive r·∇W detected" val
+        end
+
+        flux = volume * k / (rho * cp) *
+                        (temp[neighbor] - temp[particle]) *
+                        val /(r2)
+
+        dT[particle] += flux
+        
+
+    end
+
+    println("max dT = ", maximum(abs.(dT)))
+    println("nonzero dT count = ", count(!iszero, dT))
+
+    # # Update temperature with flux limiter
+    dT_max = 0.1
+    @inbounds for i in 1:length(temp)
+        temp_ref = temp[i]
+
+        temp[i] += dt * dT[i]
+
+        dT_act = temp[i] - temp_ref
+        if abs(dT_act) > dT_max
+            temp[i] = temp_ref + sign(dT_act) * dT_max
+        end
+    end
+    
+    #println("dE = ", sum(dT .* mass ./ material_density))
+
+    return temp
+end
+
+@inline function thermomechanical_loop(system, temp_mold, gap ,particle_spacing, bound_coordinate ,dt, semi)
+    (;temp_liq, temp, h) = system
+    
+    update_properties!(system, semi)
+
+    gap = gap - 0.1*dt
+    
+    update_v_x(system, dt, gap ,particle_spacing ,temp_liq, semi)
+
+    if gap > 0
+        q = 0
+        update_temperature_sph!(system, dt, q ,particle_spacing, bound_coordinate, semi)
+    else
+        q = h*(temp_mold-temp)
+        update_temperature_sph!(system, dt, q ,particle_spacing, bound_coordinate, semi)
+    end
+
+end
+
+
+@inline function update_v_x(system, dt, gap, particle_spacing ,temp_liq, semi)
+    (;mass, current_coordinates, temp, velocity, young_modulus) = system
+
+    if temp > temp_liq
+        stress = viscous_stress!(system,semi)
+    else
+        stress = elastic_stress!(system,dt,semi)
+    end
+
+    k_n = 5.0 * young_modulus / particle_spacing
+
+    momentum(system, gap, k_n ,stress, semi)
+
+    velocity += dt .* acceleration
+    current_coordinates += dt.* velocity
+end
+
+@inline function momentum(system, gap, k_n, stress, semi)
+    (;mass, material_density, current_coordinates, velocity, acceleration) = system
+
+    _acceleration = zeros(eltype(system), size(current_coordinates,1), size(current_coordinates,2))
+
+    foreach_point_neighbor(system, system, initial_coords, initial_coords,semi) do particle, neighbor, r, initial_distance2
+
+        @views r_vec =
+            current_coordinates[:, particle] .-
+            current_coordinates[:, neighbor]     
+            
+        r_vec = convert.(eltype(system), r_vec)
+
+        initial_distance2 = TrixiParticles.dot(r_vec, r_vec)
+        
+        initial_distance2 < eps(smoothing_length^2) && return
+        r = sqrt(initial_distance2)
+
+        # Kernel gradient
+        grad_kernel = smoothing_kernel_grad(system, r_vec,
+                                            r, particle)
+        gradW = grad_kernel
+
+        _acceleration = mass[neighbor] *
+            (stress[:,:,particle] / material_density[particle]^2 + stress[:,:,neighbor] / material_density[neighbor]^2) * gradW
+
+    end
+
+    if gap < 0.0
+        normal = SVector(0.0, 0.0, -1.0)   #top_mold
+        @threaded semi for particle in eachparticle(system)
+            gamma_n = 2 * sqrt(k_n * mass[particle])
+            f_contact = -k_n * gap * normal
+            f_contact -= gamma_n * dot(velocity[:,particle], normal) * normal
+            _acceleration[:,particle] .+= f_contact / mass[particle]
+        end
+    end
+    
+    acceleration = _acceleration
+    return acceleration
+end
+
+@inline function viscous_stress!(system, semi)
+    (; deformation_grad, viscosity, young_modulus, poisson_ratio) = system
+
+    v_vis = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2)
+                    ,size(deformation_grad,3))
+    F,b,d = calc_deformation_grad!(deformation_grad, system, semi)
+    J= sqrt(det(b))
+    K = young_modulus/(3-6*poisson_ratio)
+    dev_d = d - 1/2* (tr(d))*I
+
+    @threaded semi for particle in eachparticle(system)
+        for j in 1:ndims(system), i in 1:ndims(system)
+            # Precompute PK1 / rho^2 to avoid repeated divisions in the interaction loop
+            @inbounds v_vis[i, j, particle] = K*log(J)+2*viscosity[particle]*dev_d[i, j, particle]
+        end
+    end
+
+    return v_vis
+end
+
+@inline function elastic_stress!(system,dt ,semi)
+    (; deformation_grad, viscosity,young_modulus,hardening,poisson_ratio,alpha) = system
+
+    v_elas = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2)
+                    ,size(deformation_grad,3))
+    F,b,d = calc_deformation_grad!(deformation_grad, system, semi)
+    
+    be_bar = zeros(eltype(system), size(b,1), size(b,2),size(b,3))
+    J= det(F)
+    mu = young_modulus/(2+2*poisson_ratio)
+    K = young_modulus/(3-6*poisson_ratio)
+    dev_b = b - 1/2* (tr(b))*I
+
+
+    @threaded semi for particle in eachparticle(system)
+        for j in 1:ndims(system), i in 1:ndims(system)
+            # Precompute PK1 / rho^2 to avoid repeated divisions in the interaction loop
+            @inbounds v_elas[i, j, particle] = K*log(J)+mu*dev_b[i, j, particle]
+        end
+    end
+    
+    yf = sqrt(1.5)*sqrt(sum((v_elas- 1/2* (tr(v_elas))*I).^ 2))- (young_modulus-hardening)
+
+    if yf >0
+        strain_rate = yf./viscosity[:]
+        #dp = strain_rate .* (dev_b) ./ det(dev_b)
+        be_bar = b/(sqrt(det(b)))^(2/3)   ##iso_choric b
+        be_bar = strain_rate.*be_bar  ##
+        be_bar = (sqrt(det(be_bar)))^(2/3)*be_bar
+        be_bar = be_bar - 1/2* (tr(be_bar))*I
+        J_e = sqrt(det(be_bar))
+        alpha_dot = strain_rate
+        alpha = alpha + alpha_dot*dt
+
+        @threaded semi for particle in eachparticle(system)
+            for j in 1:ndims(system), i in 1:ndims(system)
+                # Precompute PK1 / rho^2 to avoid repeated divisions in the interaction loop
+                @inbounds v_elas[i, j, particle] = K*log(J_e)+mu*be_bar[i, j, particle]
+            end
+        end
+    end
+    return v_elas
+end
+    
+
 @inline function calc_deformation_grad!(deformation_grad, system, semi)
-    (; mass, material_density) = system
+    (;deformation_grad, velocity) = system
 
     # Reset deformation gradient
     set_zero!(deformation_grad)
+    velocity_grad = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2)
+                    ,size(deformation_grad,3))
+    # # Reset deformation gradient_init
+    # set_zero!(deformation_grad_init)
 
     # Loop over all pairs of particles and neighbors within the kernel cutoff
     initial_coords = initial_coordinates(system)
@@ -477,6 +754,7 @@ end
                               current_coords(system, neighbor)
         # On GPUs, convert `Float64` coordinates to `Float32` after computing the difference
         pos_diff = convert.(eltype(system), pos_diff_)
+        vel_diff = current_velocity(velocity, system, particle) - current_velocity(velocity, system, neighbor)
 
         grad_kernel = smoothing_kernel_grad(system, initial_pos_diff,
                                             initial_distance, particle)
@@ -485,13 +763,26 @@ end
         L = @inbounds correction_matrix(system, particle)
 
         result = volume * pos_diff * grad_kernel' * L'
+        result_v = volume * vel_diff * grad_kernel' * L'
 
         for j in 1:ndims(system), i in 1:ndims(system)
             @inbounds deformation_grad[i, j, particle] -= result[i, j]
+            @inbounds velocity_grad[i,j,particle] -= result_v[i,j]
         end
+
+        F = deformation_grad[:,:,i]
+        b = F * transpose(F)
+
+        L = velocity_grad[:,:,i]
+        d = 0.5 * (L + L')
+
+        # I3 = Matrix{Float64}(I, ndims(system), ndims(system))
+        # @inbounds deformation_grad_init[:, :, particle] = (1 + alpha[particle] * (temp-temp_ref)) * I3
+        # @inbounds deformation_grad[:, :, particle] = deformation_grad[:, :, particle] * deformation_grad_init[:, :, particle]
+
     end
 
-    return deformation_grad
+    return deformation_grad,b,d
 end
 
 # First Piola-Kirchhoff stress tensor
@@ -593,7 +884,7 @@ end
 # Otherwise, `@threaded` does not work here with Julia ARM on macOS.
 # See https://github.com/JuliaSIMD/Polyester.jl/issues/88.
 @inline function von_mises_stress(system, particle::Integer)
-    F = deformation_gradient(system, particle)
+    F,b,d = deformation_gradient(system, particle)
     J = det(F)
     P = pk1_rho2(system, particle) * system.material_density[particle]^2
     sigma = (1.0 / J) * P * F'
@@ -624,6 +915,24 @@ function cauchy_stress(system::TotalLagrangianSPHSystem)
     end
 
     return cauchy_stress_tensors
+end
+
+function kirchhoff_stress(system::TotalLagrangianSPHSystem)
+    NDIMS = ndims(system)
+
+    kirchhoff_stress_tensors = zeros(eltype(system.pk1_rho2), NDIMS, NDIMS,
+                                  nparticles(system))
+
+    @threaded default_backend(kirchhoff_stress_tensors) for particle in
+                                                         each_integrated_particle(system)
+        F = deformation_gradient(system, particle)
+        J = det(F)
+        P = pk1_rho2(system, particle) * system.material_density[particle]^2
+        sigma = (1.0 / J) * P * F'
+        kirchhoff_stress_tensors[:, :, particle] = sigma
+    end
+
+    return kirchhoff_stress_tensors
 end
 
 function calculate_dt(v_ode, u_ode, cfl_number, system::TotalLagrangianSPHSystem, semi)
