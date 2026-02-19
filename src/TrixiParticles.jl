@@ -67,7 +67,7 @@ export Semidiscretization, semidiscretize, restart_with!
 export InitialCondition
 export WeaklyCompressibleSPHSystem, EntropicallyDampedSPHSystem, TotalLagrangianSPHSystem,
        WallBoundarySystem, DEMSystem, BoundaryDEMSystem, OpenBoundarySystem,
-       ImplicitIncompressibleSPHSystem
+       ImplicitIncompressibleSPHSystem, thermomechanical_loop, eachparticle, update_temperature_sph!
 export BoundaryZone, InFlow, OutFlow, BidirectionalFlow
 export InfoCallback, SolutionSavingCallback, DensityReinitializationCallback,
        PostprocessCallback, StepsizeCallback, UpdateCallback, SteadyStateReachedCallback,

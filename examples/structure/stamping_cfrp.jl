@@ -16,196 +16,190 @@ using TrixiParticles
 using OrdinaryDiffEq
 # ==========================================================================================
 
-@inline initial_coordinates(system::TotalLagrangianSPHSystem) = system.initial_coordinates
+# @inline initial_coordinates(system::TotalLagrangianSPHSystem) = system.initial_coordinates
 
-@inline system_smoothing_kernel(system) = system.smoothing_kernel
+# @inline system_smoothing_kernel(system) = system.smoothing_kernel
 
-@inline function _smoothing_length(system, particle)
-    return system.smoothing_length
-end
+# @inline function _smoothing_length(system, particle)
+#     return system.smoothing_length
+# end
 
-@inline system_correction(system) = nothing
+# @inline system_correction(system) = nothing
 
-@inline function current_coordinates(u, system::TotalLagrangianSPHSystem)
-    return system.current_coordinates
-end
+# @inline function current_coordinates(u, system::TotalLagrangianSPHSystem)
+#     return system.current_coordinates
+# end
 
-@inline normalization_factor(::WendlandC2Kernel{2}, h) = 7 / (pi * h^2 * 4)
+# @inline normalization_factor(::WendlandC2Kernel{2}, h) = 7 / (pi * h^2 * 4)
 
-@inline function kernel_deriv(kernel::WendlandC2Kernel, r::Real, h)
-    inner_deriv = 1 / h
-    q = r * inner_deriv
+# @inline function kernel_deriv(kernel::WendlandC2Kernel, r::Real, h)
+#     inner_deriv = 1 / h
+#     q = r * inner_deriv
 
-    result = -5 * (1 - q / 2)^3 * q
+#     result = -5 * (1 - q / 2)^3 * q
 
-    # Zero out result if q >= 2
-    result = ifelse(q < 2,
-                    normalization_factor(kernel, h) * result * inner_deriv, zero(q))
+#     # Zero out result if q >= 2
+#     result = ifelse(q < 2,
+#                     normalization_factor(kernel, h) * result * inner_deriv, zero(q))
 
-    return result
-end
+#     return result
+# end
 
-@inline function kernel_grad(kernel, pos_diff, distance, h)
-    # For `distance == 0`, the analytical gradient is zero, but the code divides by zero.
-    # To account for rounding errors, we check if `distance` is almost zero.
-    # Since the coordinates are in the order of the smoothing length `h`,
-    # `distance^2` is in the order of `h^2`, hence the comparison `distance^2 < eps(h^2)`.
-    # Note that this is faster than `distance < sqrt(eps(h^2))`.
-    # Also note that `sqrt(eps(h^2)) != eps(h)`.
-    distance^2 < eps(h^2) && return zero(pos_diff)
+# @inline function kernel_grad(kernel, pos_diff, distance, h)
+#     # For `distance == 0`, the analytical gradient is zero, but the code divides by zero.
+#     # To account for rounding errors, we check if `distance` is almost zero.
+#     # Since the coordinates are in the order of the smoothing length `h`,
+#     # `distance^2` is in the order of `h^2`, hence the comparison `distance^2 < eps(h^2)`.
+#     # Note that this is faster than `distance < sqrt(eps(h^2))`.
+#     # Also note that `sqrt(eps(h^2)) != eps(h)`.
+#     distance^2 < eps(h^2) && return zero(pos_diff)
+#     # q = distance / h
+#     # if q >= 2
+#     #     return zero(pos_diff)
+#     # end
 
-    return kernel_deriv(kernel, distance, h) / distance * pos_diff
-end
+#     return kernel_deriv(kernel, distance, h) / distance * pos_diff
+# end
 
-@inline function corrected_kernel_grad(kernel, pos_diff, distance, h, correction, system,
-                                       particle)
-    return kernel_grad(kernel, pos_diff, distance, h)
-end
+# @inline function corrected_kernel_grad(kernel, pos_diff, distance, h, correction, system,
+#                                        particle)
+#     return kernel_grad(kernel, pos_diff, distance, h)
+# end
 
-@inline function smoothing_kernel_grad(system, pos_diff, distance, particle)
-    return corrected_kernel_grad(system_smoothing_kernel(system), pos_diff,
-                                 distance, _smoothing_length(system, particle),
-                                 system_correction(system), system, particle)
-end
+# @inline function smoothing_kernel_grad(system, pos_diff, distance, particle)
+#     return corrected_kernel_grad(system_smoothing_kernel(system), pos_diff,
+#                                  distance, _smoothing_length(system, particle),
+#                                  system_correction(system), system, particle)
+# end
 
-Base.@propagate_inbounds function correction_matrix(system, particle)
-    extract_smatrix(system.correction_matrix, system, particle)
-end
+# Base.@propagate_inbounds function correction_matrix(system, particle)
+#     extract_smatrix(system.correction_matrix, system, particle)
+# end
 
-@inline function update_temperature_sph!(system, dt, particle_spacing, x_heater,
-    T_heater,h , semi)
-    # Unpack system properties
-    (; mass, material_density, temp, temp_ref, cp, k, current_coordinates) = system
+# @inline function update_temperature_sph!(system, dt, particle_spacing, x_heater,
+#     T_heater,h , semi)
+#     # Unpack system properties
+#     (; mass, material_density, temp, temp_ref, cp, k, current_coordinates) = system
 
-    # Temporary storage for ΔT
-    dT = zeros(length(temp_ref))
+#     # Temporary storage for ΔT
+#     dT = zeros(length(temp_ref))
 
-    dx = particle_spacing
+#     dx = particle_spacing
 
-    for i in 1:length(temp)
-        if current_coordinates[1,i] < x_heater
-            dq = 5e4   # W/m²
-            dT[i] += dq / (material_density[i] * cp * dx)
-        end
-    end
+#     for i in 1:length(temp)
+#         if current_coordinates[1,i] < x_heater
+#             dq = 5e4   # W/m²
+#             dT[i] += dq / (material_density[i] * cp * dx)
+#         end
+#     end
 
-    # Loop over all particles and neighbors (SPH)
-    initial_coords = initial_coordinates(system)
-    TrixiParticles.PointNeighbors.foreach_point_neighbor(system, system, initial_coords, initial_coords,
-                           semi) do particle, neighbor, r, initial_distance2
+#     # Loop over all particles and neighbors (SPH)
+#     initial_coords = initial_coordinates(system)
+#     TrixiParticles.PointNeighbors.foreach_point_neighbor(system, system, initial_coords, initial_coords,
+#                            semi) do particle, neighbor, r, initial_distance2
 
-        # Skip zero distance (same particle)
-        #initial_distance^2 < eps(system.smoothing_length^2) && return
+#         # Skip zero distance (same particle)
+#         #initial_distance^2 < eps(system.smoothing_length^2) && return
 
-        # Particle volumes
-        rho = material_density[1]
-        volume = @inbounds mass[neighbor] / rho
+#         # Particle volumes
+#         rho = material_density[1]
+#         volume = @inbounds mass[neighbor] / rho
 
-        ##artificial thermal diffusion to reduce oscillations
-        temp[particle] += 0.005 * (temp[neighbor] - temp[particle])
+#         ##artificial thermal diffusion to reduce oscillations
+#         temp[particle] += 0.005 * (temp[neighbor] - temp[particle])
 
-        # Distance vector
+#         # Distance vector
 
-        @views r_vec =
-            current_coordinates[:, particle] .-
-            current_coordinates[:, neighbor]     
+#         @views r_vec =
+#             current_coordinates[:, particle] .-
+#             current_coordinates[:, neighbor]     
             
-        r_vec = convert.(eltype(system), r_vec)
+#         r_vec = convert.(eltype(system), r_vec)
 
-        initial_distance2 = TrixiParticles.dot(r_vec, r_vec)
+#         initial_distance2 = TrixiParticles.dot(r_vec, r_vec)
         
-        initial_distance2 < eps(smoothing_length^2) && return
-        r = sqrt(initial_distance2)
+#         initial_distance2 < eps(system.smoothing_length^2) && return
+#         r = sqrt(initial_distance2)
 
-        # Kernel gradient
-        grad_kernel = smoothing_kernel_grad(system, r_vec,
-                                            r, particle)
+#         # Kernel gradient
+#         grad_kernel = smoothing_kernel_grad(system, r_vec,
+#                                             r, particle)
 
-        # # Multiply by correction matrix (optional, improves consistency)
-        #L = @inbounds correction_matrix(system, particle)
+#         # # Multiply by correction matrix (optional, improves consistency)
+#         #L = @inbounds correction_matrix(system, particle)
 
-        # gradW = L' * grad_kernel   # corrected gradient
+#         # gradW = L' * grad_kernel   # corrected gradient
         
-        gradW = grad_kernel
+#         gradW = grad_kernel
 
-        # Harmonic mean of thermal conductivity
-        #k_ij = 2 * k[particle] * k[neighbor] / (k[particle] + k[neighbor])
-        k_ij = k
+#         # Harmonic mean of thermal conductivity
+#         #k_ij = 2 * k[particle] * k[neighbor] / (k[particle] + k[neighbor])
+#         k_ij = k
 
-        ## SPH conduction contribution
-        #dT[particle] += volume * k_ij / (material_density[particle] * cp) *
-         #               TrixiParticles.dot(r_vec, gradW) * (temp[neighbor] - temp[particle]) / (initial_distance^2)
+#         ## SPH conduction contribution
+#         #dT[particle] += volume * k_ij / (material_density[particle] * cp) *
+#          #               TrixiParticles.dot(r_vec, gradW) * (temp[neighbor] - temp[particle]) / (initial_distance^2)
     
-        _eps = 1e-3                # regularisation factor
-        h2 = system.smoothing_length^2
-        r2= initial_distance2 + _eps * h2
+#         _eps = 1e-3                # regularisation factor
+#         h2 = system.smoothing_length^2
+#         r2= initial_distance2 + _eps * h2
 
-        val = TrixiParticles.dot(r_vec, gradW)
+#         val = TrixiParticles.dot(r_vec, gradW)
 
-        if val > 0
-            @warn "Positive r·∇W detected" val
-        end
+#         if val > 0
+#             @warn "Positive r·∇W detected" val
+#         end
 
-        flux = volume * k / (rho * cp) *
-                        (temp[neighbor] - temp[particle]) *
-                        val /(r2)
+#         flux = volume * k / (rho * cp) *
+#                         (temp[neighbor] - temp[particle]) *
+#                         val /(r2)
 
-        dT[particle] += flux
+#         dT[particle] += flux
         
 
-    end
+#     end
 
-    println("max dT = ", maximum(abs.(dT)))
-    println("nonzero dT count = ", count(!iszero, dT))
+#     #println("max dT = ", maximum(abs.(dT)))
+#     #println("nonzero dT count = ", count(!iszero, dT))
 
-    # # Update temperature with flux limiter
-    dT_max = 0.1
-    @inbounds for i in 1:length(temp)
-        temp_ref = temp[i]
+#     # # Update temperature with flux limiter
+#     dT_max = 0.1
+#     @inbounds for i in 1:length(temp)
+#         temp_ref = temp[i]
 
-        temp[i] += dt * dT[i]
+#         temp[i] += dt * dT[i]
 
-        dT_act = temp[i] - temp_ref
-        if abs(dT_act) > dT_max
-            temp[i] = temp_ref + sign(dT_act) * dT_max
-        end
-    end
+#         dT_act = temp[i] - temp_ref
+#         if abs(dT_act) > dT_max
+#             temp[i] = temp_ref + sign(dT_act) * dT_max
+#         end
+#     end
     
-    println("dE = ", sum(dT .* mass ./ material_density))
+#     #println("dE = ", sum(dT .* mass ./ material_density))
 
-    #E = sum(temp .* mass ./ material_density)
-    #println("Total energy = ",E)
+#     #E = sum(temp .* mass ./ material_density)
+#     #println("Total energy = ",E)
 
-    return temp
-end
+#     return temp
+# end
 
 # ==== Resolution
-n_particles_y = 5
+n_particles_y = 6
 
 # ==========================================================================================
 # ==== Experiment Setup
 gravity = 2.0
-tspan = (0.0, 1.0)
+#tspan = (0.0, 1.0)
 
-rec_size = (length=0.2, thickness=0.05)
+rec_size = (length=0.2, thickness=0.06)
 #material_plunger = (density=1000.0, E=1.4e6, nu=0.4)
-material_polymer = (density=1000.0, E=1.4e6, nu=0.4 ,beta=0.000, alpha=0.000, temp=270.0, temp_ref=270.0, cp=1500.0 , k=50.0,
-                            temp_liq=350.0,h= 5000.0,hardening= 1.4e4,tmelt=600.0)
-#material_container=(density=1000.0, E=1.4e6, nu=0.4)
-#clamp_radius = 0.05
+material_polymer = (density=1600.0, E=12e10, nu=0.3 ,beta=0.000, temp=270.0, temp_ref=270.0, cp=1200.0 , k=10.0,
+                            temp_liq=390.0,h= 1000000.0,hardening= 1.4e4,tmelt=700.0, viscosity=100000.0, yield_stress=600e6)
+
 
 # The structure starts at the position of the first particle and ends
 # at the position of the last particle.
 particle_spacing = rec_size.thickness / (n_particles_y - 1)
-
-# # Add particle_spacing/2 to the clamp_radius to ensure that particles are also placed on the radius
-# clamped_particles = SphereShape(particle_spacing, clamp_radius + particle_spacing / 2,
-#                                 (0.0, elastic_beam.thickness / 2), material.density,
-#                                 cutout_min=(0.0, 0.0),
-#                                 cutout_max=(clamp_radius, elastic_beam.thickness),
-#                                 place_on_shell=true, coordinates_eltype=Float64)
-
-# n_particles_clamp_x = round(Int, clamp_radius / particle_spacing)
 
 
 n_particles_per_dimension = (round(Int, rec_size.length / particle_spacing), n_particles_y)
@@ -214,49 +208,35 @@ n_particles_per_dimension = (round(Int, rec_size.length / particle_spacing), n_p
 # from the boundary, which is correct for fluids, but not for structures.
 # We therefore need to pass `place_on_shell=true`.
 
-#plunger = RectangularShape(particle_spacing, n_particles_per_dimension,
-                        # (0.0, 0.2), density=material_plunger.density, place_on_shell=true,
-                        # coordinates_eltype=Float64)
-
 polymer = RectangularShape(particle_spacing, n_particles_per_dimension,
-                        (0.0, 0.0), density=material_polymer.density, place_on_shell=true,
+                        (0.0, -0.01), density=material_polymer.density, place_on_shell=true,
                         coordinates_eltype=Float64)
-                        
-#container = RectangularShape(particle_spacing, n_particles_per_dimension,
-                        #(0.0, 0.0), density=material_container.density, place_on_shell=true,
-                        #coordinates_eltype=Float64)
-
-#structure = union(clamped_particles, beam)
 
 # ==========================================================================================
 # ==== Structure
-smoothing_length = sqrt(2) * particle_spacing
+smoothing_length = 2 * particle_spacing
 smoothing_kernel = WendlandC2Kernel{2}()
 
-#structure_system_plunger = TotalLagrangianSPHSystem(plunger, smoothing_kernel, smoothing_length,
-                                            # material_plunger.E, material_plunger.nu,0,0,0,0,
-                                            # acceleration=(0.0, -gravity),
-                                            # penalty_force=nothing, viscosity=nothing,
-                                            # clamped_particles_motion=nothing,
-                                            # self_interaction_nhs=:default)
+# X0 = initial_coordinates(semi.systems[1])
+# ymin = minimum(X0[2, :])
+
+# tol = 1e-8 * particle_spacing
+
+# fixed = findall(i -> X0[2, i] ≤ ymin + tol, eachparticle(semi.systems[1]))
+
+fixed = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]
 
 structure_system_polymer = TotalLagrangianSPHSystem(polymer, smoothing_kernel, smoothing_length,
                                             material_polymer.E, material_polymer.nu,
-                                            material_polymer.beta, material_polymer.alpha,
+                                            material_polymer.beta,
                                             material_polymer.temp, material_polymer.temp_ref, material_polymer.cp, material_polymer.k,
-                                            material_polymer.temp_liq,material_polymer.h,material_polymer.hardening,
-                                            material_polymer.tmelt,
+                                            material_polymer.temp_liq,material_polymer.h,material_polymer.hardening, material_polymer.yield_stress,
+                                            material_polymer.tmelt;
+                                            clamped_particles=fixed,
                                             acceleration=(0.0, 0),
-                                            penalty_force=nothing, viscosity=nothing,
+                                            penalty_force=nothing, viscosity=material_polymer.viscosity,
                                             clamped_particles_motion=nothing,
                                             self_interaction_nhs=:default)
-
-#structure_system_container = TotalLagrangianSPHSystem(container, smoothing_kernel, smoothing_length,
-                                            # material_container.E, material_container.nu,0,0,0,0,
-                                            # acceleration=(0.0, 0),
-                                            # penalty_force=nothing, viscosity=nothing,
-                                            # clamped_particles_motion=nothing,
-                                            # self_interaction_nhs=:default)
 
 # ==========================================================================================
 # ==== Simulation
@@ -267,43 +247,53 @@ semi = Semidiscretization(structure_system_polymer,
                           neighborhood_search=nothing,
                           parallelization_backend=PolyesterBackend())
 
-# ------------- APPLY HEAT SOURCE AT SURFACE ----------------
-# This enforces boundary temperature before updating ΔT
-x_heater = 0.01   # example: left edge at x=0
-T_heater = 1500 # example heater temperature
-h = 100
+
 ##CFL-criteria
 #dt_bc1 = vec((structure_system_polymer.material_density .* structure_system_polymer.cp .* particle_spacing) ./ h)
 ##Explicit Diffusion - criteria
 #dt_bc2 = vec((structure_system_polymer.material_density .* structure_system_polymer.cp .* particle_spacing^2) ./ 2*structure_system_polymer.k)
-dt = 0.1
-t_total = 2500       # seconds to preheat
+dt_p = 0.1
+t_preheat = 2500       # seconds to preheat
+dt_c = 0.000001
+t_comp_cooling = 0.08  #seconds under compression and cooling
+temp_mold = 270
+global y_mold = 0.000000001
+global y_particle = 0.06
+global v_mold = 0.00000008
+bound_coordinate1 = (1,0.01)
+bound_coordinate = (2,0.05)
 
-n_steps = round(Int, t_total / dt)
+n_of_particles = size(semi.systems[1].current_coordinates,2)
+n_of_fixed_particles = n_of_particles - length(fixed)
 
-for step in 1:n_steps
-    temp_updated = update_temperature_sph!(semi.systems[1],dt,particle_spacing,
-    x_heater, T_heater, h, semi)
+n_pre_steps = round(Int, t_preheat / dt_p)
+
+n_comp_steps = round(Int, t_comp_cooling / dt_c)
+
+for step in 1:n_pre_steps
+    # temp_updated = update_temperature_sph!(semi.systems[1],dt_p,particle_spacing,
+    # x_heater, T_heater, h, semi)
+    q = 5e4
+    update_temperature_sph!(semi.systems[1], dt_p, q ,particle_spacing, bound_coordinate1, semi)
 end
-
-@show structure_system_polymer.temp        # shows the full 1D vector of particle temperatures
-@show size(structure_system_polymer.temp)
 
 using Plots
 
 coords = structure_system_polymer.current_coordinates  # 2×N
-xs = coords[1, :]
-ys = coords[2, :]
+xs = coords[1, 1:n_of_fixed_particles]
+ys = coords[2, 1:n_of_fixed_particles]
 
 x_unique = sort(unique(xs))
+
 y_unique = sort(unique(ys))
+
 
 n_x = length(unique(x_unique))
 n_y = length(unique(y_unique))
 
 Tgrid = fill(NaN, n_x, n_y)
 
-for i in eachindex(structure_system_polymer.temp)
+for i in eachindex(structure_system_polymer.temp[1:n_of_fixed_particles])
     ix = findfirst(==(xs[i]), x_unique)
     iy = findfirst(==(ys[i]), y_unique)
     Tgrid[ix, iy] = structure_system_polymer.temp[i]
@@ -312,67 +302,122 @@ end
 heatmap(x_unique, y_unique, Tgrid',
         aspect_ratio=1,
         title="Temperature distribution")
-savefig("temperature.png")
+savefig("temperature_preheat.png")
 
-# material_polymer_preheated = (density=1000.0, E=1.4e6, nu=0.4 ,beta=0.000, alpha=0.000, temp_updated=271.0, temp_ref=270.0)
+global vel = zeros(eltype(semi.systems[1]), size(semi.systems[1].current_coordinates,1),n_of_particles)
 
-# structure_system_polymer_preheated = TotalLagrangianSPHSystem(polymer, smoothing_kernel, smoothing_length,
-#                                             material_polymer_preheated.E, material_polymer_preheated.nu,
-#                                             material_polymer_preheated.beta, material_polymer_preheated.alpha,
-#                                             material_polymer_preheated.temp, material_polymer_preheated.temp_ref,
-#                                             acceleration=(0.0, 0),
-#                                             penalty_force=nothing, viscosity=nothing,
-#                                             clamped_particles_motion=nothing,
-#                                             self_interaction_nhs=:default)
+@assert all(semi.systems[1].mass .> 0) 
+@assert all(semi.systems[1].material_density .> 0)
+@assert all(semi.systems[1].smoothing_length .> 0)
+@assert all(isfinite.(smoothing_length))
 
-# semi = Semidiscretization(structure_system_polymer_preheated,
-#                           neighborhood_search=nothing,
-#                           parallelization_backend=PolyesterBackend())
+x_hist = Vector{Vector{Float64}}()
+y_hist = Vector{Vector{Float64}}()
+T_hist = Vector{Vector{Float64}}()
+v_hist = []
+step_hist = []
+alpha_hist = Vector{Vector{Float64}}()
 
-# ode = semidiscretize(semi, tspan)
+#global time = 0
+
+global _alpha = zeros(eltype(semi.systems[1]),1,n_of_particles)
+global F_total_mold = 0.0
+
+for step in 1:n_comp_steps
+    
+    global y_mold -= v_mold * dt_c
+   
+    global vel, _alpha,F_total_mold = thermomechanical_loop(semi.systems[1], temp_mold, y_mold ,particle_spacing, bound_coordinate ,dt_c,vel,fixed,_alpha,F_total_mold, v_mold, semi)
+
+    if step%1000 == 0.0
+        push!(x_hist, copy(semi.systems[1].current_coordinates[1,1:n_of_fixed_particles]))
+        push!(y_hist, copy(semi.systems[1].current_coordinates[2,1:n_of_fixed_particles]))
+        push!(T_hist, copy(semi.systems[1].temp[1:n_of_fixed_particles]))
+        push!(v_hist, copy(vel[2,8]))
+        push!(step_hist, copy(step))
+        _alpha_flat = vec(_alpha)
+        push!(alpha_hist, copy(_alpha_flat[1:n_of_fixed_particles]))
+    end
+
+    F_target = 0.00
+
+    if abs(F_total_mold)>F_target
+        F_error = F_total_mold - F_target
+        global v_mold -= 1e-20 * F_error
+    end
+
+    #global time += dt_c
+    #println("Time: ",time)
+    #println("particle : ",8," vel : ",vel[2,8])
+end
+
+coords = structure_system_polymer.current_coordinates  # 2×N
+xs = coords[1, 1:n_of_fixed_particles]
+ys = coords[2, 1:n_of_fixed_particles]
+
+println("current coordinates xs",xs[75:80])
+println("current coordinates ys",ys[75:80])
+# println("fixed: ",fixed)
+
+anim = @animate for n in 1:length(x_hist)
+
+    scatter(
+        x_hist[n], y_hist[n],
+        marker_z = T_hist[n],   # color = temperature
+        markersize = 4,
+        clims = (340, 380),     # fix color scale!
+        color = :thermal,
+        xlabel = "x",
+        ylabel = "y",
+        title = "Time step = $n",
+        aspect_ratio = 1,
+        ylims = (-0.02, 0.08) 
+    )
+end
+
+gif(anim, "polymer_deformation.gif", fps = 20)
+
+plot(step_hist, v_hist, label="Particle 8", xlabel="Time (s)", ylabel="Velocity (m/s)", lw=2)
+savefig("velocity_plot_particle_8.png")
+
+x_unique = sort(unique(xs))
+y_unique = sort(unique(ys))
 
 
-# info_callback = InfoCallback(interval=1000)
+n_x = length(unique(x_unique))
+n_y = length(unique(y_unique))
 
-# # Track the position of the particle in the middle of the tip of the beam.
-# middle_particle_id = Int(n_particles_per_dimension[1] * (n_particles_per_dimension[2] + 1) /
-#                          2)
+Tgrid = fill(NaN, n_x, n_y)
 
-# # Make these constants because global variables in the functions below are slow
-# const STARTPOSITION_X = polymer.coordinates[1, middle_particle_id]
-# const STARTPOSITION_Y = polymer.coordinates[2, middle_particle_id]
+for i in eachindex(structure_system_polymer.temp[1:n_of_fixed_particles])
+    ix = findfirst(==(xs[i]), x_unique)
+    iy = findfirst(==(ys[i]), y_unique)
+    Tgrid[ix, iy] = structure_system_polymer.temp[i]
+end
 
-# function deflection_x(system, data, t)
-#     return data.coordinates[1, middle_particle_id] - STARTPOSITION_X
-# end
+heatmap(x_unique, y_unique, Tgrid',
+        aspect_ratio=1,
+        title="Temperature distribution")
+savefig("temperature_mold.png")
 
-# function deflection_y(system, data, t)
-#     return data.coordinates[2, middle_particle_id] - STARTPOSITION_Y
-# end
+anim2 = @animate for n in 1:length(x_hist)
+    xs = x_hist[n]
+    ys = y_hist[n]
+    x_unique = sort(unique(xs)) 
+    y_unique = sort(unique(ys))
+    n_x = length(unique(x_unique))
+    n_y = length(unique(y_unique))
+    Agrid = fill(NaN, n_x, n_y)
 
-# saving_callback = SolutionSavingCallback(dt=0.01, prefix="",
-#                                          deflection_x=deflection_x,
-#                                          deflection_y=deflection_y)
+    for i in eachindex(alpha_hist[n])
+        ix = findfirst(==(xs[i]), x_unique)
+        iy = findfirst(==(ys[i]), y_unique)
+        alpha_current = alpha_hist[n]
+        Agrid[ix, iy] = alpha_current[i]
+    end
 
-# callbacks = CallbackSet(info_callback, saving_callback)
-
-# @show minimum(structure_system_polymer.lame_mu)
-# @show maximum(structure_system_polymer.lame_mu)
-
-# @show minimum(structure_system_polymer.lame_lambda)
-# @show maximum(structure_system_polymer.lame_lambda)
-
-# @show minimum(structure_system_polymer.young_modulus)
-# @show maximum(structure_system_polymer.young_modulus)
-
-# @show minimum(structure_system_polymer.poisson_ratio)
-# @show maximum(structure_system_polymer.poisson_ratio)
-
-# @show minimum(structure_system_polymer.temp)
-# @show maximum(structure_system_polymer.temp)
-
-# # Use a Runge-Kutta method with automatic (error based) time step size control
-# sol = solve(ode, RDPK3SpFSAL49(), save_everystep=false, callback=callbacks)
-
-# using Plots 
-# plot(sol)
+    heatmap(x_unique, y_unique,Agrid,
+            aspect_ratio=1,
+            title="alpha distribution")
+end
+gif(anim2, "polymer_alpha.gif", fps = 20)
