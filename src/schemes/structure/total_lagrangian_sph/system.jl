@@ -634,7 +634,7 @@ end
     end
 
     #k_n = 5.0 * young_modulus / particle_spacing
-    k_n = 1e7
+    k_n = 1e6
     
     acceleration,F_total_mold = momentum(system, y_mold, k_n ,stress, fixed,vel,F_total_mold, v_mold,particle_spacing, semi)
 
@@ -647,6 +647,10 @@ end
     # end
 
     vel .+= acceleration.*dt
+
+    # for particle in length(temp)
+    #     vel[1, particle] += 1e-6 * randn()
+    # end
 
     current_coordinates += vel.*dt
 
@@ -692,7 +696,7 @@ end
 
     end
 
-    normal = SVector(0.0, -1.0)   #top_mold
+    normal = SVector(0.00, -1.0)   #top_mold
     @threaded semi for particle in eachparticle(system)
         gap = y_mold - current_coordinates[2,particle]
         if gap < 0.0
@@ -703,6 +707,8 @@ end
             f_contact -= gamma_n * dot(vel[:,particle]-v_mold*normal, normal) * normal
             F_total_mold += dot(f_contact, normal)
             _acceleration[:,particle] .+= f_contact / mass[particle]
+            gamma_lat = 0.1 * gamma_n  # smaller than vertical damping
+            _acceleration[1,particle] -= gamma_lat * vel[1,particle] / mass[particle]
         end
 
         r_min = particle_spacing # particle spacing or slightly less
@@ -710,7 +716,7 @@ end
             dist_to_b = current_coordinates[2, particle] - 0.00  
             if dist_to_b < r_min
                 gamma_n = 200 * sqrt(k_n * mass[particle])
-                normal_bottom = SVector(0.0, 1.0)
+                normal_bottom = SVector(0.00, 1.0)
                 F_rep = -1e2 * dist_to_b * normal_bottom
                 F_rep -= gamma_n * dot(vel[:,particle], normal_bottom) * normal_bottom
             else
@@ -750,13 +756,17 @@ end
 
     v_elas = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2)
                     ,size(deformation_grad,3))
+    
     F,b,d = calc_deformation_grad!(deformation_grad, system,dt, fixed, semi)
     
+    Fp = b = zeros(eltype(system), size(F,1), size(F,2) ,size(F,3))
+
     mu = young_modulus/(2+2*poisson_ratio)
     K = young_modulus/(3-6*poisson_ratio)
 
 
     @threaded semi for particle in eachparticle(system)
+        Fp[:,:,particle] .= Matrix{Float64}(I, 2, 2)
         detF = det(F[:,:,particle])
 
         J = max(detF, 1e-6)
@@ -779,28 +789,11 @@ end
 
 
         if yf > 1e-6
-
             if temp[particle] < 0.5*tmelt
-                strain_rate = yf/(3*mu + hardening)
-                dev_v_elas = v_elas[:, :, particle] - 1/2* (tr(v_elas[:, :, particle]))*I
-                norm_dev = sqrt(sum(dev_v_elas .* dev_v_elas))
-                v_elas[:, :, particle] .= v_elas[:, :, particle] .- 3*mu*strain_rate.*(dev_v_elas/norm_dev)   
-                alpha_dot = strain_rate
-                _alpha[particle] += alpha_dot       
+                strain_rate = yf/(3*mu + hardening)     
             else
-                #strain_rate_max = 1000
                 strain_rate = yf*dt/max(vis[particle],1e-8)
-                #strain_rate = min(strain_rate, strain_rate_max)
-                dev_v_elas = v_elas[:, :, particle] - 1/2* (tr(v_elas[:, :, particle]))*I
-                norm_dev = sqrt(sum(dev_v_elas .* dev_v_elas))
-                n = dev_v_elas/norm_dev
 
-                dp = strain_rate .* n 
-
-                v_elas[:, :, particle] .= v_elas[:, :, particle] .- 3*mu*dp
-            
-                alpha_dot = strain_rate
-                _alpha[particle] += alpha_dot
                 # # Isochoric part of b
                 # J_b = max(det(b[:,:,particle]), 1e-6)
                 # be_bar = zeros(eltype(system), size(b,1), size(b,2),1)
@@ -811,8 +804,23 @@ end
                 # J_e = sqrt(det_be)
                 # @inbounds v_elas[:, :, particle] .= K*log(J_e)*I+mu*dev_be
             end
-            tau_eq = yf + ys[particle]
-            plastic_work = tau_eq * alpha_dot
+            
+            dev_v_elas = v_elas[:, :, particle] - 1/2* (tr(v_elas[:, :, particle]))*I
+            norm_dev = sqrt(sum(dev_v_elas .* dev_v_elas))
+            n = dev_v_elas/norm_dev
+            dFp = strain_rate * n * dt
+            Fp_old = Fp[:,:,particle]
+            Fp[:,:,particle] += dFp * Fp[:,:,particle]
+            Fe = F[:,:,particle] * inv(Fp[:,:,particle])
+            J = det(Fe)
+            be = Fe * Fe'   # left Cauchy-Green
+            dev_be = be - 1/2*tr(be)*I
+            v_elas[:, :, particle] .= K*log(J)*I + mu*dev_be 
+            alpha_dot = strain_rate
+            _alpha[particle] += alpha_dot  
+
+            depsilon = 0.5 * ((Fp[:,:,particle] - Fp_old) * inv(Fp_old) + ((Fp[:,:,particle] - Fp_old) * inv(Fp_old))')
+            plastic_work = sum(v_elas[:,:,particle] .* depsilon)
             beta = 0.9
             temp[particle] += beta * plastic_work / (material_density[particle]*cp) * dt
         end
