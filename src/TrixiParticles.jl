@@ -66,8 +66,9 @@ include("visualization/recipes_plots.jl")
 export Semidiscretization, semidiscretize, restart_with!
 export InitialCondition
 export WeaklyCompressibleSPHSystem, EntropicallyDampedSPHSystem, TotalLagrangianSPHSystem,
-       WallBoundarySystem, DEMSystem, BoundaryDEMSystem, OpenBoundarySystem,
-       ImplicitIncompressibleSPHSystem, thermomechanical_loop, eachparticle, update_temperature_sph!
+       TotalLagrangianSPHSystem3d, WallBoundarySystem, DEMSystem, BoundaryDEMSystem, OpenBoundarySystem,
+       ImplicitIncompressibleSPHSystem, thermomechanical_loop, thermomechanical_loop3d, eachparticle, update_temperature_sph!,
+       update_temperature_sph3d!
 export BoundaryZone, InFlow, OutFlow, BidirectionalFlow
 export InfoCallback, SolutionSavingCallback, DensityReinitializationCallback,
        PostprocessCallback, StepsizeCallback, UpdateCallback, SteadyStateReachedCallback,

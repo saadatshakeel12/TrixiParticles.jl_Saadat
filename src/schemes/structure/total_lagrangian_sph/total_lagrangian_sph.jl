@@ -2,4 +2,5 @@
 # in the closure of `foreach_point_neighbor`.
 include("penalty_force.jl")
 include("system.jl")
+include("system_3d.jl")
 include("viscosity.jl")

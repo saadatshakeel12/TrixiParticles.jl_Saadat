@@ -625,7 +625,7 @@ end
 
     temp_avg = sum(temp) / length(temp) 
 
-    stress = zeros(eltype(system), size(temp,1), size(temp,2), size(temp,3))
+    stress = zeros(eltype(system), size(current_coordinates,1), size(current_coordinates,1), size(current_coordinates,2))
 
     if temp_avg > temp_liq
         stress = viscous_stress!(system,vis,dt,fixed,semi)
@@ -759,7 +759,7 @@ end
     
     F,b,d = calc_deformation_grad!(deformation_grad, system,dt, fixed, semi)
     
-    Fp = b = zeros(eltype(system), size(F,1), size(F,2) ,size(F,3))
+    Fp = zeros(eltype(system), size(F,1), size(F,2) ,size(F,3))
 
     mu = young_modulus/(2+2*poisson_ratio)
     K = young_modulus/(3-6*poisson_ratio)
