@@ -584,21 +584,21 @@ end
     return temp
 end
 
-@inline function thermomechanical_loop(system, temp_mold, gap ,particle_spacing, bound_coordinate ,dt, vel,fixed, alpha,F_total_mold, v_mold, semi)
+@inline function thermomechanical_loop(system, temp_mold, y_mold ,particle_spacing, bound_coordinate ,dt, vel,fixed, alpha,F_total_mold, v_mold, semi)
     (;temp_liq, temp, h) = system
     
     ys, hard, vis = update_properties!(system,alpha, semi)
 
-    if gap <= 0.0 
+    if y_mold <= 0.05 
         # println("ys: ",ys[1:5])
         #println("hard:",hard)
         # println("vis:",vis[1:5])
         #println("alpha1:",alpha)
-        vel,coor,alpha,F_total_mold = update_v_x(system, dt, gap ,particle_spacing ,temp_liq,vel, fixed,ys, hard, vis, alpha,F_total_mold, v_mold, semi)
+        vel,coor,alpha,F_total_mold = update_v_x(system, dt, y_mold ,particle_spacing ,temp_liq,vel, fixed,ys, hard, vis, alpha,F_total_mold, v_mold, semi)
         system.current_coordinates .= coor
     end
 
-    if gap > 0.0
+    if y_mold > 0.05
         q = 0
         update_temperature_sph!(system, dt, q ,particle_spacing, bound_coordinate, semi)
     else
@@ -634,7 +634,7 @@ end
     end
 
     #k_n = 5.0 * young_modulus / particle_spacing
-    k_n = 1e6
+    k_n = 1e7
     
     acceleration,F_total_mold = momentum(system, y_mold, k_n ,stress, fixed,vel,F_total_mold, v_mold,particle_spacing, semi)
 
@@ -699,8 +699,11 @@ end
     normal = SVector(0.00, -1.0)   #top_mold
     @threaded semi for particle in eachparticle(system)
         gap = y_mold - current_coordinates[2,particle]
+        if particle==1000
+            println("gap = ", gap)
+        end
         if gap < 0.0
-            gamma_n = 100 * sqrt(k_n * mass[particle])
+            gamma_n = 10 * sqrt(k_n * mass[particle])
             #delta = max(gap, -0.1*smoothing_length)
             #delta = max(gap, -0.0000105)
             f_contact = -k_n * gap * normal
@@ -715,7 +718,7 @@ end
         if !(particle in fixed)
             dist_to_b = current_coordinates[2, particle] - 0.00  
             if dist_to_b < r_min
-                gamma_n = 200 * sqrt(k_n * mass[particle])
+                gamma_n = 10 * sqrt(k_n * mass[particle])
                 normal_bottom = SVector(0.00, 1.0)
                 F_rep = -1e2 * dist_to_b * normal_bottom
                 F_rep -= gamma_n * dot(vel[:,particle], normal_bottom) * normal_bottom
@@ -858,7 +861,7 @@ end
         pos_diff = convert.(eltype(system), pos_diff_)
         vel_diff = velocity[particle] - velocity[neighbor]
 
-        #r_norm = norm(pos_diff_) + 1e-12  # epsilon in denominator
+        r_norm = norm(pos_diff) + 1e-12  # epsilon in denominator
 
         grad_kernel = smoothing_kernel_grad(system, pos_diff,
                                             initial_distance, particle)
@@ -875,9 +878,9 @@ end
         end
 
         # Skip too-close particles (optional)
-        # if r_norm < 1e-6
-        #     return
-        # end
+        if r_norm < 1e-6
+            return
+        end
 
         #I3 = Matrix{Float64}(I, ndims(system), ndims(system))
         #@inbounds deformation_grad_init[:, :, particle] = I3 + alpha * (temp[particle]-temp_ref[particle]) .* I3

@@ -176,21 +176,17 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
     return temp
 end
 
-@inline function thermomechanical_loop3d(system, temp_mold, gap ,particle_spacing, bound_coordinate ,dt, vel,fixed, alpha,F_total_mold, v_mold, semi)
+@inline function thermomechanical_loop3d(system, temp_mold, y_mold ,particle_spacing, bound_coordinate ,dt, vel,fixed, alpha,F_total_mold, v_mold, semi)
     (;temp_liq, temp, h) = system
     
     ys, hard, vis = update_properties!(system,alpha, semi)
 
-    if gap <= 0.0 
-        # println("ys: ",ys[1:5])
-        #println("hard:",hard)
-        # println("vis:",vis[1:5])
-        #println("alpha1:",alpha)
-        vel,coor,alpha,F_total_mold = update_v_x3d(system, dt, gap ,particle_spacing ,temp_liq,vel, fixed,ys, hard, vis, alpha,F_total_mold, v_mold, semi)
+    if y_mold <= 0.006 
+        vel,coor,alpha,F_total_mold = update_v_x3d(system, dt, y_mold ,particle_spacing ,temp_liq,vel, fixed,ys, hard, vis, alpha,F_total_mold, v_mold, semi)
         system.current_coordinates .= coor
     end
 
-    if gap > 0.0
+    if y_mold > 0.006
         q = 0
         update_temperature_sph3d!(system, dt, q ,particle_spacing, bound_coordinate, semi)
     else
@@ -474,11 +470,6 @@ end
 
         _L = velocity_grad[:,:,particle]
         d[:,:,particle] = 0.5 * (_L + _L')
-
-        #println("b",b)
-        #println("d",d)
-        #println("F",F)
-        #println("max_norm_grad_kernel",maximum(norm.(grad_kernel)))
 
     end
 

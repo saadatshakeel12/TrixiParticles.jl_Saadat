@@ -255,12 +255,12 @@ semi = Semidiscretization(structure_system_polymer,
 dt_p = 0.1
 t_preheat = 2500       # seconds to preheat
 dt_c = 0.000001
-t_comp_cooling = 0.08  #seconds under compression and cooling
+t_comp_cooling = 0.14  #seconds under compression and cooling
 temp_mold = 270
-global y_mold = 0.07
-global v_mold = 0.00000008
+global y_mold = 0.05
+global v_mold = 0.12
 bound_coordinate1 = (1,0.01)
-bound_coordinate = (2,0.05)
+bound_coordinate = (2,0.01)
 
 n_of_particles = size(semi.systems[1].current_coordinates,2)
 n_of_fixed_particles = n_of_particles - length(fixed)
@@ -301,7 +301,7 @@ end
 heatmap(x_unique, y_unique, Tgrid',
         aspect_ratio=1,
         title="Temperature distribution")
-savefig("temperature_preheat.png")
+savefig("temperature_preheat_2d.png")
 
 global vel = zeros(eltype(semi.systems[1]), size(semi.systems[1].current_coordinates,1),n_of_particles)
 
@@ -338,7 +338,7 @@ for step in 1:n_comp_steps
         push!(alpha_hist, copy(_alpha_flat[1:n_of_fixed_particles]))
     end
 
-    F_target = 0.00
+    F_target = 1200
 
     if abs(F_total_mold)>F_target
         F_error = F_total_mold - F_target
@@ -374,10 +374,10 @@ anim = @animate for n in 1:length(x_hist)
     )
 end
 
-gif(anim, "polymer_deformation.gif", fps = 20)
+gif(anim, "polymer_deformation_2d.gif", fps = 20)
 
-plot(step_hist, v_hist, label="Particle 8", xlabel="Time (s)", ylabel="Velocity (m/s)", lw=2)
-savefig("velocity_plot_particle_8.png")
+# plot(step_hist, v_hist, label="Particle 8", xlabel="Time (s)", ylabel="Velocity (m/s)", lw=2)
+# savefig("velocity_plot_particle_8.png")
 
 x_unique = sort(unique(xs))
 y_unique = sort(unique(ys))
@@ -397,7 +397,7 @@ end
 heatmap(x_unique, y_unique, Tgrid',
         aspect_ratio=1,
         title="Temperature distribution")
-savefig("temperature_mold.png")
+savefig("temperature_mold_2d.png")
 
 anim2 = @animate for n in 1:length(x_hist)
     xs = x_hist[n]
@@ -419,4 +419,4 @@ anim2 = @animate for n in 1:length(x_hist)
             aspect_ratio=1,
             title="alpha distribution")
 end
-gif(anim2, "polymer_alpha.gif", fps = 20)
+gif(anim2, "polymer_alpha_2d.gif", fps = 20)
