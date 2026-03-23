@@ -46,7 +46,7 @@ shape_sampled.mass .= density * TrixiParticles.volume(geometry) / nparticles(sha
 background_pressure = 1.0
 
 smoothing_kernel = SchoenbergQuinticSplineKernel{3}()
-smoothing_length = 0.8 * particle_spacing
+smoothing_length = 1.5 * particle_spacing
 
 packing_system = ParticlePackingSystem(shape_sampled;
                                        smoothing_kernel=smoothing_kernel,
@@ -79,12 +79,12 @@ savefig("packing.png")
 # # ==========================================================================================
 # # ==== Experiment Setup
 
-material_polymer = (density=1600.0, E=12e10, nu=0.3 ,beta=0.000, temp=270.0, temp_ref=270.0, cp=1200.0 , k=10.0,
-                            temp_liq=390.0,h= 1000000.0,hardening= 1.4e4,tmelt=700.0, viscosity=100000.0, yield_stress=600e6)
+material_polymer = (density=16000.0, E=12e10, nu=0.3 ,beta=0.000, temp=270.0, temp_ref=270.0, cp=1200.0 , k=20.0,
+                            temp_liq=390.0,h= 100000.0,hardening= 1.4e6,tmelt=700.0, viscosity=100000.0, yield_stress=600e6)
 
 # ==========================================================================================
 # ==== Structure
-smoothing_length = 2.0 * particle_spacing
+smoothing_length = 1.4 * particle_spacing
 smoothing_kernel = WendlandC2Kernel{3}()
 
 X0 = polymer.coordinates
@@ -101,7 +101,7 @@ structure_system_polymer = TotalLagrangianSPHSystem(polymer, smoothing_kernel, s
                                             material_polymer.temp, material_polymer.temp_ref, material_polymer.cp, material_polymer.k,
                                             material_polymer.temp_liq,material_polymer.h,material_polymer.hardening, material_polymer.yield_stress,
                                             material_polymer.tmelt;
-                                            #clamped_particles=fixed,
+                                            clamped_particles=fixed,
                                             acceleration=(0.0,0.0,0),
                                             penalty_force=nothing, viscosity=material_polymer.viscosity,
                                             clamped_particles_motion=nothing,
@@ -121,15 +121,15 @@ semi = Semidiscretization(structure_system_polymer,
 #dt_bc1 = vec((structure_system_polymer.material_density .* structure_system_polymer.cp .* particle_spacing) ./ h)
 ##Explicit Diffusion - criteria
 #dt_bc2 = vec((structure_system_polymer.material_density .* structure_system_polymer.cp .* particle_spacing^2) ./ 2*structure_system_polymer.k)
-dt_p = 0.1
-t_preheat = 600      # seconds to preheat
-dt_c = 0.000001
-t_comp_cooling = 0.01 #seconds under compression and cooling
+dt_p = 0.05
+t_preheat = 200      # seconds to preheat
+dt_c = 0.00000005
+t_comp_cooling = 0.0000001 #seconds under compression and cooling
 temp_mold = 270
-global y_mold = 0.006
-global v_mold = 0.00000008
-bound_coordinate1 = (3,-0.0009)
-bound_coordinate = (3,0.0009)
+global y_mold = 0.012
+global v_mold = 0.00001
+bound_coordinate1 = (3,-0.011)
+bound_coordinate = (3,0.011)
 
 n_of_particles = size(semi.systems[1].current_coordinates,2)
 n_of_fixed_particles = n_of_particles - length(fixed)
@@ -139,7 +139,7 @@ n_pre_steps = round(Int, t_preheat / dt_p)
 n_comp_steps = round(Int, t_comp_cooling / dt_c)
 
 for step in 1:n_pre_steps
-    q = 5e4
+    q = 5e3
     update_temperature_sph3d!(semi.systems[1], dt_p, q ,particle_spacing, bound_coordinate1, semi)
 end
 
@@ -164,11 +164,16 @@ x_hist = Vector{Vector{Float64}}()
 y_hist = Vector{Vector{Float64}}()
 z_hist = Vector{Vector{Float64}}()
 T_hist = Vector{Vector{Float64}}()
+stress_hist = Float64[]
+strain_hist = Float64[]
 
-alpha_hist = Vector{Vector{Float64}}()
+
+#alpha_hist = Vector{Vector{Float64}}()
+global time = 0
 
 global _alpha = zeros(eltype(semi.systems[1]),1,n_of_particles)
 global F_total_mold = 0.0
+original_height = maximum(semi.systems[1].initial_coordinates[3,:]) - minimum(semi.systems[1].initial_coordinates[3,:])
 
 for step in 1:n_comp_steps
     
@@ -176,21 +181,26 @@ for step in 1:n_comp_steps
    
     global vel, _alpha,F_total_mold = thermomechanical_loop3d(semi.systems[1], temp_mold, y_mold ,particle_spacing, bound_coordinate ,dt_c,vel,fixed,_alpha,F_total_mold, v_mold, semi)
 
-    if step%1000 == 0.0
+    current_height = maximum(semi.systems[1].current_coordinates[3,:]) - minimum(semi.systems[1].current_coordinates[3,:])
+    true_strain = log(current_height/original_height)
+
+    volume = sum((semi.systems[1].mass)./(semi.systems[1].material_density))
+    area = volume / current_height
+    true_stress = abs(F_total_mold)/area
+
+    if step%1 == 0.0
         push!(x_hist, copy(semi.systems[1].current_coordinates[1,1:n_of_fixed_particles]))
         push!(y_hist, copy(semi.systems[1].current_coordinates[2,1:n_of_fixed_particles]))
         push!(z_hist, copy(semi.systems[1].current_coordinates[3,1:n_of_fixed_particles]))
         push!(T_hist, copy(semi.systems[1].temp[1:n_of_fixed_particles]))
-        _alpha_flat = vec(_alpha)
-        push!(alpha_hist, copy(_alpha_flat[1:n_of_fixed_particles]))
+        push!(stress_hist, copy(true_stress))
+        push!(strain_hist, copy(true_strain))
+        #_alpha_flat = vec(_alpha)
+        #push!(alpha_hist, copy(_alpha_flat[1:n_of_fixed_particles]))
     end
 
-    F_target = 0.00
-
-    if abs(F_total_mold)>F_target
-        F_error = F_total_mold - F_target
-        global v_mold -= 1e-20 * F_error
-    end
+    #global time += dt_c
+    #println("Time: ",time)
 
 end
 
@@ -210,19 +220,22 @@ anim = @animate for n in 1:length(x_hist)
         x_hist[n], y_hist[n],z_hist[n],
         marker_z = T_hist[n],   # color = temperature
         markersize = 4,
-        clims = (340, 380),     # fix color scale!
+        clims = (100, 600),     # fix color scale!
         color = :thermal,
         xlabel = "x",
         ylabel = "y",
         title = "Time step = $n",
         aspect_ratio = 1,
-        ylims = (-0.01, 0.01),
-        xlims = (-0.01, 0.01)  
+        ylims = (-0.015, 0.015),
+        xlims = (-0.015, 0.015),
+        zlims = (-0.015, 0.015)   
     )
 end
 
 gif(anim, "polymer_deformation.gif", fps = 20)
 
+plot(strain_hist, stress_hist, label="True Stress vs True Strain", xlabel="Strain", ylabel="Stress", lw=2)
+savefig("stress_vs_strain.png")
 
 scatter3d(xs, ys, zs,
           marker_z = structure_system_polymer.temp[1:n_of_fixed_particles],
@@ -230,28 +243,14 @@ scatter3d(xs, ys, zs,
 
 savefig("temperature_mold.png")
 
-# anim2 = @animate for n in 1:length(x_hist)
-#     xs = x_hist[n]
-#     ys = y_hist[n]
-#     zs = z_hist[n]
-#     x_unique = sort(unique(xs)) 
-#     y_unique = sort(unique(ys))
-#     z_unique = sort(unique(zs))
-#     n_x = length(unique(x_unique))
-#     n_y = length(unique(y_unique))
-#     n_z = length(unique(z_unique))
-#     Agrid = fill(NaN, n_x, n_y,n_z)
 
-#     for i in eachindex(alpha_hist[n])
-#         ix = findfirst(==(xs[i]), x_unique)
-#         iy = findfirst(==(ys[i]), y_unique)
-#         iz = findfirst(==(zs[i]), z_unique)
-#         alpha_current = alpha_hist[n]
-#         Agrid[ix, iy, iz] = alpha_current[i]
-#     end
+# original_height = maximum(semi.systems[1].initial_coordinates[3,:]) - minimum(semi.systems[1].initial_coordinates[3,:])
 
-#     heatmap(x_unique, y_unique, z_unique, permutedims(Agrid, (2,1,3)),
-#             aspect_ratio=1,
-#             title="alpha distribution")
-# end
-# gif(anim2, "polymer_alpha.gif", fps = 20)
+#     current_height = maximum(semi.systems[1].current_coordinates[3,:]) - minimum(semi.systems[1].current_coordinates[3,:])
+#     true_strain = original_height/current_height
+    
+#     volume = sum((semi.systems[1].mass)./(semi.systems[1].material_density))
+#     area = volume / current_height
+#     true_stress = F_total_mold/area
+#         push!(stress_hist, copy(true_stress))
+#         push!(strain_hist, copy(true_strain))

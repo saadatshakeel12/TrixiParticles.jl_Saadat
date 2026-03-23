@@ -240,9 +240,8 @@ function initialize_self_interaction_nhs(system::TotalLagrangianSPHSystem,
     elseif isnothing(system.self_interaction_nhs)
         template = TrivialNeighborhoodSearch{ndims(system)}()
     else
-        # The user supplied a custom self-interaction neighborhood search.
-        # We don't touch this one and just return the system as is.
-        return system
+        # User supplied custom NHS — use it as template but still initialize it
+        template = system.self_interaction_nhs
     end
 
     # Create concrete NHS from template
@@ -446,10 +445,10 @@ function apply_prescribed_motion!(system::TotalLagrangianSPHSystem, ::Nothing, s
     return system
 end
 
-function update_quantities!(system::TotalLagrangianSPHSystem, v, u, v_ode, u_ode, semi, t)
+function update_quantities!(system::TotalLagrangianSPHSystem, v, u, v_ode, u_ode, semi, t, dt=1e-5)
     # Precompute PK1 stress tensor
-    @trixi_timeit timer() "stress tensor" compute_pk1_corrected!(system, semi)
-
+    @trixi_timeit timer() "stress tensor" compute_pk1_corrected!(system, v, semi, dt)
+    
     return system
 end
 
@@ -461,13 +460,18 @@ function update_boundary_interpolation!(system::TotalLagrangianSPHSystem, v, u,
     update_pressure!(boundary_model, system, v, u, v_ode, u_ode, semi)
 end
 
-@inline function compute_pk1_corrected!(system, semi)
+@inline function compute_pk1_corrected!(system, v, semi, dt=1e-6)
     (; deformation_grad, pk1_rho2, material_density) = system
 
-    calc_deformation_grad!(deformation_grad, system, dt, semi)
+    calc_deformation_grad!(deformation_grad, system, v, dt, false, semi)
+
+    # F1 = deformation_grad[:,:,1]
+    # println("det(F[1]) = ", det(F1))
+    # println("F[1] = ", F1)
 
     @threaded semi for particle in eachparticle(system)
         pk1_particle = @inbounds pk1_stress_tensor(system, particle)
+
         pk1_particle_corrected = pk1_particle *
                                  @inbounds correction_matrix(system, particle)
         rho2_inv = 1 / @inbounds material_density[particle]^2
@@ -563,8 +567,6 @@ end
 
     end
 
-    #println("max dT = ", maximum(abs.(dT)))
-    #println("nonzero dT count = ", count(!iszero, dT))
 
     # # Update temperature with flux limiter
     dT_max = 0.1
@@ -699,9 +701,9 @@ end
     normal = SVector(0.00, -1.0)   #top_mold
     @threaded semi for particle in eachparticle(system)
         gap = y_mold - current_coordinates[2,particle]
-        if particle==1000
-            println("gap = ", gap)
-        end
+        # if particle==1000
+        #     println("gap = ", gap)
+        # end
         if gap < 0.0
             gamma_n = 10 * sqrt(k_n * mass[particle])
             #delta = max(gap, -0.1*smoothing_length)
@@ -769,7 +771,7 @@ end
 
 
     @threaded semi for particle in eachparticle(system)
-        Fp[:,:,particle] .= Matrix{Float64}(I, 2, 2)
+        Fp[:,:,particle] .= Matrix{Float64}(I, ndims(system), ndims(system))
         detF = det(F[:,:,particle])
 
         J = max(detF, 1e-6)
@@ -832,74 +834,56 @@ end
 end
     
 
-@inline function calc_deformation_grad!(deformation_grad, system, dt,fixed, semi)
-    (;mass,material_density,temp,temp_ref) = system
+@inline function calc_deformation_grad!(deformation_grad, system, v, dt, fixed, semi)
+    (; mass, material_density, temp, temp_ref) = system
 
-    velocity = system.initial_condition.velocity
-    # Reset deformation gradient
-    b = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2) ,size(deformation_grad,3))
-    d = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2) ,size(deformation_grad,3))
+    b = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2), size(deformation_grad,3))
+    d = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2), size(deformation_grad,3))
+    velocity_grad = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2), size(deformation_grad,3))
+   
     for i in 1:length(temp)
-        deformation_grad[:,:,i] .= Matrix{Float64}(I, 2, 2)
-        b[:,:,i] .= Matrix{Float64}(I, 2, 2)
-        d[:,:,i] .= Matrix{Float64}(I, 2, 2)
+        deformation_grad[:,:,i] .= zeros(eltype(system), ndims(system), ndims(system))
+        b[:,:,i] .= Matrix{Float64}(I, ndims(system), ndims(system))
+        d[:,:,i] .= Matrix{Float64}(I, ndims(system), ndims(system))
     end
-    velocity_grad = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2),size(deformation_grad,3))
 
-    # Loop over all pairs of particles and neighbors within the kernel cutoff
+    # Loop in INITIAL configuration — standard Total Lagrangian SPH
     initial_coords = initial_coordinates(system)
-    foreach_point_neighbor(system, system, initial_coords, initial_coords,
-                           semi) do particle, neighbor, pos_diff, initial_distance
-        # Only consider particles with a distance > 0.
-        # See `src/general/smoothing_kernels.jl` for more details.
+    nhs = get_neighborhood_search(system, system, semi)
+    PointNeighbors.foreach_point_neighbor(
+        initial_coords, initial_coords, nhs;
+        parallelization_backend=PolyesterBackend()
+    ) do particle, neighbor, pos_diff_initial, initial_distance
         initial_distance^2 < eps(initial_smoothing_length(system)^2) && return
 
         volume = @inbounds mass[neighbor] / material_density[neighbor]
-        pos_diff_ = @inbounds current_coords(system, particle) -
-                              current_coords(system, neighbor)
-        # On GPUs, convert `Float64` coordinates to `Float32` after computing the difference
-        pos_diff = convert.(eltype(system), pos_diff_)
-        vel_diff = velocity[particle] - velocity[neighbor]
+        pos_diff_current = @inbounds current_coords(system, particle) -
+                                     current_coords(system, neighbor)
+        pos_diff_current = convert.(eltype(system), pos_diff_current)
+        vel_diff = v[:, particle] - v[:, neighbor]
 
-        r_norm = norm(pos_diff) + 1e-12  # epsilon in denominator
-
-        grad_kernel = smoothing_kernel_grad(system, pos_diff,
+        grad_kernel = smoothing_kernel_grad(system, pos_diff_initial,
                                             initial_distance, particle)
-
-        # Multiply by L_{0a}
         L = @inbounds correction_matrix(system, particle)
 
-        result = volume * pos_diff * grad_kernel' * L'
-        result_v = volume * vel_diff * grad_kernel' * L'
+        result   = volume * pos_diff_current * grad_kernel' * L'
+        result_v = volume * vel_diff         * grad_kernel' * L'
 
         for j in 1:ndims(system), i in 1:ndims(system)
-            @inbounds velocity_grad[i,j,particle] -= dt * result_v[i,j]   
-            @inbounds deformation_grad[i, j, particle] -= dt * result[i, j]        
+            @inbounds deformation_grad[i, j, particle] -= result[i, j]
+            @inbounds velocity_grad[i, j, particle]    -= result_v[i, j]
         end
-
-        # Skip too-close particles (optional)
-        if r_norm < 1e-6
-            return
-        end
-
-        #I3 = Matrix{Float64}(I, ndims(system), ndims(system))
-        #@inbounds deformation_grad_init[:, :, particle] = I3 + alpha * (temp[particle]-temp_ref[particle]) .* I3
-        #@inbounds deformation_grad[:, :, particle] = deformation_grad[:, :, particle] * deformation_grad_init[:, :, particle]
-
-        F = deformation_grad[:,:,particle]
-        b[:,:,particle] = F * F'
-
-        _L = velocity_grad[:,:,particle]
-        d[:,:,particle] = 0.5 * (_L + _L')
-
-        #println("b",b)
-        #println("d",d)
-        #println("F",F)
-        #println("max_norm_grad_kernel",maximum(norm.(grad_kernel)))
-
     end
 
-    return deformation_grad,b,d
+    # Add identity and compute b, d
+    for particle in eachparticle(system)
+        F  = deformation_grad[:,:,particle]
+        b[:,:,particle] = F * F'
+        _L = velocity_grad[:,:,particle]
+        d[:,:,particle] = 0.5 * (_L + _L')
+    end
+
+    return deformation_grad, b, d
 end
 
 # First Piola-Kirchhoff stress tensor
@@ -1001,7 +985,7 @@ end
 # Otherwise, `@threaded` does not work here with Julia ARM on macOS.
 # See https://github.com/JuliaSIMD/Polyester.jl/issues/88.
 @inline function von_mises_stress(system, particle::Integer)
-    F,b,d = deformation_gradient(system, particle)
+    F= deformation_gradient(system, particle)
     J = det(F)
     P = pk1_rho2(system, particle) * system.material_density[particle]^2
     sigma = (1.0 / J) * P * F'

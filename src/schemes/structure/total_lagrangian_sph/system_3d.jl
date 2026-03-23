@@ -181,12 +181,12 @@ end
     
     ys, hard, vis = update_properties!(system,alpha, semi)
 
-    if y_mold <= 0.006 
+    if y_mold <= 0.012 
         vel,coor,alpha,F_total_mold = update_v_x3d(system, dt, y_mold ,particle_spacing ,temp_liq,vel, fixed,ys, hard, vis, alpha,F_total_mold, v_mold, semi)
         system.current_coordinates .= coor
     end
 
-    if y_mold > 0.006
+    if y_mold > 0.012
         q = 0
         update_temperature_sph3d!(system, dt, q ,particle_spacing, bound_coordinate, semi)
     else
@@ -208,34 +208,52 @@ end
 end
 
 
-@inline function update_v_x3d(system, dt, y_mold, particle_spacing ,temp_liq, vel, fixed,ys, hard, vis, alpha,F_total_mold, v_mold ,semi)
-    (;current_coordinates, temp, young_modulus, initial_coordinates) = system
+@inline function update_v_x3d(system, dt, y_mold, particle_spacing ,temp_liq, vel, fixed,ys, hard, vis, alpha, F_total_mold, v_mold ,semi)
+    (;current_coordinates, temp, young_modulus, initial_coordinates,poisson_ratio,mass, material_density) = system
 
     temp_avg = sum(temp) / length(temp) 
 
-    stress = zeros(eltype(system), size(current_coordinates,1), size(current_coordinates,1), size(current_coordinates,2))
+    #F_total_mold = 0.0
+
+    wave_speed = 0.0
+
+    stress,F_total_mold = zeros(eltype(system), size(current_coordinates,1), size(current_coordinates,1), size(current_coordinates,2))
 
     if temp_avg > temp_liq
-        stress = viscous_stress3d!(system,vis,dt,fixed,semi)
+        stress, wave_speed = viscous_stress3d!(system,vis,dt,fixed,semi)
     else
         stress, alpha = elastic_stress3d!(system,ys,hard,vis,dt,alpha,fixed,semi)
     end
 
     #k_n = 5.0 * young_modulus / particle_spacing
-    k_n = 1e7
+    #k_n = 100000
     
-    acceleration,F_total_mold = momentum3d(system, y_mold, k_n ,stress, fixed,vel,F_total_mold, v_mold,particle_spacing, semi)
-
+    acceleration, F_total_mold = momentum3d(system, y_mold ,stress,vel, v_mold,particle_spacing,F_total_mold, wave_speed, semi)
 
     vel .+= acceleration.*dt
 
+    # @threaded semi for particle in eachparticle(system)
+    #     volume = mass[particle]/material_density[particle]
+    #     F_total_mold += stress[3,3,particle]*(volume)
+    # end
+
+    # total_volume = sum((mass)./(material_density))
+
+    # F_total_mold /= total_volume
+
+    # for particle in fixed
+    #     acceleration[:, particle] .= 0.0
+    #     vel[:, particle] .= 0.0
+    #     current_coordinates[:, particle] .= initial_coordinates[:, particle]
+    # end
+
     current_coordinates += vel.*dt
 
-    return vel,current_coordinates, alpha,F_total_mold
+    return vel,current_coordinates, alpha, F_total_mold
 end
 
-@inline function momentum3d(system, y_mold, k_n, stress, fixed,vel,F_total_mold, v_mold,particle_spacing, semi)
-    (;mass, material_density, current_coordinates, smoothing_length, young_modulus) = system
+@inline function momentum3d(system, y_mold, stress,vel, v_mold,particle_spacing,F_total_mold, wave_speed , semi)
+    (;mass, material_density, current_coordinates, smoothing_length, young_modulus, poisson_ratio) = system
 
     _acceleration = zeros(eltype(system), size(current_coordinates,1), size(current_coordinates,2))
     initial_coords = initial_coordinates(system)
@@ -273,50 +291,59 @@ end
 
     end
 
-    normal = SVector(0.00,0.00, -1.0)   #top_mold
+    normal = SVector(0.00,0.00, 1.0)   #top_mold
+    
     @threaded semi for particle in eachparticle(system)
-        gap = y_mold - current_coordinates[3,particle]
-        if gap < 0.0
-            gamma_n = 100 * sqrt(k_n * mass[particle])
-            #delta = max(gap, -0.1*smoothing_length)
-            #delta = max(gap, -0.0000105)
-            f_contact = -k_n * gap * normal
-            f_contact -= gamma_n * dot(vel[:,particle]-v_mold*normal, normal) * normal
-            F_total_mold += dot(f_contact, normal)
-            _acceleration[:,particle] .+= f_contact / mass[particle]
-            gamma_lat = 0.1 * gamma_n  # smaller than vertical damping
-            _acceleration[1,particle] -= gamma_lat * vel[1,particle] / mass[particle]
+        t_star = 0.0
+        
+        if wave_speed==0.0
+            wave_speed = sqrt(young_modulus*(1.0-poisson_ratio) / (material_density[particle]*(1.0+poisson_ratio)*(1.0-2.0*poisson_ratio)))
+        else
+            wave_speed = wave_speed/material_density[particle]
         end
+            # gap = y_mold - current_coordinates[3,particle]
+        # if gap < 0.0
+        #     gamma_n = 10 * sqrt(k_n * mass[particle])
+        #     #delta = max(gap, -0.1*smoothing_length)
+        #     #delta = max(gap, -0.0000105)
+        #     f_contact = -k_n * gap * normal
+        #     f_contact -= gamma_n * dot(vel[:,particle]-v_mold*normal, normal) * normal
+        #     F_total_mold += dot(f_contact, normal)
+        #     _acceleration[:,particle] .+= f_contact / mass[particle]
+        #    # gamma_lat = 0.1 * gamma_n  # smaller than vertical damping
+        #     #_acceleration[1,particle] -= gamma_lat * vel[1,particle] / mass[particle]
+        # end
+        z_i = current_coordinates[3,particle]
+        v_rel = dot(vel[:,particle] .- v_mold, normal)
+        if z_i >= y_mold - 2*smoothing_length
+            P = stress[:,:,particle]
+            traction = P * normal
+            if v_rel < 0
+                Z = material_density[particle] * wave_speed
+                t_star = traction - Z*(dot(vel[:,particle],normal)-v_mold)*normal
+                _acceleration[:,particle] += t_star ./ mass[particle]
+            end     
+            # @show t_star
+            # @show v_rel
+            # @show wave_speed
+            # @show traction
+            
 
-        r_min = particle_spacing # particle spacing or slightly less
-        if !(particle in fixed)
-            dist_to_b = current_coordinates[3, particle] - 0.00  
-            if dist_to_b < r_min
-                gamma_n = 200 * sqrt(k_n * mass[particle])
-                normal_bottom = SVector(0.00,0.00,1.0)
-                F_rep = -1e2 * dist_to_b * normal_bottom
-                F_rep -= gamma_n * dot(vel[:,particle], normal_bottom) * normal_bottom
-            else
-                F_rep = 0
-            end
-            _acceleration[:,particle] .+= F_rep / mass[particle]
-        end
+        end   
     end
 
-    return _acceleration, F_total_mold
+    return _acceleration,F_total_mold
 end
 
 @inline function viscous_stress3d!(system,vis,dt,fixed, semi)
     (; deformation_grad, young_modulus, poisson_ratio) = system
-
-    println("size deformation grad: ",size(deformation_grad))
-    println("eltype(system) = ", eltype(system))
-    println("typeof(system) = ", typeof(system))    
+    #println("viscous_Regime")
     
     v_vis = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2)
                     ,size(deformation_grad,3))
     F,b,d = calc_deformation_grad3d!(deformation_grad, system,dt,fixed, semi)
     K = young_modulus/(3-6*poisson_ratio)
+    wave_speed = K
 
     @threaded semi for particle in eachparticle(system)
         det_F = max(det(F[:,:,particle]), 1e-6)
@@ -329,13 +356,13 @@ end
         end
     end
 
-    return v_vis
+    return v_vis, wave_speed
 end
 
 @inline function elastic_stress3d!(system,ys, hard, vis, dt, _alpha ,fixed, semi)
     (; deformation_grad,young_modulus,poisson_ratio,temp, tmelt, hardening, material_density, cp, temp) = system
 
-    println("size deformation grad: ",size(deformation_grad))
+    #println("size deformation grad: ",size(deformation_grad))
     v_elas = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2)
                     ,size(deformation_grad,3))
     
@@ -345,7 +372,6 @@ end
 
     mu = young_modulus/(2+2*poisson_ratio)
     K = young_modulus/(3-6*poisson_ratio)
-
 
     @threaded semi for particle in eachparticle(system)
         Fp[:,:,particle] .= Matrix{Float64}(I, 3, 3)
@@ -371,6 +397,7 @@ end
 
 
         if yf > 1e-6
+            #println("plastic_Regime")
             if temp[particle] < 0.5*tmelt
                 strain_rate = yf/(3*mu + hardening)     
             else
@@ -405,6 +432,8 @@ end
             plastic_work = sum(v_elas[:,:,particle] .* depsilon)
             beta = 0.9
             temp[particle] += beta * plastic_work / (material_density[particle]*cp) * dt
+        else
+            #println("Elastic_Regime")
         end
     end
     return v_elas, _alpha
@@ -451,9 +480,9 @@ end
         result = volume * pos_diff * grad_kernel' * L'
         result_v = volume * vel_diff * grad_kernel' * L'
 
-        for k in 1:ndims(system), j in 1:ndims(system), i in 1:ndims(system)
-            @inbounds velocity_grad[i,j,k,particle] -= dt * result_v[i,j,k]   
-            @inbounds deformation_grad[i, j, k, particle] -= dt * result[i,j,k]        
+        for j in 1:ndims(system), i in 1:ndims(system)
+            @inbounds velocity_grad[i,j,particle] -= dt * result_v[i,j]   
+            @inbounds deformation_grad[i, j,particle] -= dt * result[i,j]        
         end
 
         # Skip too-close particles (optional)
