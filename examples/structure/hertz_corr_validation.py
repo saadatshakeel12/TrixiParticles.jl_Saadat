@@ -10,12 +10,12 @@ from scipy.interpolate import griddata
 # ==========================================================
 # Parameters (Must match your Julia setup)
 # ==========================================================
-E      = 1e6
-nu     = 0.3
+E      = 1.5e9
+nu     = 0.42
 E_star = E / (1 - nu**2)
-rho_0  = 1500.0
-R_cyl  = 0.006
-L_cyl  = 0.012
+rho_0  = 905.0
+R_cyl  = 4.0e-3
+L_cyl  = 12.0e-3
 
 # Acoustic Impedance for Riemann damping reconstruction
 c_0    = np.sqrt(E / rho_0)
@@ -36,9 +36,9 @@ def extract_boundary_frame(fpath):
 # Mesh Convergence Study — define runs here
 # ==========================================================================================
 runs = [
-    ("cylinder_drop_new4", 0.0013, 'blue',  'ps=1.3mm'),
-    ("cylinder_drop_new5", 0.001, 'red',   'ps=1.0mm'),
-    ("cylinder_drop_new6", 0.0007, 'green',   'ps=0.7mm')
+    ("stamping_isothermal_elastoplastic", 0.002, 'blue',  'ps=2.0mm'),
+    # ("cylinder_drop_new5", 0.001, 'red',   'ps=1.0mm'),
+    # ("cylinder_drop_new6", 0.0007, 'green',   'ps=0.7mm')
     # Add more runs here:
     # ("cylinder_drop_new7", 0.0005, 'green', 'ps=0.5mm'),
 ]
@@ -153,116 +153,46 @@ for run_prefix, run_ps, run_color, run_label in runs:
     time_arr     = np.array(time_history)
 
     # ==========================================================
-    # Theory & Validation Logic
+    # SPH-only metrics (Hertz comparison disabled)
     # ==========================================================
     max_delta    = np.max(indent_arr)
     smooth_delta = np.linspace(0, max_delta, 100) if max_delta > 0 else np.linspace(0, 0.001, 100)
 
-    sph_peak_elastic = np.max(elastic_arr) if len(elastic_arr) > 0 else 0.0
-    if max_delta > 0:
-        scale_factor = sph_peak_elastic / (max_delta**1.5)
-    else:
-        scale_factor = 0
-
     loading   = v_z_arr < -1e-4
     unloading = v_z_arr >  1e-4
 
-    from scipy.optimize import curve_fit
-
-    def hertz_shape(d, k):
-        return k * (d**1.5)
-
-    valid_idx = indent_arr > (0.1 * max_delta)
-    if np.any(valid_idx):
-        try:
-            popt, _ = curve_fit(hertz_shape, indent_arr[valid_idx], elastic_arr[valid_idx])
-            k_fit = popt[0]
-        except Exception:
-            k_fit = 0
-    else:
-        k_fit = 0
-
-    smooth_hertz = k_fit * (smooth_delta**1.5)
-
-    f_theory_load   = smooth_hertz
-    f_theory_unload = smooth_hertz
-    cor_velocity    = 0.0
-
+    cor_velocity = 0.0
     if np.any(loading) and np.any(unloading):
-        res_load   = forces_arr[loading]   - (k_fit * indent_arr[loading]**1.5)
-        res_unload = (k_fit * indent_arr[unloading]**1.5) - forces_arr[unloading]
-
-        lift = np.percentile(res_load,   95) if len(res_load)   > 0 else 0
-        dip  = np.percentile(res_unload, 95) if len(res_unload) > 0 else 0
-
-        delta_offset  = 0.0
-        shifted_delta = np.maximum(0, smooth_delta - delta_offset)
-        max_shifted   = np.max(shifted_delta)
-
-        smooth_hertz = k_fit * (shifted_delta**1.5)
-
-        if max_shifted > 0:
-            f_theory_load   = smooth_hertz + (lift * (shifted_delta / max_shifted))
-            f_theory_unload = smooth_hertz - (dip  * (shifted_delta / max_shifted))
-        else:
-            f_theory_load = smooth_hertz
-
-        idx_L = np.argsort(indent_arr[loading])
-        idx_U = np.argsort(indent_arr[unloading])
-        if len(idx_L) > 1 and len(idx_U) > 1:
-            w_in  = trapezoid(forces_arr[loading][idx_L],   indent_arr[loading][idx_L])
-            w_out = trapezoid(forces_arr[unloading][idx_U], indent_arr[unloading][idx_U])
-
-        v_before     = np.abs(np.min(v_z_avg))
-        v_after      = np.abs(np.max(v_z_avg))
+        v_before = np.abs(np.min(v_z_avg))
+        v_after  = np.abs(np.max(v_z_avg))
         cor_velocity = v_after / v_before if v_before > 0 else 0.0
         print(f"CoR (Velocity-based): {cor_velocity:.3f}")
 
-    # ==========================================================
-    # ROBUST HERTZ VALIDATION
-    # ==========================================================
+    # Physical indentation estimate used for normalized SPH plots.
     physical_gap    = h - (ps / 2)
     true_indent_arr = np.maximum(0, indent_arr - physical_gap)
-    max_true_delta  = np.max(true_indent_arr)
-
-    vm_max_theo = 0.0
-    a_theo      = 0.0
-    p0_theo     = 0.0
 
     max_disp_idx  = np.argmax(disp_arr) if len(disp_arr) > 0 else 0
     idx_max_force = np.argmax(forces_arr)
 
-    if max_true_delta > 0:
-        idx_max     = np.argmax(forces_arr)
-        P_physical  = forces_arr[idx_max]
-        p_line_true = P_physical / L_cyl
+    # Keep placeholders for downstream references where Hertz overlays are commented out.
+    k_fit = 0.0
+    smooth_hertz = np.zeros_like(smooth_delta)
+    f_theory_load = np.zeros_like(smooth_delta)
+    f_theory_unload = np.zeros_like(smooth_delta)
+    vm_max_theo = 0.0
+    a_theo = 0.0
+    p0_theo = 0.0
 
-        a_theo      = np.sqrt((4 * p_line_true * R_cyl) / (np.pi * E_star))
-        p0_theo     = (2 * p_line_true) / (np.pi * a_theo)
-        vm_max_theo = 0.56 * p0_theo
-
-        m_peak = meshio.read(struct_files[idx_max])
-        if 'von_mises_stress' in m_peak.point_data:
-            raw_vm_data = m_peak.point_data['von_mises_stress']
-            valid_peak_vm = raw_vm_data[~np.isnan(raw_vm_data)]
-            vm_max      = np.percentile(valid_peak_vm, 99.5) / 1000.0 if len(valid_peak_vm) > 0 else 0.0
-        else:
-            vm_max = 0.0
-
-        print(f"\n--- PHYSICAL HERTZ VALIDATION ({run_label}) ---")
-        print(f"True Physical Indent: {max_true_delta*1000:.4f} mm")
-        print(f"Physical Force:       {P_physical:.2f} N")
-        print(f"Theory Peak VM:   {vm_max_theo/1000:.2f} kPa")
-        print(f"SPH Peak VM:      {vm_max:.2f} kPa")
-
-        final_error = abs((vm_max_theo/1000.0) - vm_max) / (vm_max_theo/1000.0) * 100 if vm_max_theo > 0 else 0
-        print(f"Final Validation Error: {final_error:.2f} %")
+    if len(vm_arr) > 0:
+        vm_max = np.percentile(vm_arr[~np.isnan(vm_arr)], 99.5) / 1000.0 if np.any(~np.isnan(vm_arr)) else 0.0
     else:
         vm_max = 0.0
-        print(f"\n--- VALIDATION STATUS: PRE-CONTACT ({run_label}) ---")
-        print(f"Current Max Overlap: {np.max(indent_arr)*1000:.4f} mm")
-        print(f"Required for Contact (h): {h*1000:.4f} mm")
-        print("RESULT: No physical contact yet. Theory skipped.")
+
+    print(f"\n--- SPH-ONLY VALIDATION ({run_label}) ---")
+    print(f"Max Physical Indent: {np.max(true_indent_arr)*1000:.4f} mm")
+    print(f"Max Contact Force:   {np.max(forces_arr):.4f} N")
+    print(f"SPH Peak VM (P99.5): {vm_max:.2f} kPa")
 
     print(f"Peak Von Mises: {np.max(max_vm_history)/1e3:.4f} KPa")
 
@@ -374,14 +304,15 @@ boundary_files  = r['boundary_files']
 cor_velocity    = r['cor']
 k_fit           = r['k_fit']
 
-# Update the Stress Evolution Plot to include the Theoretical Max
+# Stress evolution (SPH-only)
 plt.figure(figsize=(10, 6))
 plt.plot(r['time'], r['vm']/1e3, 'b-', label=f'SPH (ps={ps*1000}mm)')
-if np.max(forces_arr) > 0:
-    plt.axhline(y=vm_max_theo/1e3, color='r', linestyle='--', label='Hertz Analytical Peak')
+# HERTZ_COMPARISON_DISABLED:
+# if np.max(forces_arr) > 0:
+#     plt.axhline(y=vm_max_theo/1e3, color='r', linestyle='--', label='Hertz Analytical Peak')
 plt.xlabel("Time (s)")
 plt.ylabel("Max Von Mises Stress (KPa)")
-plt.title("Stress Evolution vs. Analytical Hertz Theory")
+plt.title("Stress Evolution (SPH)")
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.savefig("stress_validation_hertz.png")
@@ -390,12 +321,13 @@ plt.savefig("stress_validation_hertz.png")
 plt.figure(figsize=(10, 6))
 plt.scatter(indent_arr[loading]*1000,   forces_arr[loading],   color='red',  s=5, alpha=0.4, label='SPH Loading')
 plt.scatter(indent_arr[unloading]*1000, forces_arr[unloading], color='blue', s=5, alpha=0.4, label='SPH Unloading')
-plt.plot(smooth_delta*1000, f_theory_load,   'k--', label='Theory: Loading')
-plt.plot(smooth_delta*1000, f_theory_unload, 'k:',  label='Theory: Unloading')
-plt.plot(smooth_delta*1000, smooth_hertz,    'g-',  lw=2, label='Elastic Backbone (Hertz)')
+# HERTZ_COMPARISON_DISABLED:
+# plt.plot(smooth_delta*1000, f_theory_load,   'k--', label='Theory: Loading')
+# plt.plot(smooth_delta*1000, f_theory_unload, 'k:',  label='Theory: Unloading')
+# plt.plot(smooth_delta*1000, smooth_hertz,    'g-',  lw=2, label='Elastic Backbone (Hertz)')
 plt.xlabel("Indentation (mm)")
 plt.ylabel("Force (N)")
-plt.title("Kelvin-Voigt Proof: SPH Contact Damping")
+plt.title("Force-Indentation (SPH only)")
 plt.legend()
 plt.grid(True, alpha=0.2)
 plt.savefig("kv_validation_proof.png")
@@ -413,8 +345,30 @@ plt.legend()
 plt.grid(True, alpha=0.2)
 plt.savefig("reaction_force_vs_displacement.png")
 
+# --- PLOT 2b: Engineering Stress-Strain Curve ---
+# Engineering strain: epsilon = u / L0 (using initial cylinder height L_cyl)
+# Engineering stress: sigma = F / A0 (using initial cross-sectional area A0 = pi*R^2)
+A0 = np.pi * (R_cyl ** 2)
+eng_strain = np.maximum(0.0, (disp_arr / 1000.0) / L_cyl)
+eng_stress_mpa = (forces_arr / A0) / 1e6
+
+plt.figure(figsize=(10, 6))
+plt.plot(eng_strain[:max_disp_idx + 1], eng_stress_mpa[:max_disp_idx + 1],
+         color='red', lw=1.5, label='Approach (Loading)')
+plt.plot(eng_strain[max_disp_idx:], eng_stress_mpa[max_disp_idx:],
+         color='blue', lw=1.5, label='Rebound (Unloading)')
+if len(eng_strain) > 0:
+    plt.scatter(eng_strain[max_disp_idx], eng_stress_mpa[max_disp_idx],
+                color='black', zorder=5, label='Peak Point')
+plt.xlabel("Engineering Strain (-)")
+plt.ylabel("Engineering Stress (MPa)")
+plt.title("Engineering Stress-Strain Curve")
+plt.legend()
+plt.grid(True, alpha=0.2)
+plt.savefig("engineering_stress_strain.png")
+
 print(f"Peak Von Mises: {np.max(r['vm'])/1e3:.4f} KPa")
-print("Successfully saved: kv_validation_proof.png and reaction_force_vs_displacement.png")
+print("Successfully saved: kv_validation_proof.png, reaction_force_vs_displacement.png, and engineering_stress_strain.png")
 
 plt.figure(figsize=(10, 6))
 plt.plot(time_arr, vm_arr, 'b-', label=f'SPH (ps={ps*1000}mm)')
@@ -434,11 +388,12 @@ f_ref_05 = 0.5 * w_ref
 # --- PLOT 3a ---
 plt.figure(figsize=(8, 6))
 plt.plot(w_norm, F_norm, 'b-', lw=2, label=f'SPH (ps={ps})')
-plt.plot(w_ref, f_ref_05, 'k--', label='Target Gradient (0.5)')
+# HERTZ_COMPARISON_DISABLED:
+# plt.plot(w_ref, f_ref_05, 'k--', label='Target Gradient (0.5)')
 plt.scatter(w_norm[max_disp_idx], F_norm[max_disp_idx], color='red', zorder=5, label='Peak Impact')
 plt.xlabel(r"Normalized Displacement $\omega / \omega_c$")
 plt.ylabel(r"Normalized Force $F / F_c$")
-plt.title("Validation: Normalized Force (Tribology Letters)")
+plt.title("Normalized Force (SPH)")
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.savefig("norm_force_vs_disp_changed.png")
@@ -458,11 +413,12 @@ plt.savefig("norm_force_vs_disp.png")
 w_theory_norm = np.linspace(0, np.max(w_norm)*1.1, 100)
 plt.figure(figsize=(8, 6))
 plt.plot(w_norm, b_norm, 'g-', label='SPH Contact Growth')
-if np.max(w_norm) > 0:
-    plt.plot(w_theory_norm, slope_b * np.sqrt(w_theory_norm), 'k--', label='Hertzian Growth ($b \propto \sqrt{w}$)')
+# HERTZ_COMPARISON_DISABLED:
+# if np.max(w_norm) > 0:
+#     plt.plot(w_theory_norm, slope_b * np.sqrt(w_theory_norm), 'k--', label='Hertzian Growth ($b \propto \sqrt{w}$)')
 plt.xlabel(r"Normalized Displacement $\omega / \omega_c$")
 plt.ylabel(r"Normalized Half-Width $b / b_c$")
-plt.title("Validation: Contact Width Evolution")
+plt.title("Contact Width Evolution (SPH)")
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.savefig("norm_width_vs_disp.png")
@@ -477,11 +433,12 @@ y_trend = p_fit(x_trend)
 plt.figure(figsize=(8, 6))
 plt.scatter(x_data, y_data, color='green', s=10, alpha=0.1, label='SPH Raw Data')
 plt.plot(x_trend, y_trend, color='green', lw=3, label='SPH Best-Fit Trend')
-if np.max(w_norm) > 0:
-    plt.plot(w_theory_norm, slope_b * np.sqrt(w_theory_norm), 'k--', label='Hertzian Growth ($b \propto \sqrt{w}$)')
+# HERTZ_COMPARISON_DISABLED:
+# if np.max(w_norm) > 0:
+#     plt.plot(w_theory_norm, slope_b * np.sqrt(w_theory_norm), 'k--', label='Hertzian Growth ($b \propto \sqrt{w}$)')
 plt.xlabel('Normalized Displacement $\omega/\omega_c$')
 plt.ylabel('Normalized Half-Width $b/b_c$')
-plt.title('Validation: Contact Width Evolution (Best-Fit)')
+plt.title('Contact Width Evolution (Best-Fit, SPH)')
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.savefig("contact_width_best_fit.png")
@@ -536,23 +493,22 @@ if 'sigma_33' in m_max.point_data and np.any(contact_mask):
         for i in range(n_bins)
     ])
 
-    a_contact = np.max(np.abs(y_sorted))
-    y_ell     = np.linspace(-a_contact, a_contact, 200)
-    p_ell     = p0_theo * np.sqrt(np.maximum(0, 1 - (y_ell / a_contact)**2))
-
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.scatter(y_sorted*1000, sigma_zz_vals,
                c='green', s=20, alpha=0.4, label='SPH σ_33 (compressive)')
     ax.plot(bin_cents*1000, bin_means, 'b-o', lw=2, ms=5, label='SPH σ_33 (bin mean)')
-    ax.plot(y_ell*1000, p_ell/1000, 'r-', lw=2,
-            label=f'Hertz p(y), p0={p0_theo/1000:.1f} kPa')
+    # HERTZ_COMPARISON_DISABLED:
+    # a_contact = np.max(np.abs(y_sorted))
+    # y_ell     = np.linspace(-a_contact, a_contact, 200)
+    # p_ell     = p0_theo * np.sqrt(np.maximum(0, 1 - (y_ell / a_contact)**2))
+    # ax.plot(y_ell*1000, p_ell/1000, 'r-', lw=2,
+    #         label=f'Hertz p(y), p0={p0_theo/1000:.1f} kPa')
     ax.set_xlabel('Width along cylinder (mm)')
     ax.set_ylabel('Stress (kPa)')
-    ax.set_title('Contact Normal Stress σ_33 vs Hertz Pressure')
+    ax.set_title('Contact Normal Stress σ_33 (SPH)')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    plt.suptitle(f'Max indentation frame {idx_max_indent} — '
-                 f'a={a_contact*1000:.2f}mm  p0={p0_theo/1000:.1f}kPa', fontsize=10)
+    plt.suptitle(f'Max indentation frame {idx_max_indent}', fontsize=10)
     plt.tight_layout()
     plt.savefig("sph_vs_hertz_pressure.png", dpi=150, bbox_inches='tight')
     plt.close()
@@ -579,21 +535,23 @@ depth    = np.abs(z_spine - z_floor) * 1000
 sort_idx = np.argsort(depth)
 
 z_theory     = np.linspace(0, np.max(depth), 100)
-a_mm         = a_theo * 1000 if a_theo > 0 else 1.0
-p0_val       = p0_theo if p0_theo > 0 else np.max(vm_spine)
-theory_vm_profile = p0_val * 0.56 * (1 / (1 + (z_theory/(a_mm*1.5))**2))
+# HERTZ_COMPARISON_DISABLED:
+# a_mm         = a_theo * 1000 if a_theo > 0 else 1.0
+# p0_val       = p0_theo if p0_theo > 0 else np.max(vm_spine)
+# theory_vm_profile = p0_val * 0.56 * (1 / (1 + (z_theory/(a_mm*1.5))**2))
 
 plt.figure(figsize=(8, 6))
 plt.plot(vm_spine[sort_idx]/1000, depth[sort_idx], 'b.-', label='SPH Centerline Stress')
-plt.plot(theory_vm_profile/1000, z_theory, 'r--', lw=2, label='Hertz Depth Theory')
+# HERTZ_COMPARISON_DISABLED:
+# plt.plot(theory_vm_profile/1000, z_theory, 'r--', lw=2, label='Hertz Depth Theory')
 plt.ylabel("Depth from Contact Surface (mm)")
 plt.xlabel("Von Mises Stress (KPa)")
-plt.title("Validated Depth Profile: Stress Propagation into Cylinder")
+plt.title("Depth Profile: Stress Propagation into Cylinder (SPH)")
 plt.gca().invert_yaxis()
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.savefig("stress_depth_fixed.png")
-print(f"Saved: stress_depth_fixed.png. Theoretical peak depth target: {0.707*a_mm:.3f} mm")
+print("Saved: stress_depth_fixed.png")
 
 # ==========================================================
 # Von Mises Contour Animation (last run)

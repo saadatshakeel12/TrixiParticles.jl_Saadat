@@ -83,7 +83,9 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
     where `beam` and `clamped_particles` are of type [`InitialCondition`](@ref).
 
 """
-@inline function update_temperature_sph3d!(system, dt, ext_heat ,particle_spacing, bound_coordinate, semi)
+@inline function update_temperature_sph3d!(system, dt, ext_heat, particle_spacing, bound_coordinate, semi;
+                                           artificial_diffusion_coeff=0.005,
+                                           temperature_increment_limit=0.1)
     # Unpack system properties
     (; mass, material_density, temp, temp_ref, cp, k, current_coordinates, smoothing_length) = system
 
@@ -92,15 +94,32 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
 
     dx = particle_spacing
 
+    rho_wall = material_density[1]
     for i in 1:length(temp)
         if current_coordinates[bound_coordinate[1],i] < bound_coordinate[2]
-            dq = ext_heat   # W/m²
-            dT[i] += dq / (material_density[i] * cp * dx)
+            dT[i] += ext_heat / (rho_wall * cp * dx)
         end
     end
 
     # Loop over all particles and neighbors (SPH)
     initial_coords = initial_coordinates(system)
+
+    # --- Pass 1: Shepard normalization factor ---
+    # W_sum[i] = sum_j V_j * W(r_ij).  For a fully-embedded particle this
+    # approaches 1; near the wall it drops to ~0.5 because the kernel support
+    # is truncated by the boundary.  Dividing the conduction flux by W_sum
+    # restores consistency (Randles & Libersky 1996 renormalization).
+    W_sum = zeros(eltype(temp), length(temp))
+    foreach_point_neighbor(system, system, initial_coords, initial_coords,
+                           semi) do particle, neighbor, r_nb, _
+        rho_nb  = material_density[1]
+        vol_nb  = mass[neighbor] / rho_nb
+        r_scalar = sqrt(TrixiParticles.dot(r_nb, r_nb))
+        W_sum[particle] += vol_nb * smoothing_kernel(system, r_scalar, particle)
+    end
+    clamp!(W_sum, 0.1, Inf)   # guard against near-zero at isolated boundary nodes
+
+    # --- Pass 2: SPH thermal conduction with truncated-support renormalization ---
     foreach_point_neighbor(system, system, initial_coords, initial_coords,
                            semi) do particle, neighbor, r, initial_distance2
 
@@ -110,7 +129,7 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
         volume = @inbounds mass[neighbor] / rho
 
         ##artificial thermal diffusion to reduce oscillations
-        temp[particle] += 0.005 * (temp[neighbor] - temp[particle])
+        temp[particle] += artificial_diffusion_coeff * (temp[neighbor] - temp[particle])
 
         # Distance vector
 
@@ -147,11 +166,12 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
         end
 
         flux = volume * k / (rho * cp) *
-                        (temp[neighbor] - temp[particle]) *
-                        val /(r2)
+                (temp[particle] - temp[neighbor]) *
+                val /(r2)
 
-        dT[particle] += flux
-        
+        # Truncated-support renormalization: scale by 1/W_sum to recover
+        # Laplacian consistency near the wall where kernel support is cut off
+        dT[particle] += flux / W_sum[particle]
 
     end
 
@@ -159,7 +179,7 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
     #println("nonzero dT count = ", count(!iszero, dT))
 
     # # Update temperature with flux limiter
-    dT_max = 0.1
+    dT_max = temperature_increment_limit
     @inbounds for i in 1:length(temp)
         temp_ref = temp[i]
 
@@ -174,6 +194,71 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
     #println("dE = ", sum(dT .* mass ./ material_density))
 
     return temp
+end
+
+# Compute the thermal RHS dT/dt for use as an ODE state variable.
+# Writes dT/dt into dv[ndims(system)+1, particle] for each integrated particle.
+# No mutation of system.temp — the ODE solver integrates the temperature row of v.
+# Call this at the end of kick_implicit_visible! after all momentum terms are set.
+@inline function thermal_rhs_sph3d!(system, dv, v, ext_heat, particle_spacing, bound_coordinate, semi)
+    (; mass, material_density, temp, cp, k, current_coordinates, smoothing_length) = system
+
+    NDIMS      = ndims(system)
+    n_particles = nparticles(system)
+    rho        = material_density[1]
+    dT         = zeros(eltype(system), n_particles)
+
+    # Boundary heat flux source term
+    dx = particle_spacing
+    for i in 1:n_particles
+        if current_coordinates[bound_coordinate[1], i] < bound_coordinate[2]
+            dT[i] += ext_heat / (rho * cp * dx)
+        end
+    end
+
+    initial_coords = initial_coordinates(system)
+
+    # Shepard normalization for truncated-kernel consistency near boundaries
+    W_sum = zeros(eltype(system), n_particles)
+    foreach_point_neighbor(system, system, initial_coords, initial_coords,
+                           semi) do particle, neighbor, r_nb, _
+        vol_nb   = mass[neighbor] / rho
+        r_scalar = sqrt(TrixiParticles.dot(r_nb, r_nb))
+        W_sum[particle] += vol_nb * smoothing_kernel(system, r_scalar, particle)
+    end
+    clamp!(W_sum, 0.1, Inf)
+
+    # SPH thermal conduction: dT/dt += (k / rho*cp) * Laplacian(T)
+    foreach_point_neighbor(system, system, initial_coords, initial_coords,
+                           semi) do particle, neighbor, r_nb, _
+        volume = mass[neighbor] / rho
+
+        @views r_vec = current_coordinates[:, particle] .- current_coordinates[:, neighbor]
+        r_vec = convert.(eltype(system), r_vec)
+
+        r2 = TrixiParticles.dot(r_vec, r_vec)
+        r2 < eps(smoothing_length^2) && return
+        r_dist = sqrt(r2)
+
+        grad_kernel = smoothing_kernel_grad(system, r_vec, r_dist, particle)
+        _eps = 1e-3
+        h2   = smoothing_length^2
+
+        val = TrixiParticles.dot(r_vec, grad_kernel)
+        # val should be ≤ 0 for a radial kernel; clamp positive roundoff to zero
+        val = min(val, zero(val))
+
+        flux = volume * k / (rho * cp) *
+               (temp[particle] - temp[neighbor]) * val / (r2 + _eps * h2)
+        dT[particle] += flux / W_sum[particle]
+    end
+
+    # Write dT/dt into the temperature row of dv
+    for particle in each_integrated_particle(system)
+        dv[NDIMS + 1, particle] += dT[particle]
+    end
+
+    return dv
 end
 
 @inline function thermomechanical_loop3d(system, temp_mold, y_mold ,particle_spacing, bound_coordinate ,dt, vel,fixed, alpha,F_total_mold, v_mold, semi)

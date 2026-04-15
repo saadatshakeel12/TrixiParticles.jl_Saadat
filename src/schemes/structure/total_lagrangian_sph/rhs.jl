@@ -1,5 +1,5 @@
 # Structure-structure interaction (includes cross-system volumetric contact)
-function interact!(dv, v_particle_system, u_particle_system, dv_neighbor,
+function interact!(dv, v_particle_system, u_particle_system,
                    v_neighbor_system, u_neighbor_system,
                    particle_system::TotalLagrangianSPHSystem,
                    neighbor_system::TotalLagrangianSPHSystem,
@@ -13,8 +13,8 @@ function interact!(dv, v_particle_system, u_particle_system, dv_neighbor,
         interact_structure_structure!(dv, v_particle_system, particle_system, semi)
     else
         # Cross-system: volumetric contact between cylinder and floor
-        # Pass both dv arrays so we can apply equal-and-opposite forces efficiently
-        interact_Reimann!(dv, dv_neighbor, v_particle_system, u_particle_system,
+        # Symmetric system-pair calls provide equal-and-opposite coupling at system level.
+        interact_Reimann!(dv, v_particle_system, u_particle_system,
                             v_neighbor_system, u_neighbor_system,
                             particle_system, neighbor_system, semi)
     end
@@ -224,6 +224,15 @@ end
 @inline function interact_structure_structure!(dv, v_system, system, semi)
     (; penalty_force) = system
 
+    # Check once whether a custom thermomechanical stress is cached for this system.
+    # If STRESS_TENSOR_CACHE holds (objectid(system), stress_array), use that instead of
+    # the built-in pk1_rho2.  The cached array is corrected PK1 stress (3×3×n); dividing
+    # by rho² brings it to the same units as system.pk1_rho2.  Falls back to pk1_rho2
+    # when cache is nothing (pk1_restored path) or belongs to a different system.
+    _cached       = STRESS_TENSOR_CACHE[]
+    _use_cache    = _cached !== nothing && _cached[1] == objectid(system)
+    _cache_stress = _use_cache ? _cached[2] : nothing
+
     # Everything here is done in the initial coordinates
     system_coords = initial_coordinates(system)
 
@@ -246,9 +255,13 @@ end
         m_a = @inbounds system.mass[particle]
         m_b = @inbounds system.mass[neighbor]
 
-        # PK1 / rho^2
-        pk1_rho2_a = @inbounds pk1_rho2(system, particle)
-        pk1_rho2_b = @inbounds pk1_rho2(system, neighbor)
+        # PK1 / rho^2 — use cached thermomechanical stress if available, else built-in
+        pk1_rho2_a = _use_cache ?
+            extract_smatrix(_cache_stress, system, particle) / (rho_a * rho_a) :
+            @inbounds pk1_rho2(system, particle)
+        pk1_rho2_b = _use_cache ?
+            extract_smatrix(_cache_stress, system, neighbor) / (rho_b * rho_b) :
+            @inbounds pk1_rho2(system, neighbor)
 
         current_pos_diff_ = @inbounds current_coords(system, particle) -
                                       current_coords(system, neighbor)
@@ -385,7 +398,7 @@ end
                          grad_kernel, particle)
 end
 
-function interact_Reimann!(dv, dv_neighbor, v_particle_system, u_particle_system,
+function interact_Reimann!(dv, v_particle_system, u_particle_system,
                            v_neighbor_system, u_neighbor_system,
                            particle_system::TotalLagrangianSPHSystem,
                            neighbor_system::TotalLagrangianSPHSystem,
@@ -414,7 +427,7 @@ function interact_Reimann!(dv, dv_neighbor, v_particle_system, u_particle_system
     # ==========================
     h_global = initial_smoothing_length(particle_system)
     ps       = h_global / 1.5        # particle spacing (factor=1.5 from setup)
-    z_wall   = maximum(neighbor_coords[3, :])  # flat plate top surface z
+    z_wall   = maximum(@view neighbor_coords[3, :])  # flat plate top surface z
     r_i      = ps / 2                # effective particle radius ≈ Δp/2
     A_eff    = ps^2                  # effective contact area per particle (eq. 10)
     α        = 0.1                   # stabiliser threshold factor
@@ -426,8 +439,8 @@ function interact_Reimann!(dv, dv_neighbor, v_particle_system, u_particle_system
     # n_w3 = one(eltype(system_coords))
 
 
-    z_sys_mean = sum(system_coords[3, :]) / size(system_coords, 2)
-    z_nbr_mean = sum(neighbor_coords[3, :]) / size(neighbor_coords, 2)
+    z_sys_mean = sum(@view system_coords[3, :]) / size(system_coords, 2)
+    z_nbr_mean = sum(@view neighbor_coords[3, :]) / size(neighbor_coords, 2)
 
     # Determine contact direction — neighbor below (floor) or above (mold)
     neighbor_is_below = z_nbr_mean < z_sys_mean
@@ -439,13 +452,18 @@ function interact_Reimann!(dv, dv_neighbor, v_particle_system, u_particle_system
     # Wall reference z and normal direction
     # Floor below: z_wall = top of floor, normal points UP (+z)
     # Mold above:  z_wall = bottom of mold, normal points DOWN (-z)
-    z_wall = neighbor_is_below ? maximum(neighbor_coords[3, :]) :
-                                 minimum(neighbor_coords[3, :])
+    z_wall = neighbor_is_below ? maximum(@view neighbor_coords[3, :]) :
+                                 minimum(@view neighbor_coords[3, :])
     n_w3   = neighbor_is_below ? one(eltype(system_coords)) :
                                  -one(eltype(system_coords))
     n_w1   = zero(eltype(system_coords))
     n_w2   = zero(eltype(system_coords))
+    n_w    = SVector(n_w1, n_w2, n_w3)
     r_i    = ps / 2
+
+    # Neighbor velocity: all floor/mold particles share the same rigid body velocity,
+    # so reading particle 1 is exact and avoids an O(N_neighbor) averaging loop.
+    v_neighbor_mean = current_velocity(v_neighbor_system, neighbor_system, 1)
 
     # ==========================
     # Contact traction per particle — O(N), no neighbor loop
@@ -477,19 +495,7 @@ function interact_Reimann!(dv, dv_neighbor, v_particle_system, u_particle_system
         # --- Velocity: use relative normal velocity between systems ---
         v_i = current_velocity(v_particle_system, particle_system, particle)
 
-        # Compute mean neighbor velocity (approximate wall/mold velocity at contact)
-        v_neighbor_mean = zero(v_i)
-        n_neigh = 0
-        for nb in each_integrated_particle(neighbor_system)
-            v_neighbor_mean += current_velocity(v_neighbor_system, neighbor_system, nb)
-            n_neigh += 1
-        end
-        if n_neigh > 0
-            v_neighbor_mean = v_neighbor_mean / n_neigh
-        end
-
         # Wall normal vector (only z-component non-zero) and relative normal velocity
-        n_w = SVector(n_w1, n_w2, n_w3)
         v_rel = dot(v_i - v_neighbor_mean, n_w)
 
         # --- Riemann contact traction (eq. 7) ---
@@ -500,8 +506,11 @@ function interact_Reimann!(dv, dv_neighbor, v_particle_system, u_particle_system
 
         # --- Stabilising penalty (eq. 8) ---
         # Activates only for deep penetration δ > δ_tol
-        k_n    = E / ps                            # stiffness from material, no free param
-        c_n    = 2 * sqrt(k_n * m_i / A_eff)       # critical damping
+        k_n    = 1.0* E / ps                            # stiffness from material, no free param
+        c_n    = 0.05* 2 * sqrt(k_n * m_i / A_eff)       # critical damping
+
+        # k_n = E                          # mesh-independent total penalty force
+        # c_n = 2 * sqrt(E * rho_i)        # mesh-independent damping (critical at continuum limit)
 
         t_stab = δ > δ_tol ? k_n * (δ - δ_tol) : zero(δ)
         t_damp = (δ > 0 && v_rel < 0) ? c_n * (-v_rel) : zero(v_rel)
@@ -517,29 +526,6 @@ function interact_Reimann!(dv, dv_neighbor, v_particle_system, u_particle_system
         @inbounds dv[1, particle] += a_mag * n_w1
         @inbounds dv[2, particle] += a_mag * n_w2
         @inbounds dv[3, particle] += a_mag * n_w3
-
-        # --- Reaction: find nearest neighbor and apply equal-and-opposite force ---
-        min_dist = Inf
-        min_idx = 0
-        p_pos = system_coords[:, particle]
-        
-        # Check only particles within smoothing distance for efficiency
-        for nb in each_integrated_particle(neighbor_system)
-            nb_pos = neighbor_coords[:, nb]
-            d_sq = sum((p_pos .- nb_pos).^2)
-            if d_sq < min_dist && d_sq < (smoothing_length(particle_system))^2
-                min_dist = d_sq
-                min_idx = nb
-            end
-        end
-
-        if min_idx > 0
-            m_j = neighbor_system.mass[min_idx]
-            a_neighbor_mag = -F_n / m_j
-            @inbounds dv_neighbor[1, min_idx] += a_neighbor_mag * n_w1
-            @inbounds dv_neighbor[2, min_idx] += a_neighbor_mag * n_w2
-            @inbounds dv_neighbor[3, min_idx] += a_neighbor_mag * n_w3
-        end
     end
 
     return dv

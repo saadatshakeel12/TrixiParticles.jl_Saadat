@@ -388,6 +388,8 @@ function write2vtk!(vtk, v, u, t, system::TotalLagrangianSPHSystem)
     vtk["lame_mu"] = system.lame_mu
     vtk["young_modulus"] = system.young_modulus
     vtk["poisson_ratio"] = system.poisson_ratio
+    vtk["temperature"] = system.temp
+    vtk["temperature_ref"] = system.temp_ref
 
     sigma = cauchy_stress(system)
     vtk["sigma_11"] = sigma[1, 1, :]

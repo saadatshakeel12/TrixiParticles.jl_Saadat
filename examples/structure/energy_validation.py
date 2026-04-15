@@ -19,17 +19,18 @@ import meshio
 import glob
 import os
 import re
+from collections import defaultdict
 
 # ==========================================================================================
 # Parameters
 # ==========================================================================================
 rho_mat = 1500.0   # kg/m³
-E       = 1e6      # Pa
+E       = 1e5      # Pa (match the current implicit stamping setup)
 nu      = 0.3
 g_acc   = 9.81     # m/s²
-ps      = 0.0013   # m
-dt_out  = 0.005    # s
-prefix  = "cylinder_drop_new6"
+ps      = 0.002   # m
+dt_out  = 0.002    # s
+prefix  = "molding_cfrp_3d_thermo_implicit_krylov_mod2"
 folder  = "."
 
 G      = E / (2 * (1 + nu))
@@ -40,32 +41,59 @@ m_part = rho_mat * V_part
 # ==========================================================================================
 # Discover files — structure_1 only, sorted by frame number
 # ==========================================================================================
-def extract_frame_number(fpath):
-    match = re.search(r'_structure_1_(\d+)\.vtu$', fpath)
-    return int(match.group(1)) if match else -1
+def extract_structure_info(fpath):
+    match = re.search(r'_structure_(\d+)_(\d+)\.vtu$', fpath)
+    if not match:
+        return None
+    sid = int(match.group(1))
+    frame = int(match.group(2))
+    return sid, frame
 
-def extract_boundary_frame(fpath):
-    match = re.search(r'_boundary_1_(\d+)\.vtu$', fpath)
-    return int(match.group(1)) if match else -1
+all_structure_files = glob.glob(os.path.join(folder, f'{prefix}_structure_*_*.vtu'))
+files_by_sid = defaultdict(list)
+for fpath in all_structure_files:
+    info = extract_structure_info(fpath)
+    if info is None:
+        continue
+    sid, _ = info
+    files_by_sid[sid].append(fpath)
 
-struct_files = sorted(
-    [f for f in glob.glob(os.path.join(folder, f'{prefix}_structure_1_*.vtu'))
-     if extract_frame_number(f) >= 0],
-    key=extract_frame_number)
-
-boundary_files = sorted(
-    [f for f in glob.glob(os.path.join(folder, f'{prefix}_boundary_1_*.vtu'))
-     if extract_boundary_frame(f) >= 0],
-    key=extract_boundary_frame)
-
-if not struct_files:
-    print(f"No structure_1 VTU files found with prefix '{prefix}' in {folder}")
+if not files_by_sid:
+    print(f"No structure VTU files found with prefix '{prefix}' in {folder}")
     exit(1)
 
-print(f"Found {len(struct_files)} structure_1 files")
-print(f"Found {len(boundary_files)} boundary_1 files")
-print(f"First: {os.path.basename(struct_files[0])}")
-print(f"Last:  {os.path.basename(struct_files[-1])}")
+for sid in files_by_sid:
+    files_by_sid[sid].sort(key=lambda p: extract_structure_info(p)[1])
+
+structure_ids = sorted(files_by_sid.keys())
+print(f"Found structure IDs: {structure_ids}")
+for sid in structure_ids:
+    print(f"  structure_{sid}: {len(files_by_sid[sid])} files")
+
+# Detect cylinder as the structure with the smallest particle count.
+counts = {}
+z_mean0 = {}
+for sid in structure_ids:
+    m0 = meshio.read(files_by_sid[sid][0])
+    counts[sid] = len(m0.points)
+    z_mean0[sid] = float(m0.points[:, 2].mean())
+
+cylinder_sid = min(structure_ids, key=lambda sid: counts[sid])
+
+other_sids = [sid for sid in structure_ids if sid != cylinder_sid]
+if len(other_sids) >= 2:
+    floor_sid = min(other_sids, key=lambda sid: z_mean0[sid])
+    mold_sid = max(other_sids, key=lambda sid: z_mean0[sid])
+else:
+    floor_sid = None
+    mold_sid = None
+
+struct_files = files_by_sid[cylinder_sid]
+print(f"Using structure_{cylinder_sid} as cylinder (N={counts[cylinder_sid]})")
+if floor_sid is not None and mold_sid is not None:
+    print(f"Using structure_{floor_sid} as floor and structure_{mold_sid} as mold")
+print(f"First cylinder file: {os.path.basename(struct_files[0])}")
+print(f"Last  cylinder file: {os.path.basename(struct_files[-1])}")
 
 # ==========================================================================================
 # Reference state
@@ -75,6 +103,15 @@ pts0  = m0.points
 N     = len(pts0)
 M_tot = N * m_part
 
+# Prefer particle spacing stored in VTU output so validation matches simulation settings.
+if 'particle_spacing' in m0.point_data:
+    ps_data = np.asarray(m0.point_data['particle_spacing']).reshape(-1)
+    if ps_data.size > 0 and np.isfinite(ps_data[0]) and ps_data[0] > 0:
+        ps = float(ps_data[0])
+        V_part = ps**3
+        m_part = rho_mat * V_part
+        M_tot = N * m_part
+
 print(f"\nN particles = {N}")
 print(f"m_particle  = {m_part:.4e} kg")
 print(f"M_total     = {M_tot*1e3:.4f} g")
@@ -82,15 +119,13 @@ print(f"M_total     = {M_tot*1e3:.4f} g")
 # ==========================================================================================
 # Floor z-position
 # ==========================================================================================
-if boundary_files:
-    b0      = meshio.read(boundary_files[0])
-    z_floor = b0.points[:, 2].max()
-    print(f"Floor z     = {z_floor*1e3:.4f} mm  (from boundary VTU)")
+if floor_sid is not None:
+    floor0 = meshio.read(files_by_sid[floor_sid][0])
+    z_floor = floor0.points[:, 2].max()
+    print(f"Floor z     = {z_floor*1e3:.4f} mm  (from structure_{floor_sid})")
 else:
     z_floor = pts0[:, 2].min() - 2.0 * ps
     print(f"Floor z     = {z_floor*1e3:.4f} mm  (estimated)")
-
-h_smooth = 1.8 * ps
 
 # ==========================================================================================
 # Per-timestep extraction
@@ -101,16 +136,38 @@ KE           = np.zeros(n_files)
 SE           = np.zeros(n_files)
 PE           = np.zeros(n_files)
 z_cyl_bottom = np.zeros(n_files)
+z_cyl_top    = np.zeros(n_files)
 z_cm_arr     = np.zeros(n_files)
+T_mean       = np.zeros(n_files)
+T_max        = np.zeros(n_files)
+T_min        = np.zeros(n_files)
+T_top_band   = np.zeros(n_files)
 
 for i, fpath in enumerate(struct_files):
     m   = meshio.read(fpath)
     pts = m.points
     vel = m.point_data['velocity']
+    frame = extract_structure_info(fpath)[1]
 
     z_cm_arr[i]     = pts[:, 2].mean()
     z_cyl_bottom[i] = pts[:, 2].min()
-    times[i]        = i * dt_out
+    z_cyl_top[i]    = pts[:, 2].max()
+    times[i]        = frame * dt_out
+
+    temp = m.point_data.get('temperature', None)
+    if temp is not None:
+        temp = np.asarray(temp).flatten()
+        T_mean[i] = temp.mean()
+        T_max[i] = temp.max()
+        T_min[i] = temp.min()
+        # Average temperature in the top 1*ps layer (closest to mold).
+        top_mask = pts[:, 2] >= (z_cyl_top[i] - ps)
+        T_top_band[i] = temp[top_mask].mean() if np.any(top_mask) else T_mean[i]
+    else:
+        T_mean[i] = np.nan
+        T_max[i] = np.nan
+        T_min[i] = np.nan
+        T_top_band[i] = np.nan
 
     # Kinetic energy
     KE[i] = 0.5 * np.sum(m_part * np.sum(vel**2, axis=1))
@@ -133,11 +190,53 @@ for i, fpath in enumerate(struct_files):
 # ==========================================================================================
 # Contact detection
 # ==========================================================================================
-contact_idx = 0
-for i in range(n_files):
-    if z_cyl_bottom[i] <= (z_floor + h_smooth):
-        contact_idx = i
-        break
+contact_tol = 0.05 * ps
+contact_idx = None
+mold_contact_idx = None
+mold_min_gap = np.inf
+mold_min_gap_idx = None
+if floor_sid is not None:
+    floor_files = files_by_sid[floor_sid]
+    floor_files_by_frame = {extract_structure_info(f)[1]: f for f in floor_files}
+    mold_files_by_frame = {}
+    if mold_sid is not None:
+        mold_files = files_by_sid[mold_sid]
+        mold_files_by_frame = {extract_structure_info(f)[1]: f for f in mold_files}
+
+    for i, fpath in enumerate(struct_files):
+        frame = extract_structure_info(fpath)[1]
+
+        if frame not in floor_files_by_frame:
+            continue
+
+        floor_mesh = meshio.read(floor_files_by_frame[frame])
+        z_floor_frame = floor_mesh.points[:, 2].max()
+        gap = z_cyl_bottom[i] - z_floor_frame
+        if gap <= contact_tol:
+            contact_idx = i
+
+        if mold_sid is not None and frame in mold_files_by_frame:
+            mold_mesh = meshio.read(mold_files_by_frame[frame])
+            z_mold_frame = mold_mesh.points[:, 2].min()
+            gap_mold = z_mold_frame - z_cyl_top[i]
+            if gap_mold < mold_min_gap:
+                mold_min_gap = gap_mold
+                mold_min_gap_idx = i
+            if mold_contact_idx is None and 0.0 <= gap_mold <= 0.25 * ps:
+                mold_contact_idx = i
+
+        if contact_idx is not None and (mold_sid is None or mold_contact_idx is not None):
+            break
+else:
+    # Fallback if floor structure is unavailable.
+    for i in range(n_files):
+        if z_cyl_bottom[i] <= (z_floor + contact_tol):
+            contact_idx = i
+            break
+
+if contact_idx is None:
+    contact_idx = 0
+    print(f"\nNo contact detected in available frames (tol={contact_tol*1e3:.4f} mm).")
 
 times_contact = times - times[contact_idx]
 
@@ -145,6 +244,22 @@ print(f"\nContact at frame {contact_idx}, t={times[contact_idx]:.4f} s")
 print(f"Cylinder bottom : {z_cyl_bottom[contact_idx]*1e3:.4f} mm")
 print(f"Floor z         : {z_floor*1e3:.4f} mm")
 print(f"PE at t=0       : {PE[0]*1e3:.4f} mJ  (should be positive — cylinder above floor)")
+print(f"SE range        : min={SE.min()*1e3:.4e} mJ, max={SE.max()*1e3:.4e} mJ")
+
+if mold_contact_idx is None:
+    print(f"Mold contact    : not detected in available frames (thermal band=0..{0.25*ps*1e3:.4f} mm)")
+    if mold_min_gap_idx is not None:
+        print(f"Mold min gap    : {mold_min_gap*1e3:.4f} mm at frame {mold_min_gap_idx}"
+              f" (t={times[mold_min_gap_idx]:.4f} s)")
+else:
+    print(f"Mold contact    : frame {mold_contact_idx}, t={times[mold_contact_idx]:.4f} s")
+    if np.isfinite(T_mean[mold_contact_idx]):
+        print(f"T@mold_contact  : mean={T_mean[mold_contact_idx]:.3f} K, "
+              f"top_band={T_top_band[mold_contact_idx]:.3f} K, max={T_max[mold_contact_idx]:.3f} K")
+
+if np.isfinite(T_mean[0]):
+    print(f"Temperature span: mean {T_mean[0]:.3f} -> {T_mean[-1]:.3f} K, "
+          f"top_band {T_top_band[0]:.3f} -> {T_top_band[-1]:.3f} K")
 
 # ==========================================================================================
 # Total energy
@@ -171,7 +286,7 @@ print(f"\n{'t(s)':>8} {'t_c(s)':>8} {'KE(mJ)':>10} {'SE(mJ)':>10} "
 print("-" * 82)
 for i in range(n_files):
     print(f"{times[i]:>8.4f} {times_contact[i]:>8.4f} {KE[i]*1e3:>10.4f} "
-          f"{SE[i]*1e3:>10.4f} {PE[i]*1e3:>10.4f} "
+        f"{SE[i]*1e3:>10.3e} {PE[i]*1e3:>10.4f} "
           f"{E_total[i]*1e3:>12.4f} {dE_pct[i]:>12.2f}")
 
 print(f"\nContact time    : {times[contact_idx]:.4f} s")

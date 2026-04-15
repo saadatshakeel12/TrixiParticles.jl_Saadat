@@ -262,6 +262,20 @@ function Broadcast.BroadcastStyle(s1::ThreadedBroadcastStyle,
     return s1
 end
 
+# Reverse directions: needed because RecursiveArrayTools calls BroadcastStyle(AStyle(), BStyle())
+# for BOTH orderings when combining ArrayPartitionStyle types. Without these, mixing an
+# ArrayPartition{Vector} workspace (allocated by KrylovKit) with ArrayPartition{ThreadedBroadcastArray}
+# state produces conflicting results and a "conflicting broadcast rules" error.
+function Broadcast.BroadcastStyle(::Broadcast.AbstractArrayStyle,
+                                  s2::ThreadedBroadcastStyle)
+    return s2
+end
+
+function Broadcast.BroadcastStyle(::Broadcast.DefaultArrayStyle,
+                                  s2::ThreadedBroadcastStyle)
+    return s2
+end
+
 # Based on copyto!(dest::AbstractArray, bc::Broadcasted{Nothing})
 # defined in base/broadcast.jl.
 # For things like `A .= B .+ C` where `A` is a `ThreadedBroadcastArray`.

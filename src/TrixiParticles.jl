@@ -63,12 +63,18 @@ include("preprocessing/preprocessing.jl")
 include("io/io.jl")
 include("visualization/recipes_plots.jl")
 
+# Module-level stress tensor cache: set by callback, read by interact_structure_structure! in RHS.
+# Stores (system_objectid, array) so the cache is only used for the specific system that wrote it.
+# This prevents floor/mold self-interaction from accidentally reading the cylinder's stress.
+const STRESS_TENSOR_CACHE = Ref{Union{Nothing, Tuple{UInt64, Array}}}(nothing)
+
 export Semidiscretization, semidiscretize, restart_with!
 export InitialCondition
 export WeaklyCompressibleSPHSystem, EntropicallyDampedSPHSystem, TotalLagrangianSPHSystem,
        TotalLagrangianSPHSystem3d, WallBoundarySystem, DEMSystem, BoundaryDEMSystem, OpenBoundarySystem,
        ImplicitIncompressibleSPHSystem, thermomechanical_loop, thermomechanical_loop3d, eachparticle, update_temperature_sph!,
-       update_temperature_sph3d!
+    update_temperature_sph3d!, elastic_stress3d!, viscous_stress3d!, update_properties!,
+    elastic_stress3d_fast!, viscous_stress3d_fast!, elastic_stress3d_trial!, thermal_rhs_sph3d!
 export BoundaryZone, InFlow, OutFlow, BidirectionalFlow
 export InfoCallback, SolutionSavingCallback, DensityReinitializationCallback,
        PostprocessCallback, StepsizeCallback, UpdateCallback, SteadyStateReachedCallback,

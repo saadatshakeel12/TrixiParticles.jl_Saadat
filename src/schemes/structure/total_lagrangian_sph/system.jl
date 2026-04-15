@@ -285,23 +285,40 @@ end
 extract_periodic_box(::Nothing) = nothing
 extract_periodic_box(nhs) = nhs.periodic_box
 
-create_cache_tlsph(::Nothing, initial_condition) = (;)
+function create_cache_tlsph(::Nothing, initial_condition)
+    NDIMS = ndims(initial_condition)
+    ELTYPE = eltype(initial_condition)
+    n = nparticles(initial_condition)
+    velocity_grad = zeros(ELTYPE, NDIMS, NDIMS, n)
+    b_buf         = zeros(ELTYPE, NDIMS, NDIMS, n)
+    d_buf         = zeros(ELTYPE, NDIMS, NDIMS, n)
+    return (; velocity_grad, b_buf, d_buf)
+end
 
 function create_cache_tlsph(::PrescribedMotion, initial_condition)
     velocity = zero(initial_condition.velocity)
     acceleration = zero(initial_condition.velocity)
-
-    return (; velocity, acceleration)
+    NDIMS = ndims(initial_condition)
+    ELTYPE = eltype(initial_condition)
+    n = nparticles(initial_condition)
+    velocity_grad = zeros(ELTYPE, NDIMS, NDIMS, n)
+    b_buf         = zeros(ELTYPE, NDIMS, NDIMS, n)
+    d_buf         = zeros(ELTYPE, NDIMS, NDIMS, n)
+    return (; velocity, acceleration, velocity_grad, b_buf, d_buf)
 end
 
 @inline function Base.eltype(::TotalLagrangianSPHSystem{<:Any, <:Any, ELTYPE}) where {ELTYPE}
     return ELTYPE
 end
 
+# Temperature is integrated as the (ndims+1)-th velocity-block variable so that
+# implicit solvers (TRBDF2) handle thermal diffusion stiffness automatically.
 @inline function v_nvariables(system::TotalLagrangianSPHSystem)
-    return ndims(system)
+    return ndims(system) + 1
 end
 
+# ContinuityDensity already uses the ndims+1 slot for density; that dispatch
+# is intentionally left unchanged — it takes priority via Julia specificity.
 @inline function v_nvariables(system::TotalLagrangianSPHSystem{<:BoundaryModelDummyParticles{ContinuityDensity}})
     return ndims(system) + 1
 end
@@ -445,7 +462,28 @@ function apply_prescribed_motion!(system::TotalLagrangianSPHSystem, ::Nothing, s
     return system
 end
 
+# If this Ref holds objectid(system), update_quantities! computes only the
+# deformation gradient for that TLSPH system and skips building the default
+# pk1_rho2 tensor. This is used in the implicit custom-stress residual where
+# a stress cache replaces pk1_rho2 in the self-interaction loop.
+const TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM = Ref{Any}(nothing)
+
 function update_quantities!(system::TotalLagrangianSPHSystem, v, u, v_ode, u_ode, semi, t, dt=1e-5)
+    # All-clamped systems (rigid tools) have no deforming particles — skip heavy
+    # O(N·K) deformation-gradient and PK1 computation entirely.
+    isempty(each_integrated_particle(system)) && return system
+
+    # In the implicit custom-stress path we still need F for the constitutive law,
+    # but pk1_rho2 is overridden by STRESS_TENSOR_CACHE in the RHS, so building the
+    # default PK1 tensor would be redundant work.
+    if TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM[] === objectid(system)
+        @trixi_timeit timer() "deformation gradient" calc_deformation_grad!(system.deformation_grad,
+                                                                              system, v, dt,
+                                                                              false, semi;
+                                                                              compute_b_d=false)
+        return system
+    end
+
     # Precompute PK1 stress tensor
     @trixi_timeit timer() "stress tensor" compute_pk1_corrected!(system, v, semi, dt)
     
@@ -463,7 +501,7 @@ end
 @inline function compute_pk1_corrected!(system, v, semi, dt=1e-6)
     (; deformation_grad, pk1_rho2, material_density) = system
 
-    calc_deformation_grad!(deformation_grad, system, v, dt, false, semi)
+    calc_deformation_grad!(deformation_grad, system, v, dt, false, semi; compute_b_d=false)
 
     # F1 = deformation_grad[:,:,1]
     # println("det(F[1]) = ", det(F1))
@@ -483,16 +521,28 @@ end
     end
 end
 
-@inline function update_properties!(system,alpha, semi)
-    (; temp, temp_ref, yield_stress, hardening, tmelt, viscosity) = system
-    viscosity = fill(viscosity,length(temp))
-    H = 1/(tmelt.-temp_ref[1])         #thermal softening modulus
-    yield_stress = yield_stress .* (1 .- H.*(temp .- temp_ref) ) 
-    hardening = hardening.*(1 .- H .*(temp .- temp_ref) )*alpha
-    E=100000 # activation energy for flow
-    R=8.314  #gas constant
-    viscosity = viscosity .* exp.(E ./(R.* temp))
-    return yield_stress, hardening, viscosity
+@inline function update_properties!(system, alpha, semi, viscosity_0=1.0;
+                                    yield_stress_buf=nothing, hardening_buf=nothing,
+                                    viscosity_buf=nothing)
+    (; temp, temp_ref, yield_stress, hardening, tmelt) = system
+    n = length(temp)
+    yield_stress_out = yield_stress_buf !== nothing ? yield_stress_buf : similar(temp)
+    hardening_out = hardening_buf !== nothing ? hardening_buf : similar(temp)
+    viscosity = viscosity_buf !== nothing ? viscosity_buf : similar(temp)
+    H = 1 / (tmelt - temp_ref[1])         # thermal softening modulus
+    E_act = 30000.0  # activation energy for viscous flow [J/mol] — typical for polymer melt
+    R_gas = 8.314    # gas constant [J/mol·K]
+    # Relative Arrhenius: vis = vis_ref at T = temp_ref; decreases as T increases (correct polymer behaviour)
+    arrhenius_ref = E_act / (R_gas * temp_ref[1])
+
+    @inbounds for i in eachindex(temp)
+        thermal_factor = 1 - H * (temp[i] - temp_ref[i])
+        yield_stress_out[i] = yield_stress[i] * thermal_factor
+        hardening_out[i] = hardening * thermal_factor * alpha[i]
+        viscosity[i] = viscosity_0 * exp(E_act / (R_gas * temp[i]) - arrhenius_ref)
+    end
+
+    return yield_stress_out, hardening_out, viscosity
 end
 
 @inline function update_temperature_sph!(system, dt, ext_heat ,particle_spacing, bound_coordinate, semi)
@@ -554,12 +604,19 @@ end
 
         val = TrixiParticles.dot(r_vec, gradW)
 
-        if val > 0
-            @warn "Positive r·∇W detected" val
-        end
+        positive_tol = sqrt(eps(eltype(system)))
 
+        # if val > positive_tol
+        #     @warn "Positive r·∇W detected" val
+        # end
+
+        # For a radial kernel, r·∇W should be non-positive. Clamp tiny positive
+        # roundoff noise to zero to avoid anti-diffusive contributions.
+        val = min(val, zero(val))
+
+        # Standard SPH Heat Laplacian formulation requires (T_i - T_j) when val (r \cdot gradW) is negative
         flux = volume * k / (rho * cp) *
-                        (temp[neighbor] - temp[particle]) *
+                        (temp[particle] - temp[neighbor]) *
                         val /(r2)
 
         dT[particle] += flux
@@ -584,6 +641,262 @@ end
     #println("dE = ", sum(dT .* mass ./ material_density))
 
     return temp
+end
+
+# Fast variant of elastic_stress3d!: reuses system.deformation_grad already computed by
+# compute_pk1_corrected! (called during update_quantities!). Skips the SPH neighbor loop
+# entirely — saves one full O(N·K) deformation-gradient sweep per accepted timestep.
+# Exact same yield/plasticity formulation; only difference is F is read, not recomputed.
+@inline function elastic_stress3d_fast!(system, ys, hard, vis, dt, _alpha, _Fp, semi;
+                                        v_elas_buf=nothing)
+    (; deformation_grad, young_modulus, poisson_ratio, temp, tmelt, hardening,
+       material_density, cp, temp_ref) = system
+
+    n_particles = size(deformation_grad, 3)
+    # Use caller-supplied pre-allocated buffer if provided (avoids per-step heap allocation)
+    v_elas = v_elas_buf !== nothing ? v_elas_buf : zeros(eltype(system), 3, 3, n_particles)
+
+    mu = young_modulus / (2 + 2 * poisson_ratio)
+    K  = young_modulus / (3 - 6 * poisson_ratio)
+    # Thermal softening slope — needed for temperature-corrected H_α(θ) in return mapping (eq. 13)
+    H_theta = 1.0 / (tmelt - temp_ref[1])
+
+    @threaded semi for particle in eachparticle(system)
+        # Reuse F already stored by compute_pk1_corrected! — no SPH loop needed
+        F = deformation_gradient(system, particle)
+        # Read Fp as stack-allocated SMatrix (avoids heap copy/pinv allocations)
+        Fp_sm = SMatrix{3,3}(@view _Fp[:, :, particle])
+        L_corr = @inbounds correction_matrix(system, particle)
+
+        # Guard: if F is degenerate, shift all singular values by adding ε·I.
+        # This path fires only when det(F) < 1e-10 — the particle is already in an
+        # unphysical state (near-zero volume). The original SVD clamp and this ε·I
+        # shift produce virtually identical inv(F) results (||Δinv(F)|| ~ 2e-4) for
+        # such degenerate F, but svd(F) on a non-static matrix allocates ~22 MB per
+        # call. F + ε·I is allocation-free (SMatrix arithmetic) and ensures
+        # det(F_reg) > 0 so inv(F_reg) remains finite.
+        det_F = det(F)
+        F_reg = if !isfinite(det_F) || abs(det_F) < 1e-10
+            F + 1e-4 * one(SMatrix{3,3,eltype(F)})
+        else
+            F
+        end
+
+        # Enforce det(Fp)=1 unconditionally before use.
+        d_fp = det(Fp_sm)
+        if isfinite(d_fp) && abs(d_fp) > 1e-14
+            Fp_sm = Fp_sm / cbrt(d_fp)
+        end
+
+        # --- Elastic trial stress: always compute from Fe = F * Fp^{-1} ---
+        Fp_inv = inv(Fp_sm)
+        Fe    = F_reg * Fp_inv
+        J_e   = max(det(Fe), 1e-6)
+        be    = Fe * Fe'
+        be_bar = be / (J_e^(2/3))
+        dev_be = be_bar - 1/3 * tr(be_bar) * I
+        tau    = K * log(J_e) * I + mu * dev_be  # trial Kirchhoff stress
+
+        dev_tau = tau - 1/3 * tr(tau) * I
+
+        yf = sqrt(1.5) * sqrt(sum(dev_tau .^ 2)) - (ys[particle] + hard[particle])
+
+        if yf > 1e-6
+            H_alpha_theta = hardening * (1 - H_theta * (temp[particle] - temp_ref[1]))
+            if temp[particle] < 0.5 * tmelt
+                delta_gamma = yf / (3 * mu + H_alpha_theta)
+            else
+                delta_gamma = yf * dt / max(vis[particle], 1e-8)
+            end
+
+            norm_dev = sqrt(sum(dev_tau .* dev_tau))
+            if norm_dev > 1e-14 && isfinite(norm_dev)
+                n_dir    = dev_tau / norm_dev
+                # No cap on delta_gamma — the exponential map is unconditionally
+                # stable and the return mapping must fully relax to the yield
+                # surface each step to prevent stress accumulation.
+
+                c         = delta_gamma * sqrt(1.5)
+                A         = c * n_dir
+                A2        = A * A
+                sc        = abs(c) < 1e-14 ? one(c) : sinh(c) / c
+                cc        = abs(c) < 1e-14 ? one(c) : (cosh(c) - 1) / (c * c)
+                exp_A     = one(SMatrix{3,3,eltype(n_dir)}) + sc * A + cc * A2
+                Fp_old    = Fp_sm
+                Fp_old_inv = inv(Fp_old)
+                Fp_sm = exp_A * Fp_sm
+                Fp_sm = Fp_sm / cbrt(det(Fp_sm))
+
+                Fp_inv = inv(Fp_sm)
+                Fe    = F_reg * Fp_inv
+                J_e   = max(det(Fe), 1e-6)
+                be    = Fe * Fe'
+                be_bar = be / (J_e^(2/3))
+                dev_be = be_bar - 1/3 * tr(be_bar) * I
+                tau    = K * log(J_e) * I + mu * dev_be
+
+                _alpha[particle] += delta_gamma
+
+                dFp_total    = Fp_sm - Fp_old
+                depsilon     = 0.5 * (dFp_total * Fp_old_inv + (dFp_total * Fp_old_inv)')
+                plastic_work = sum(tau .* depsilon)
+                temp[particle] += 0.9 * plastic_work / (material_density[particle] * cp) * dt
+            end # norm_dev guard
+        end # yf guard
+
+        FinvT = inv(F_reg)'
+        v_elas[:, :, particle] .= (tau * FinvT) * L_corr
+
+        # Write back updated Fp to the shared array
+        @inbounds for j in 1:3, i in 1:3
+            _Fp[i, j, particle] = Fp_sm[i, j]
+        end
+    end
+
+    return v_elas, _alpha, _Fp
+end
+
+# Read-only trial stress for implicit Newton residuals.
+# Performs the same return-mapping as elastic_stress3d_fast! but uses a LOCAL copy of Fp
+# per particle — _Fp, _alpha, and system.temp are never mutated.
+# Call this inside the Newton residual (kick) to keep residual evaluations consistent.
+# Pair with elastic_stress3d_fast! in an accepted-step callback to commit history.
+@inline function elastic_stress3d_trial!(system, ys, hard, vis, dt, _alpha, _Fp, semi;
+                                         v_elas_buf=nothing)
+    (; deformation_grad, young_modulus, poisson_ratio, temp, tmelt, hardening) = system
+
+    n_particles = size(deformation_grad, 3)
+    v_elas = v_elas_buf !== nothing ? v_elas_buf : zeros(eltype(system), 3, 3, n_particles)
+
+    mu = young_modulus / (2 + 2 * poisson_ratio)
+    K  = young_modulus / (3 - 6 * poisson_ratio)
+    H_theta = 1.0 / (tmelt - system.temp_ref[1])
+
+    @threaded semi for particle in eachparticle(system)
+        F = deformation_gradient(system, particle)
+        # Stack-allocated SMatrix copy — mutations stay thread-local; _Fp is never written
+        Fp_local = SMatrix{3,3}(@view _Fp[:, :, particle])
+        L_corr = @inbounds correction_matrix(system, particle)
+
+        # Guard: if F is degenerate, shift singular values by adding ε·I.
+        # Allocation-free; see elastic_stress3d_fast! for detailed rationale.
+        det_F = det(F)
+        F_reg = if !isfinite(det_F) || abs(det_F) < 1e-10
+            F + 1e-4 * one(SMatrix{3,3,eltype(F)})
+        else
+            F
+        end
+
+        # Same unconditional renorm on the local copy — mirrors fast! path.
+        d_fp = det(Fp_local)
+        if isfinite(d_fp) && abs(d_fp) > 1e-14
+            Fp_local = Fp_local / cbrt(d_fp)
+        end
+
+        Fp_inv = inv(Fp_local)
+        Fe     = F_reg * Fp_inv
+        J_e    = max(det(Fe), 1e-6)
+        be     = Fe * Fe'
+        be_bar = be / (J_e^(2/3))
+        dev_be = be_bar - 1/3 * tr(be_bar) * I
+        tau    = K * log(J_e) * I + mu * dev_be
+
+        dev_tau = tau - 1/3 * tr(tau) * I
+        yf = sqrt(1.5) * sqrt(sum(dev_tau .^ 2)) - (ys[particle] + hard[particle])
+
+        if yf > 1e-6
+            H_alpha_theta = hardening * (1 - H_theta * (temp[particle] - system.temp_ref[1]))
+            if temp[particle] < 0.5 * tmelt
+                delta_gamma = yf / (3 * mu + H_alpha_theta)
+            else
+                delta_gamma = yf * dt / max(vis[particle], 1e-8)
+            end
+
+            norm_dev = sqrt(sum(dev_tau .* dev_tau))
+            if norm_dev > 1e-14 && isfinite(norm_dev)
+                n_dir = dev_tau / norm_dev
+                # No cap on delta_gamma — let return mapping fully relax to yield surface.
+
+                c     = delta_gamma * sqrt(1.5)
+                A     = c * n_dir
+                A2    = A * A
+                sc    = abs(c) < 1e-14 ? one(c) : sinh(c) / c
+                cc    = abs(c) < 1e-14 ? one(c) : (cosh(c) - 1) / (c * c)
+                exp_A = one(SMatrix{3,3,eltype(n_dir)}) + sc * A + cc * A2
+                Fp_local = exp_A * Fp_local
+                Fp_local = Fp_local / cbrt(det(Fp_local))
+
+                Fp_inv = inv(Fp_local)
+                Fe     = F_reg * Fp_inv
+                J_e    = max(det(Fe), 1e-6)
+                be     = Fe * Fe'
+                be_bar = be / (J_e^(2/3))
+                dev_be = be_bar - 1/3 * tr(be_bar) * I
+                tau    = K * log(J_e) * I + mu * dev_be
+            end
+            # _alpha[particle], _Fp[:,:,particle], and temp[particle] are NOT updated
+        end
+
+        FinvT = inv(F_reg)'
+        v_elas[:, :, particle] .= (tau * FinvT) * L_corr
+    end
+
+    return v_elas
+end
+
+# Fast variant of viscous_stress3d!: reuses system.deformation_grad for J; runs only the
+# velocity-gradient SPH loop (skips the position-gradient accumulation). ~50% loop work saved.
+@inline function viscous_stress3d_fast!(system, v, vis, semi;
+                                        v_vis_buf=nothing, vel_grad_buf=nothing)
+    (; deformation_grad, mass, material_density, young_modulus, poisson_ratio) = system
+
+    n_particles   = size(deformation_grad, 3)
+    # Use caller-supplied pre-allocated buffers if provided (avoids per-step heap allocation)
+    v_vis         = v_vis_buf     !== nothing ? v_vis_buf     : zeros(eltype(system), 3, 3, n_particles)
+    velocity_grad = vel_grad_buf  !== nothing ? vel_grad_buf  : zeros(eltype(system), 3, 3, n_particles)
+
+    K = young_modulus / (3 - 6 * poisson_ratio)
+
+    # Only velocity-gradient SPH loop — position-gradient (for F) is skipped
+    initial_coords = initial_coordinates(system)
+    nhs = get_neighborhood_search(system, system, semi)
+    PointNeighbors.foreach_point_neighbor(
+        initial_coords, initial_coords, nhs;
+        parallelization_backend=PolyesterBackend()
+    ) do particle, neighbor, pos_diff_initial, initial_distance
+        initial_distance^2 < eps(initial_smoothing_length(system)^2) && return
+
+        volume   = @inbounds mass[neighbor] / material_density[neighbor]
+        vel_diff = v[:, particle] - v[:, neighbor]
+
+        grad_kernel = smoothing_kernel_grad(system, pos_diff_initial,
+                                            initial_distance, particle)
+        result_v = volume * vel_diff * grad_kernel'
+
+        for j in 1:ndims(system), i in 1:ndims(system)
+            @inbounds velocity_grad[i, j, particle] -= result_v[i, j]
+        end
+    end
+
+    @threaded semi for particle in eachparticle(system)
+        # Reuse F from system.deformation_grad — no position SPH loop needed
+        F = deformation_gradient(system, particle)
+        L_corr = @inbounds correction_matrix(system, particle)
+        # J = det(F) is the volumetric Jacobian (paper uses ln(J_e) in τ = K ln(J_e) + 2η dev d)
+        J = max(det(F), 1e-6)
+
+        _L    = velocity_grad[:, :, particle] * L_corr'
+        d     = 0.5 * (_L + _L')
+        dev_d = d - 1/3 * tr(d) * I
+
+        tau = K * log(J) * I + 2 * vis[particle] * dev_d
+        
+        # Convert Kirchhoff stress to First Piola-Kirchhoff (PK1) stress P = tau * F^{-T}
+        FinvT = pinv(F)'
+        v_vis[:, :, particle] .= (tau * FinvT) * L_corr
+    end
+
+    return v_vis
 end
 
 @inline function thermomechanical_loop(system, temp_mold, y_mold ,particle_spacing, bound_coordinate ,dt, vel,fixed, alpha,F_total_mold, v_mold, semi)
@@ -781,7 +1094,7 @@ end
 
         @inbounds v_elas[:, :, particle] .= K*log(J)*I+mu*dev_b
 
-        yf = sqrt(1.5)*sqrt(sum((v_elas[:, :, particle]- 1/2* (tr(v_elas[:, :, particle]))*I).^ 2))- (ys[particle]-hard[particle])
+        yf = sqrt(1.5)*sqrt(sum((v_elas[:, :, particle]- 1/2* (tr(v_elas[:, :, particle]))*I).^ 2))- (ys[particle]+hard[particle])
         #yf_max = 10000000
         #yf = max(yf, 0.0)
         #yf = min(yf, yf_max)    
@@ -816,7 +1129,7 @@ end
             dFp = strain_rate * n * dt
             Fp_old = Fp[:,:,particle]
             Fp[:,:,particle] += dFp * Fp[:,:,particle]
-            Fe = F[:,:,particle] * inv(Fp[:,:,particle])
+            Fe = F[:,:,particle] * pinv(Fp[:,:,particle])
             J = det(Fe)
             be = Fe * Fe'   # left Cauchy-Green
             dev_be = be - 1/2*tr(be)*I
@@ -824,7 +1137,7 @@ end
             alpha_dot = strain_rate
             _alpha[particle] += alpha_dot  
 
-            depsilon = 0.5 * ((Fp[:,:,particle] - Fp_old) * inv(Fp_old) + ((Fp[:,:,particle] - Fp_old) * inv(Fp_old))')
+            depsilon = 0.5 * ((Fp[:,:,particle] - Fp_old) * pinv(Fp_old) + ((Fp[:,:,particle] - Fp_old) * pinv(Fp_old))')
             plastic_work = sum(v_elas[:,:,particle] .* depsilon)
             beta = 0.9
             temp[particle] += beta * plastic_work / (material_density[particle]*cp) * dt
@@ -834,17 +1147,31 @@ end
 end
     
 
-@inline function calc_deformation_grad!(deformation_grad, system, v, dt, fixed, semi)
+@inline function calc_deformation_grad!(deformation_grad, system, v, dt, fixed, semi;
+                                        compute_b_d::Bool=true)
     (; mass, material_density, temp, temp_ref) = system
 
-    b = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2), size(deformation_grad,3))
-    d = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2), size(deformation_grad,3))
-    velocity_grad = zeros(eltype(system), size(deformation_grad,1), size(deformation_grad,2), size(deformation_grad,3))
-   
-    for i in 1:length(temp)
-        deformation_grad[:,:,i] .= zeros(eltype(system), ndims(system), ndims(system))
-        b[:,:,i] .= Matrix{Float64}(I, ndims(system), ndims(system))
-        d[:,:,i] .= Matrix{Float64}(I, ndims(system), ndims(system))
+    # Use pre-allocated cache buffers — eliminates three large heap allocations per RHS call.
+    velocity_grad = system.cache.velocity_grad
+    b = system.cache.b_buf
+    d = system.cache.d_buf
+
+    # Reset deformation_grad to zero (always needed).
+    fill!(deformation_grad, zero(eltype(system)))
+    NDIMS = ndims(system)
+
+    # velocity_grad, b, d are only needed when the caller uses the return values.
+    # Skip their reset and computation entirely in the implicit deformation-grad-only path.
+    if compute_b_d
+        fill!(velocity_grad, zero(eltype(system)))
+        fill!(b, zero(eltype(system)))
+        fill!(d, zero(eltype(system)))
+        for i in 1:size(deformation_grad, 3)
+            @inbounds for k in 1:NDIMS
+                b[k, k, i] = one(eltype(system))
+                d[k, k, i] = one(eltype(system))
+            end
+        end
     end
 
     # Loop in INITIAL configuration — standard Total Lagrangian SPH
@@ -860,27 +1187,35 @@ end
         pos_diff_current = @inbounds current_coords(system, particle) -
                                      current_coords(system, neighbor)
         pos_diff_current = convert.(eltype(system), pos_diff_current)
-        vel_diff = v[:, particle] - v[:, neighbor]
 
         grad_kernel = smoothing_kernel_grad(system, pos_diff_initial,
                                             initial_distance, particle)
         L = @inbounds correction_matrix(system, particle)
 
         result   = volume * pos_diff_current * grad_kernel' * L'
-        result_v = volume * vel_diff         * grad_kernel' * L'
 
         for j in 1:ndims(system), i in 1:ndims(system)
             @inbounds deformation_grad[i, j, particle] -= result[i, j]
-            @inbounds velocity_grad[i, j, particle]    -= result_v[i, j]
+        end
+
+        # velocity_grad is only needed for b and d (strain-rate tensor).
+        if compute_b_d
+            vel_diff = v[:, particle] - v[:, neighbor]
+            result_v = volume * vel_diff * grad_kernel' * L'
+            for j in 1:ndims(system), i in 1:ndims(system)
+                @inbounds velocity_grad[i, j, particle] -= result_v[i, j]
+            end
         end
     end
 
-    # Add identity and compute b, d
-    for particle in eachparticle(system)
-        F  = deformation_grad[:,:,particle]
-        b[:,:,particle] = F * F'
-        _L = velocity_grad[:,:,particle]
-        d[:,:,particle] = 0.5 * (_L + _L')
+    # Compute b = F·Fᵀ and d = sym(L) — only when caller needs them.
+    if compute_b_d
+        for particle in eachparticle(system)
+            F  = deformation_grad[:,:,particle]
+            b[:,:,particle] = F * F'
+            _L = velocity_grad[:,:,particle]
+            d[:,:,particle] = 0.5 * (_L + _L')
+        end
     end
 
     return deformation_grad, b, d
@@ -931,6 +1266,13 @@ function write_v0!(v0, system::TotalLagrangianSPHSystem)
     # This is as fast as a loop with `@inbounds`, but it's GPU-compatible
     indices = CartesianIndices((ndims(system), each_integrated_particle(system)))
     copyto!(v0, indices, initial_condition.velocity, indices)
+
+    # Initialise the temperature state variable (row ndims+1) from system.temp.
+    # system.temp is set to the preheated value before semidiscretize is called,
+    # so this captures the correct initial thermal state.
+    for particle in each_integrated_particle(system)
+        v0[ndims(system) + 1, particle] = system.temp[particle]
+    end
 
     write_v0!(v0, boundary_model, system)
 

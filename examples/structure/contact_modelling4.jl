@@ -28,7 +28,7 @@ println("---------------------------")
 file = pkgdir(TrixiParticles, "examples", "preprocessing", "data", "Cylinder.stl")
 geometry = load_geometry(file)
 
-particle_spacing = 0.0007
+particle_spacing = 0.0013
 boundary_thickness = 3 * particle_spacing
 
 signed_distance_field = SignedDistanceField(geometry, particle_spacing;
@@ -187,7 +187,7 @@ ode = semidiscretize(semi, tspan)
 
 callbacks = CallbackSet(
     UpdateCallback(),
-    SolutionSavingCallback(dt=0.005, prefix="cylinder_drop_new6"),
+    SolutionSavingCallback(dt=0.005, prefix="cylinder_drop_new8"),
     StepsizeCallback(cfl=0.7),  # TrixiParticles built-in CFL control
     InfoCallback(interval=100)
 )
