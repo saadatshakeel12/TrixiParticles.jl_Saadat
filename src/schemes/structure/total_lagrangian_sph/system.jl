@@ -5,7 +5,8 @@
                              clamped_particles=Int[],
                              clamped_particles_motion=nothing,
                              acceleration=ntuple(_ -> 0.0, NDIMS),
-                             penalty_force=nothing, viscosity=nothing,
+                             penalty_force=nothing,
+                             viscosity=nothing,
                              source_terms=nothing, boundary_model=nothing,
                              self_interaction_nhs=:default)
 
@@ -131,7 +132,8 @@ function TotalLagrangianSPHSystem(initial_condition, smoothing_kernel, smoothing
                                   clamped_particles_motion=nothing,
                                   acceleration=ntuple(_ -> zero(eltype(initial_condition)),
                                                       ndims(smoothing_kernel)),
-                                  penalty_force=nothing, viscosity=nothing,
+                                  penalty_force=nothing,
+                                  viscosity=nothing,
                                   source_terms=nothing, boundary_model=nothing,
                                   self_interaction_nhs=:default)
     NDIMS = ndims(initial_condition)
@@ -214,7 +216,8 @@ function TotalLagrangianSPHSystem(initial_condition, smoothing_kernel, smoothing
                                     poisson_ratio_sorted,
                                     lame_lambda, lame_mu, smoothing_kernel,
                                     smoothing_length, acceleration_, boundary_model,
-                                    penalty_force, viscosity, source_terms,
+                                    penalty_force, viscosity,
+                                    source_terms,
                                     clamped_particles_motion, ismoving,
                                     self_interaction_nhs, cache, beta_sorted , temp, temp_ref, cp, k, temp_liq,
                                     h,hardening,tmelt,yield_stress)
@@ -275,7 +278,8 @@ function initialize_self_interaction_nhs(system::TotalLagrangianSPHSystem,
                                     system.lame_mu, system.smoothing_kernel,
                                     system.smoothing_length, system.acceleration,
                                     system.boundary_model, system.penalty_force,
-                                    system.viscosity, system.source_terms,
+                                    system.viscosity,
+                                    system.source_terms,
                                     system.clamped_particles_motion,
                                     system.clamped_particles_moving,
                                     self_interaction_nhs, system.cache, system.beta, system.temp, system.temp_ref,
@@ -847,7 +851,8 @@ end
 # Fast variant of viscous_stress3d!: reuses system.deformation_grad for J; runs only the
 # velocity-gradient SPH loop (skips the position-gradient accumulation). ~50% loop work saved.
 @inline function viscous_stress3d_fast!(system, v, vis, semi;
-                                        v_vis_buf=nothing, vel_grad_buf=nothing)
+                                        v_vis_buf=nothing, vel_grad_buf=nothing,
+                                        include_bulk_term=true)
     (; deformation_grad, mass, material_density, young_modulus, poisson_ratio) = system
 
     n_particles   = size(deformation_grad, 3)
@@ -889,7 +894,10 @@ end
         d     = 0.5 * (_L + _L')
         dev_d = d - 1/3 * tr(d) * I
 
-        tau = K * log(J) * I + 2 * vis[particle] * dev_d
+        tau = 2 * vis[particle] * dev_d
+        if include_bulk_term
+            tau += K * log(J) * I
+        end
         
         # Convert Kirchhoff stress to First Piola-Kirchhoff (PK1) stress P = tau * F^{-T}
         FinvT = pinv(F)'
@@ -1433,7 +1441,19 @@ end
 
 function system_data_acceleration(dv, system::TotalLagrangianSPHSystem, ::PrescribedMotion)
     clamped_particles = (n_integrated_particles(system) + 1):nparticles(system)
-    return hcat(dv, view(system.cache.acceleration, :, clamped_particles))
+    accel_clamped = view(system.cache.acceleration, :, clamped_particles)
+
+    # Prescribed-motion acceleration stores only spatial components (ndims),
+    # while `dv` can carry additional rows (e.g., temperature equation).
+    if size(dv, 1) == size(accel_clamped, 1)
+        return hcat(dv, accel_clamped)
+    elseif size(dv, 1) > size(accel_clamped, 1)
+        accel_padded = zeros(eltype(dv), size(dv, 1), size(accel_clamped, 2))
+        accel_padded[1:size(accel_clamped, 1), :] .= accel_clamped
+        return hcat(dv, accel_padded)
+    else
+        return hcat(dv, accel_clamped[1:size(dv, 1), :])
+    end
 end
 
 function available_data(::TotalLagrangianSPHSystem)

@@ -35,7 +35,7 @@ println("----------------------------------------------------")
 file = pkgdir(TrixiParticles, "examples", "preprocessing", "data", "Cylinder.stl")
 geometry = load_geometry(file)
 
-particle_spacing = 0.0005
+particle_spacing = 0.0006
 boundary_thickness = 3 * particle_spacing
 
 signed_distance_field = SignedDistanceField(geometry, particle_spacing;
@@ -507,7 +507,7 @@ callbacks = CallbackSet(
             #             " | s33=", round(cyl_sys.pk1_rho2[3,3,1]*cyl_sys.material_density[1]^2/1e6, digits=2))
             # end
         end),
-    SolutionSavingCallback(dt=2.0e-3, prefix="stamping_isothermal_elastoplastic_0.0005"),
+    SolutionSavingCallback(dt=2.0e-3, prefix="stamping_isothermal_elastoplastic_0.0006"),
     InfoCallback(interval=10)
 )
 

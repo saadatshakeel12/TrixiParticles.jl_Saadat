@@ -15,7 +15,8 @@ using ForwardDiff: ForwardDiff
 using GPUArraysCore: AbstractGPUArray
 using JSON: JSON
 using KernelAbstractions: KernelAbstractions, @kernel, @index
-using LinearAlgebra: norm, normalize, cross, dot, I, tr, inv, pinv, det
+using LinearAlgebra: norm, normalize, cross, dot, I, tr, inv, pinv, det, eigen,
+                     Symmetric, Diagonal
 using MuladdMacro: @muladd
 using Polyester: Polyester, @batch
 using Printf: @printf, @sprintf
@@ -80,7 +81,8 @@ export InfoCallback, SolutionSavingCallback, DensityReinitializationCallback,
        PostprocessCallback, StepsizeCallback, UpdateCallback, SteadyStateReachedCallback,
        SplitIntegrationCallback
 export ContinuityDensity, SummationDensity
-export PenaltyForceGanzenmueller, TransportVelocityAdami, ParticleShiftingTechnique,
+export PenaltyForceGanzenmueller,
+       TransportVelocityAdami, ParticleShiftingTechnique,
        ParticleShiftingTechniqueSun2017, ConsistentShiftingSun2019,
        ContinuityEquationTermSun2019, MomentumEquationTermSun2019
 export SchoenbergCubicSplineKernel, SchoenbergQuarticSplineKernel,

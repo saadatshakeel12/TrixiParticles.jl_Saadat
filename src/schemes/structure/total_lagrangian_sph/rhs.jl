@@ -499,10 +499,11 @@ function interact_Reimann!(dv, v_particle_system, u_particle_system,
         v_rel = dot(v_i - v_neighbor_mean, n_w)
 
         # --- Riemann contact traction (eq. 7) ---
-        # Use relative normal velocity between the two systems. Cap rapid approaches
+        # Mass scaling artificially increases Z_i = sqrt(rho * E) by sqrt(mass_scaling).
+        # We apply a reduction factor to fix violent contact bouncing ("splashing").
+        riemann_factor = 0.1
         v_rel_capped = sign(-v_rel) * min(abs(v_rel), 0.01 * sqrt(E / rho_i))
-        # For a semi-infinite neighbor the impedance combination reduces appropriately
-        t_riemann = Z_i * max(zero(v_rel_capped), -v_rel_capped)
+        t_riemann = riemann_factor * Z_i * max(zero(v_rel_capped), -v_rel_capped)
 
         # --- Stabilising penalty (eq. 8) ---
         # Activates only for deep penetration δ > δ_tol
