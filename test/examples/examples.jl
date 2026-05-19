@@ -65,6 +65,8 @@
                 @test count_rhs_allocations(sol, semi) == 0
             end
         end
+
+        include("examples_structure_uniaxial.jl")
     end
 
     @testset verbose=true "FSI" begin
