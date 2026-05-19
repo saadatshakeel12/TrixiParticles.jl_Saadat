@@ -43,6 +43,8 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
                     (see [`PenaltyForceGanzenmueller`](@ref)).
 - `viscosity`:      Artificial viscosity model to stabilize both the TLSPH and the FSI.
                     Currently, only [`ArtificialViscosityMonaghan`](@ref) is supported.
+- `tensile_stress`: Artificial stress model for tensile-instability correction in
+                    structure-structure interaction.
 - `acceleration`:   Acceleration vector for the system. (default: zero vector)
 - `source_terms`:   Additional source terms for this system. Has to be either `nothing`
                     (by default), or a function of `(coords, velocity, density, pressure)`
@@ -85,7 +87,7 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
 """
 struct TotalLagrangianSPHSystem{BM, NDIMS, ELTYPE <: Real, IC, ARRAY1D, ARRAY2D, ARRAY3D,
                                 YM, PR, LL, LM, K, PF, V, ST, M, IM, NHS,
-                                C, temp, temp_ref, YS} <: AbstractStructureSystem{NDIMS}
+                                C, temp, temp_ref, YS, TS} <: AbstractStructureSystem{NDIMS}
     initial_condition   :: IC
     initial_coordinates :: ARRAY2D # Array{ELTYPE, 2}: [dimension, particle]
     # `current_coordinates` contains `u` plus coordinates of the fixed particles
@@ -123,6 +125,7 @@ struct TotalLagrangianSPHSystem{BM, NDIMS, ELTYPE <: Real, IC, ARRAY1D, ARRAY2D,
     hardening                :: Float64
     tmelt                    :: Float64
     yield_stress             :: YS
+    tensile_stress           :: TS
 end
 
 function TotalLagrangianSPHSystem(initial_condition, smoothing_kernel, smoothing_length,
@@ -134,6 +137,7 @@ function TotalLagrangianSPHSystem(initial_condition, smoothing_kernel, smoothing
                                                       ndims(smoothing_kernel)),
                                   penalty_force=nothing,
                                   viscosity=nothing,
+                                  tensile_stress=nothing,
                                   source_terms=nothing, boundary_model=nothing,
                                   self_interaction_nhs=:default)
     NDIMS = ndims(initial_condition)
@@ -220,7 +224,8 @@ function TotalLagrangianSPHSystem(initial_condition, smoothing_kernel, smoothing
                                     source_terms,
                                     clamped_particles_motion, ismoving,
                                     self_interaction_nhs, cache, beta_sorted , temp, temp_ref, cp, k, temp_liq,
-                                    h,hardening,tmelt,yield_stress)
+                                    h,hardening,tmelt,yield_stress,
+                                    tensile_stress)
 end
 
 # Initialize self-interaction neighborhood search if not provided by the user
@@ -283,7 +288,8 @@ function initialize_self_interaction_nhs(system::TotalLagrangianSPHSystem,
                                     system.clamped_particles_motion,
                                     system.clamped_particles_moving,
                                     self_interaction_nhs, system.cache, system.beta, system.temp, system.temp_ref,
-                                    system.cp, system.k, system.temp_liq, system.h, system.hardening, system.tmelt, system.yield_stress)
+                                    system.cp, system.k, system.temp_liq, system.h, system.hardening, system.tmelt, system.yield_stress,
+                                    system.tensile_stress)
 end
 
 extract_periodic_box(::Nothing) = nothing

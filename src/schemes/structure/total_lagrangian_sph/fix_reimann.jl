@@ -31,6 +31,8 @@
 #   * `tanh` instead of `sign+min` in the Riemann term (smooth ⇒ NLNewton converges).
 # ------------------------------------------------------------------------------
 
+const REIMANN_CONTACT_OVERLAP_TOLERANCE = Ref(0.1)
+
 @inline function _reimann_pair_force!(dv,
                                       particle::Int,
                                       dx::Float64, dy::Float64, dz::Float64,
@@ -55,8 +57,7 @@
     δ <= 0.0 && return
 
     A_eff = ps * ps
-    α = 0.1
-    δ_tol = α * ps
+    δ_tol = max(0.0, REIMANN_CONTACT_OVERLAP_TOLERANCE[]) * ps
 
     # --- Stabilising penalty (same form as rhs.jl eq. 8) ------------------
     k_n = E / ps
@@ -108,8 +109,13 @@ function TrixiParticles.interact_Reimann!(dv, v_particle_system, u_particle_syst
     neighbor_coords = TrixiParticles.current_coordinates(u_neighbor_system,
                                                          neighbor_system)
 
-    ps             = TrixiParticles.initial_smoothing_length(particle_system) / 1.2
-    contact_radius = 1.5 * ps
+    # Use physical particle spacing (cube root of volume) instead of a value
+    # derived from smoothing length. Using h-based spacing can overestimate
+    # overlap at t=0 and trigger a spurious first-step force spike.
+    m_ref = particle_system.mass[1]
+    rho_ref = particle_system.material_density[1]
+    ps_ref = cbrt(m_ref / rho_ref)
+    contact_radius = 1.5 * ps_ref
     radius2        = contact_radius * contact_radius
 
     n_q = TrixiParticles.nparticles(neighbor_system)
@@ -140,9 +146,11 @@ function TrixiParticles.interact_Reimann!(dv, v_particle_system, u_particle_syst
                                                   neighbor_system, neighbor)
             vjx = v_j[1]; vjy = v_j[2]; vjz = v_j[3]
 
+            ps_pair = cbrt(m_i / rho_i)
+
             _reimann_pair_force!(dv, particle,
                                  dx, dy, dz, distance,
-                                 ps, E, rho_i, m_i,
+                                 ps_pair, E, rho_i, m_i,
                                  vix, viy, viz,
                                  vjx, vjy, vjz)
         end

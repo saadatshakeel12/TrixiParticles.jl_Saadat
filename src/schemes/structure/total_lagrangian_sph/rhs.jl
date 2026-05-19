@@ -220,6 +220,52 @@ function interact_volumetric_contact!(dv,
     return dv
 end
 
+@inline function tensile_stress_cache_tlsph(::Nothing, system, use_cache, cached_stress)
+    return nothing
+end
+
+function tensile_stress_cache_tlsph(model::TensileArtificialStressMonaghan,
+                                    system, use_cache, cached_stress)
+    NDIMS = ndims(system)
+    n_particles = nparticles(system)
+    tensile_cache = Array{eltype(system), 3}(undef, NDIMS, NDIMS, n_particles)
+
+    for particle in eachparticle(system)
+        rho = @inbounds system.material_density[particle]
+        pk1_over_rho2 = use_cache ?
+            extract_smatrix(cached_stress, system, particle) / (rho * rho) :
+            @inbounds pk1_rho2(system, particle)
+
+        tensile_tensor = artificial_tensile_stress_tensor(model, pk1_over_rho2)
+        for j in 1:NDIMS, i in 1:NDIMS
+            @inbounds tensile_cache[i, j, particle] = tensile_tensor[i, j]
+        end
+    end
+
+    return tensile_cache
+end
+
+@inline function dv_tensile_stress_tlsph(::Nothing, system, particle, neighbor,
+                                         initial_distance, grad_kernel, m_b,
+                                         tensile_cache)
+    return zero(grad_kernel)
+end
+
+@inline function dv_tensile_stress_tlsph(model::TensileArtificialStressMonaghan,
+                                         system, particle, neighbor,
+                                         initial_distance, grad_kernel, m_b,
+                                         tensile_cache)
+    w_ab = smoothing_kernel(system, initial_distance, particle)
+    w_ref = smoothing_kernel(system, particle_spacing(system, particle), particle)
+    w_ref <= eps(eltype(system)) && return zero(grad_kernel)
+
+    f_ab = (w_ab / w_ref)^model.exponent
+    R_a = extract_smatrix(tensile_cache, system, particle)
+    R_b = extract_smatrix(tensile_cache, system, neighbor)
+
+    return m_b * (R_a + R_b) * f_ab * grad_kernel
+end
+
 # Function barrier without dispatch for unit testing
 @inline function interact_structure_structure!(dv, v_system, system, semi)
     (; penalty_force) = system
@@ -232,6 +278,8 @@ end
     _cached       = STRESS_TENSOR_CACHE[]
     _use_cache    = _cached !== nothing && _cached[1] == objectid(system)
     _cache_stress = _use_cache ? _cached[2] : nothing
+    tensile_cache = tensile_stress_cache_tlsph(system.tensile_stress, system,
+                                               _use_cache, _cache_stress)
 
     # Everything here is done in the initial coordinates
     system_coords = initial_coordinates(system)
@@ -271,6 +319,13 @@ end
 
         dv_stress = m_b * (pk1_rho2_a + pk1_rho2_b) * grad_kernel
 
+        dv_tensile_stress = @inbounds dv_tensile_stress_tlsph(system.tensile_stress,
+                                      system,
+                                      particle, neighbor,
+                                      initial_distance,
+                                      grad_kernel, m_b,
+                                      tensile_cache)
+
         dv_penalty_force_ = @inbounds dv_penalty_force(penalty_force, particle, neighbor,
                                                        initial_pos_diff, initial_distance,
                                                        current_pos_diff, current_distance,
@@ -280,7 +335,7 @@ end
                                                     current_pos_diff, current_distance,
                                                     m_a, m_b, rho_a, rho_b, grad_kernel)
 
-        dv_particle = dv_stress + dv_penalty_force_ + dv_viscosity
+        dv_particle = dv_stress + dv_tensile_stress + dv_penalty_force_ + dv_viscosity
 
         for i in 1:ndims(system)
             @inbounds dv[i, particle] += dv_particle[i]
