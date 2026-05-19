@@ -21,7 +21,8 @@ particle_spacing = 1.0e-3
 # ==== Experiment Setup
 tspan = (0.0, 70.0e-3)
 compression_speed = 1.5e-3
-output_directory = "/SPH_Code/TrixiParticles.jl_Saadat/out_sandstone_uniaxial"
+output_directory = get(ENV, "TRIXIPARTICLES_SANDSTONE_OUTPUT_DIRECTORY",
+                       joinpath(pwd(), "out_sandstone_uniaxial"))
 save_dt = 1.0e-3
 stress_history_dt = 1.0e-3
 
@@ -63,7 +64,9 @@ function platen_movement(x, t)
         return x
     end
 
-    return x + SVector(0.0, -compression_speed * t)
+    elapsed_time = clamp(t - first(tspan), 0.0, last(tspan) - first(tspan))
+
+    return x + SVector(0.0, -compression_speed * elapsed_time)
 end
 
 is_moving(t) = t <= last(tspan)
@@ -147,5 +150,5 @@ stress_history_callback = PostprocessCallback(; dt=stress_history_dt,
 callbacks = CallbackSet(info_callback, saving_callback, stress_history_callback)
 
 sol = solve(ode, RDPK3SpFSAL49(),
-            abstol=1e-8, reltol=1e-6, dtmax=min(save_dt, stress_history_dt),
+            abstol=1e-8, reltol=1e-6, dtmax=min(save_dt, stress_history_dt, 1.0e-4),
             save_everystep=false, callback=callbacks);
