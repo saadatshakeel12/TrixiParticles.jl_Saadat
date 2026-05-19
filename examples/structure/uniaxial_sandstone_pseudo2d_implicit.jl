@@ -25,6 +25,9 @@ output_directory = get(ENV, "TRIXIPARTICLES_SANDSTONE_OUTPUT_DIRECTORY",
                        joinpath(pwd(), "out_sandstone_uniaxial"))
 save_dt = 1.0e-3
 stress_history_dt = 1.0e-3
+simulation_start_time = first(tspan)
+simulation_duration = last(tspan) - simulation_start_time
+max_timestep = 1.0e-4
 
 specimen_size = (25.0e-3, 50.0e-3)
 sandstone = (density=2200.0, E=14.0e7, nu=0.2)
@@ -64,7 +67,7 @@ function platen_movement(x, t)
         return x
     end
 
-    elapsed_time = clamp(t - first(tspan), 0.0, last(tspan) - first(tspan))
+    elapsed_time = clamp(t - simulation_start_time, 0.0, simulation_duration)
 
     return x + SVector(0.0, -compression_speed * elapsed_time)
 end
@@ -127,7 +130,9 @@ axial_stress(system, particle) = TrixiParticles.cauchy_stress(system)[2, 2, part
 axial_stress_lower(system, data, t) = axial_stress(system, PROBE_PARTICLES.lower)
 axial_stress_middle(system, data, t) = axial_stress(system, PROBE_PARTICLES.middle)
 axial_stress_upper(system, data, t) = axial_stress(system, PROBE_PARTICLES.upper)
-punch_displacement(system, data, t) = compression_speed * t
+punch_displacement(system, data, t) = compression_speed *
+                                      clamp(t - simulation_start_time, 0.0,
+                                            simulation_duration)
 
 # ==========================================================================================
 # ==== Simulation
@@ -150,5 +155,5 @@ stress_history_callback = PostprocessCallback(; dt=stress_history_dt,
 callbacks = CallbackSet(info_callback, saving_callback, stress_history_callback)
 
 sol = solve(ode, RDPK3SpFSAL49(),
-            abstol=1e-8, reltol=1e-6, dtmax=min(save_dt, stress_history_dt, 1.0e-4),
+            abstol=1e-8, reltol=1e-6, dtmax=min(save_dt, stress_history_dt, max_timestep),
             save_everystep=false, callback=callbacks);
