@@ -155,5 +155,5 @@ stress_history_callback = PostprocessCallback(; dt=stress_history_dt,
 callbacks = CallbackSet(info_callback, saving_callback, stress_history_callback)
 
 sol = solve(ode, RDPK3SpFSAL49(),
-            abstol=1e-8, reltol=1e-6, dtmax=min(save_dt, stress_history_dt, max_timestep),
+            abstol=1e-8, reltol=1e-6, dtmax=max_timestep,
             save_everystep=false, callback=callbacks);
