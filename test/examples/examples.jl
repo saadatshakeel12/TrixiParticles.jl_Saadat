@@ -65,6 +65,19 @@
                 @test count_rhs_allocations(sol, semi) == 0
             end
         end
+
+        @trixi_testset "structure/uniaxial_sandstone_pseudo2d_implicit.jl" begin
+            @trixi_test_nowarn trixi_include(@__MODULE__,
+                                             joinpath(examples_dir(), "structure",
+                                                      "uniaxial_sandstone_pseudo2d_implicit.jl"),
+                                             tspan=(0.0, 1.0e-3),
+                                             save_dt=1.0e-3,
+                                             stress_history_dt=1.0e-3,
+                                             output_directory=mktempdir()) [
+                r"\[ Info: To create the self-interaction neighborhood search.*\n"
+            ]
+            @test sol.retcode == ReturnCode.Success
+        end
     end
 
     @testset verbose=true "FSI" begin
