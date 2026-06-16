@@ -82,6 +82,7 @@ export InfoCallback, SolutionSavingCallback, DensityReinitializationCallback,
        SplitIntegrationCallback
 export ContinuityDensity, SummationDensity
 export PenaltyForceGanzenmueller,
+    TensileArtificialStressMonaghan,
        TransportVelocityAdami, ParticleShiftingTechnique,
        ParticleShiftingTechniqueSun2017, ConsistentShiftingSun2019,
        ContinuityEquationTermSun2019, MomentumEquationTermSun2019

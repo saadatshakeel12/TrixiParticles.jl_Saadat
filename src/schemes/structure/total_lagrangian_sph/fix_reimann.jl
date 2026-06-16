@@ -31,6 +31,18 @@
 #   * `tanh` instead of `sign+min` in the Riemann term (smooth ⇒ NLNewton converges).
 # ------------------------------------------------------------------------------
 
+# Tool–charge Reimann penalty: k_n = active_contact_e_scale() * E / ps.
+# Compression (molten charge): use melt-scale stiffness (K_melt/E), not solid composite E.
+# Retraction (solid springback): softer scale via TP_CLIP_RETRACTION_CONTACT_E_SCALE.
+const compression_contact_e_scale = Ref(1.0)
+const retraction_contact_e_scale = Ref(1.0)
+
+@inline function active_contact_e_scale()
+    retraction_contact_e_scale[] < 1.0 - 1.0e-12 &&
+        return retraction_contact_e_scale[]
+    return compression_contact_e_scale[]
+end
+
 @inline function _reimann_pair_force!(dv,
                                       particle::Int,
                                       dx::Float64, dy::Float64, dz::Float64,
@@ -59,7 +71,7 @@
     δ_tol = α * ps
 
     # --- Stabilising penalty (same form as rhs.jl eq. 8) ------------------
-    k_n = E / ps
+    k_n = active_contact_e_scale() * E / ps
     c_n = 0.05 * 2.0 * sqrt(k_n * m_i / A_eff)
 
     t_stab = δ > δ_tol ? k_n * (δ - δ_tol) : zero(δ)

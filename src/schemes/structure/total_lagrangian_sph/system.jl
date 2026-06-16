@@ -7,6 +7,7 @@
                              acceleration=ntuple(_ -> 0.0, NDIMS),
                              penalty_force=nothing,
                              viscosity=nothing,
+                             tensile_stress=nothing,
                              source_terms=nothing, boundary_model=nothing,
                              self_interaction_nhs=:default)
 
@@ -84,7 +85,7 @@ See [Total Lagrangian SPH](@ref tlsph) for more details on the method.
     where `beam` and `clamped_particles` are of type [`InitialCondition`](@ref).
 """
 struct TotalLagrangianSPHSystem{BM, NDIMS, ELTYPE <: Real, IC, ARRAY1D, ARRAY2D, ARRAY3D,
-                                YM, PR, LL, LM, K, PF, V, ST, M, IM, NHS,
+                                YM, PR, LL, LM, K, PF, V, ST, TS, M, IM, NHS,
                                 C, temp, temp_ref, YS} <: AbstractStructureSystem{NDIMS}
     initial_condition   :: IC
     initial_coordinates :: ARRAY2D # Array{ELTYPE, 2}: [dimension, particle]
@@ -108,6 +109,7 @@ struct TotalLagrangianSPHSystem{BM, NDIMS, ELTYPE <: Real, IC, ARRAY1D, ARRAY2D,
     penalty_force            :: PF
     viscosity                :: V
     source_terms             :: ST
+    tensile_stress           :: TS
     clamped_particles_motion :: M
     clamped_particles_moving :: IM
     self_interaction_nhs     :: NHS
@@ -134,6 +136,7 @@ function TotalLagrangianSPHSystem(initial_condition, smoothing_kernel, smoothing
                                                       ndims(smoothing_kernel)),
                                   penalty_force=nothing,
                                   viscosity=nothing,
+                                  tensile_stress=nothing,
                                   source_terms=nothing, boundary_model=nothing,
                                   self_interaction_nhs=:default)
     NDIMS = ndims(initial_condition)
@@ -217,7 +220,7 @@ function TotalLagrangianSPHSystem(initial_condition, smoothing_kernel, smoothing
                                     lame_lambda, lame_mu, smoothing_kernel,
                                     smoothing_length, acceleration_, boundary_model,
                                     penalty_force, viscosity,
-                                    source_terms,
+                                    source_terms, tensile_stress,
                                     clamped_particles_motion, ismoving,
                                     self_interaction_nhs, cache, beta_sorted , temp, temp_ref, cp, k, temp_liq,
                                     h,hardening,tmelt,yield_stress)
@@ -279,7 +282,7 @@ function initialize_self_interaction_nhs(system::TotalLagrangianSPHSystem,
                                     system.smoothing_length, system.acceleration,
                                     system.boundary_model, system.penalty_force,
                                     system.viscosity,
-                                    system.source_terms,
+                                    system.source_terms, system.tensile_stress,
                                     system.clamped_particles_motion,
                                     system.clamped_particles_moving,
                                     self_interaction_nhs, system.cache, system.beta, system.temp, system.temp_ref,

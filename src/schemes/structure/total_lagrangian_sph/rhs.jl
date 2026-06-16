@@ -222,7 +222,7 @@ end
 
 # Function barrier without dispatch for unit testing
 @inline function interact_structure_structure!(dv, v_system, system, semi)
-    (; penalty_force) = system
+    (; penalty_force, tensile_stress) = system
 
     # Check once whether a custom thermomechanical stress is cached for this system.
     # If STRESS_TENSOR_CACHE holds (objectid(system), stress_array), use that instead of
@@ -232,6 +232,8 @@ end
     _cached       = STRESS_TENSOR_CACHE[]
     _use_cache    = _cached !== nothing && _cached[1] == objectid(system)
     _cache_stress = _use_cache ? _cached[2] : nothing
+    _tensile_cache = tensile_stress_cache_tlsph(tensile_stress, system, _use_cache,
+                                                _cache_stress)
 
     # Everything here is done in the initial coordinates
     system_coords = initial_coordinates(system)
@@ -280,7 +282,12 @@ end
                                                     current_pos_diff, current_distance,
                                                     m_a, m_b, rho_a, rho_b, grad_kernel)
 
-        dv_particle = dv_stress + dv_penalty_force_ + dv_viscosity
+        dv_tensile = @inbounds dv_tensile_stress_tlsph(tensile_stress, system,
+                                   particle, neighbor,
+                                   initial_distance, grad_kernel,
+                                   m_b, _tensile_cache)
+
+        dv_particle = dv_stress + dv_penalty_force_ + dv_viscosity + dv_tensile
 
         for i in 1:ndims(system)
             @inbounds dv[i, particle] += dv_particle[i]
@@ -290,6 +297,53 @@ end
     end
 
     return dv
+end
+
+@inline function tensile_stress_cache_tlsph(::Nothing, system, use_cache, cached_stress)
+    return nothing
+end
+
+function tensile_stress_cache_tlsph(model::TensileArtificialStressMonaghan,
+                                    system, use_cache, cached_stress)
+    NDIMS = ndims(system)
+    n_particles = nparticles(system)
+    tensile_cache = Array{eltype(system), 3}(undef, NDIMS, NDIMS, n_particles)
+
+    for particle in eachparticle(system)
+        rho = @inbounds system.material_density[particle]
+        pk1_over_rho2 = use_cache ?
+            extract_smatrix(cached_stress, system, particle) / (rho * rho) :
+            @inbounds pk1_rho2(system, particle)
+
+        tensile_tensor = artificial_tensile_stress_tensor(model, pk1_over_rho2)
+        for j in 1:NDIMS, i in 1:NDIMS
+            @inbounds tensile_cache[i, j, particle] = tensile_tensor[i, j]
+        end
+    end
+
+    return tensile_cache
+end
+
+@inline function dv_tensile_stress_tlsph(::Nothing, system, particle, neighbor,
+                                         initial_distance, grad_kernel, m_b,
+                                         tensile_cache)
+    return zero(initial_coords(system, particle))
+end
+
+function dv_tensile_stress_tlsph(model::TensileArtificialStressMonaghan,
+                                 system, particle, neighbor,
+                                 initial_distance, grad_kernel, m_b,
+                                 tensile_cache)
+    ps = (system.mass[1] / system.material_density[1])^(1 / ndims(system))
+    W_ab = TrixiParticles.kernel(system.smoothing_kernel, initial_distance,
+                                 initial_smoothing_length(system))
+    W_dp = TrixiParticles.kernel(system.smoothing_kernel, ps,
+                                 initial_smoothing_length(system))
+    weight = (W_ab / max(W_dp, eps(eltype(system))))^model.exponent
+
+    tensile_a = extract_smatrix(tensile_cache, system, particle)
+    tensile_b = extract_smatrix(tensile_cache, system, neighbor)
+    return m_b * weight * (tensile_a + tensile_b) * grad_kernel
 end
 
 # Structure-fluid interaction
