@@ -171,18 +171,8 @@ function (solution_callback::SolutionSavingCallback)(integrator; from_initialize
             end
         end
         semi = integrator.p
-        iter = get_iter(interval, integrator)
-
-        if iter == latest_saved_iter
-            # This should only happen at the end of the simulation when using `dt` and the
-            # final time is not a multiple of the saving interval.
-            @assert isfinished(integrator)
-
-            # Avoid overwriting the previous file
-            iter += 1
-        end
-
-        latest_saved_iter = iter
+        solution_callback.latest_saved_iter += 1
+        iter = solution_callback.latest_saved_iter
 
         if verbose
             println("Writing solution to $output_directory at t = $(integrator.t)")

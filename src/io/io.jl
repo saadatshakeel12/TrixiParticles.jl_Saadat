@@ -4,7 +4,8 @@ include("read_vtk.jl")
 # Handle "_" on optional prefix strings
 add_underscore_to_optional_prefix(str) = (str === "" ? "" : "$(str)_")
 # Same for optional postfix strings
-add_underscore_to_optional_postfix(str) = (str === "" ? "" : "_$(str)")
+add_underscore_to_optional_postfix(iter::Integer) = "_$(lpad(string(iter), 6, "0"))"
+add_underscore_to_optional_postfix(str) = (str === "" || str === nothing ? "" : "_$(str)")
 
 function write_meta_data(callback::SolutionSavingCallback, integrator)
     prefix = callback.prefix

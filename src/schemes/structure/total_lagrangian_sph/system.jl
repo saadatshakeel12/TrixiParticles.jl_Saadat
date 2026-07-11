@@ -441,13 +441,14 @@ function initialize!(system::TotalLagrangianSPHSystem, semi)
 end
 
 function update_positions!(system::TotalLagrangianSPHSystem, v, u, v_ode, u_ode, semi, t)
-    (; current_coordinates, clamped_particles_motion) = system
+    (; clamped_particles_motion) = system
+    coords = system.current_coordinates
 
     # `current_coordinates` stores the coordinates of both integrated and clamped particles.
     # Copy the coordinates of the integrated particles from `u`.
     @threaded semi for particle in each_integrated_particle(system)
         for i in 1:ndims(system)
-            current_coordinates[i, particle] = u[i, particle]
+            coords[i, particle] = u[i, particle]
         end
     end
 
@@ -715,6 +716,7 @@ end
             else
                 delta_gamma = yf * dt / max(vis[particle], 1e-8)
             end
+            delta_gamma = min(delta_gamma, 12.0)
 
             norm_dev = sqrt(sum(dev_tau .* dev_tau))
             if norm_dev > 1e-14 && isfinite(norm_dev)
@@ -752,7 +754,10 @@ end
         end # yf guard
 
         FinvT = inv(F_reg)'
-        v_elas[:, :, particle] .= (tau * FinvT) * L_corr
+        v_particle = (tau * FinvT) * L_corr
+        @inbounds for j in 1:3, i in 1:3
+            v_elas[i, j, particle] = v_particle[i, j]
+        end
 
         # Write back updated Fp to the shared array
         @inbounds for j in 1:3, i in 1:3
@@ -818,6 +823,7 @@ end
             else
                 delta_gamma = yf * dt / max(vis[particle], 1e-8)
             end
+            delta_gamma = min(delta_gamma, 12.0)
 
             norm_dev = sqrt(sum(dev_tau .* dev_tau))
             if norm_dev > 1e-14 && isfinite(norm_dev)
@@ -845,7 +851,10 @@ end
         end
 
         FinvT = inv(F_reg)'
-        v_elas[:, :, particle] .= (tau * FinvT) * L_corr
+        v_particle = (tau * FinvT) * L_corr
+        @inbounds for j in 1:3, i in 1:3
+            v_elas[i, j, particle] = v_particle[i, j]
+        end
     end
 
     return v_elas
@@ -870,19 +879,18 @@ end
     nhs = get_neighborhood_search(system, system, semi)
     PointNeighbors.foreach_point_neighbor(
         initial_coords, initial_coords, nhs;
-        parallelization_backend=PolyesterBackend()
+        parallelization_backend=semi.parallelization_backend
     ) do particle, neighbor, pos_diff_initial, initial_distance
         initial_distance^2 < eps(initial_smoothing_length(system)^2) && return
 
-        volume   = @inbounds mass[neighbor] / material_density[neighbor]
-        vel_diff = v[:, particle] - v[:, neighbor]
+        volume = @inbounds mass[neighbor] / material_density[neighbor]
 
         grad_kernel = smoothing_kernel_grad(system, pos_diff_initial,
                                             initial_distance, particle)
-        result_v = volume * vel_diff * grad_kernel'
 
         for j in 1:ndims(system), i in 1:ndims(system)
-            @inbounds velocity_grad[i, j, particle] -= result_v[i, j]
+            @inbounds velocity_grad[i, j, particle] -=
+                volume * (v[i, particle] - v[i, neighbor]) * grad_kernel[j]
         end
     end
 
@@ -893,7 +901,7 @@ end
         # J = det(F) is the volumetric Jacobian (paper uses ln(J_e) in τ = K ln(J_e) + 2η dev d)
         J = max(det(F), 1e-6)
 
-        _L    = velocity_grad[:, :, particle] * L_corr'
+        _L = StaticArrays.SMatrix{3, 3}(@view velocity_grad[:, :, particle]) * L_corr'
         d     = 0.5 * (_L + _L')
         dev_d = d - 1/3 * tr(d) * I
 
@@ -904,7 +912,10 @@ end
         
         # Convert Kirchhoff stress to First Piola-Kirchhoff (PK1) stress P = tau * F^{-T}
         FinvT = pinv(F)'
-        v_vis[:, :, particle] .= (tau * FinvT) * L_corr
+        v_particle = (tau * FinvT) * L_corr
+        for j in 1:ndims(system), i in 1:ndims(system)
+            @inbounds v_vis[i, j, particle] = v_particle[i, j]
+        end
     end
 
     return v_vis
@@ -1163,24 +1174,22 @@ end
     (; mass, material_density, temp, temp_ref) = system
 
     # Use pre-allocated cache buffers — eliminates three large heap allocations per RHS call.
-    velocity_grad = system.cache.velocity_grad
-    b = system.cache.b_buf
-    d = system.cache.d_buf
+    velocity_grad, b, d = system.cache.velocity_grad, system.cache.b_buf, system.cache.d_buf
 
     # Reset deformation_grad to zero (always needed).
-    fill!(deformation_grad, zero(eltype(system)))
+    fill!(deformation_grad, 0)
     NDIMS = ndims(system)
 
     # velocity_grad, b, d are only needed when the caller uses the return values.
     # Skip their reset and computation entirely in the implicit deformation-grad-only path.
     if compute_b_d
-        fill!(velocity_grad, zero(eltype(system)))
-        fill!(b, zero(eltype(system)))
-        fill!(d, zero(eltype(system)))
+        fill!(velocity_grad, 0)
+        fill!(b, 0)
+        fill!(d, 0)
         for i in 1:size(deformation_grad, 3)
             @inbounds for k in 1:NDIMS
-                b[k, k, i] = one(eltype(system))
-                d[k, k, i] = one(eltype(system))
+                b[k, k, i] = 1.0
+                d[k, k, i] = 1.0
             end
         end
     end
@@ -1190,42 +1199,53 @@ end
     nhs = get_neighborhood_search(system, system, semi)
     PointNeighbors.foreach_point_neighbor(
         initial_coords, initial_coords, nhs;
-        parallelization_backend=PolyesterBackend()
+        parallelization_backend=semi.parallelization_backend
     ) do particle, neighbor, pos_diff_initial, initial_distance
         initial_distance^2 < eps(initial_smoothing_length(system)^2) && return
 
         volume = @inbounds mass[neighbor] / material_density[neighbor]
         pos_diff_current = @inbounds current_coords(system, particle) -
                                      current_coords(system, neighbor)
-        pos_diff_current = convert.(eltype(system), pos_diff_current)
 
         grad_kernel = smoothing_kernel_grad(system, pos_diff_initial,
                                             initial_distance, particle)
         L = @inbounds correction_matrix(system, particle)
 
-        result   = volume * pos_diff_current * grad_kernel' * L'
-
         for j in 1:ndims(system), i in 1:ndims(system)
-            @inbounds deformation_grad[i, j, particle] -= result[i, j]
+            corrected_grad_j = zero(eltype(grad_kernel))
+            for k in 1:ndims(system)
+                @inbounds corrected_grad_j += grad_kernel[k] * L[j, k]
+            end
+            @inbounds deformation_grad[i, j, particle] -=
+                volume * pos_diff_current[i] * corrected_grad_j
         end
 
         # velocity_grad is only needed for b and d (strain-rate tensor).
         if compute_b_d
-            vel_diff = v[:, particle] - v[:, neighbor]
-            result_v = volume * vel_diff * grad_kernel' * L'
             for j in 1:ndims(system), i in 1:ndims(system)
-                @inbounds velocity_grad[i, j, particle] -= result_v[i, j]
+                corrected_grad_j = zero(eltype(grad_kernel))
+                for k in 1:ndims(system)
+                    @inbounds corrected_grad_j += grad_kernel[k] * L[j, k]
+                end
+                @inbounds velocity_grad[i, j, particle] -=
+                    volume * (v[i, particle] - v[i, neighbor]) * corrected_grad_j
             end
         end
     end
 
     # Compute b = F·Fᵀ and d = sym(L) — only when caller needs them.
     if compute_b_d
-        for particle in eachparticle(system)
-            F  = deformation_grad[:,:,particle]
-            b[:,:,particle] = F * F'
-            _L = velocity_grad[:,:,particle]
-            d[:,:,particle] = 0.5 * (_L + _L')
+        @threaded semi for particle in eachparticle(system)
+            for j in 1:ndims(system), i in 1:ndims(system)
+                b_ij = zero(eltype(b))
+                for k in 1:ndims(system)
+                    @inbounds b_ij += deformation_grad[i, k, particle] *
+                                      deformation_grad[j, k, particle]
+                end
+                @inbounds b[i, j, particle] = b_ij
+                @inbounds d[i, j, particle] = 0.5 * (velocity_grad[i, j, particle] +
+                                                     velocity_grad[j, i, particle])
+            end
         end
     end
 

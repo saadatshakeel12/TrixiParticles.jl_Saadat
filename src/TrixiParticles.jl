@@ -67,7 +67,7 @@ include("visualization/recipes_plots.jl")
 # Module-level stress tensor cache: set by callback, read by interact_structure_structure! in RHS.
 # Stores (system_objectid, array) so the cache is only used for the specific system that wrote it.
 # This prevents floor/mold self-interaction from accidentally reading the cylinder's stress.
-const STRESS_TENSOR_CACHE = Ref{Union{Nothing, Tuple{UInt64, Array}}}(nothing)
+const STRESS_TENSOR_CACHE = Ref{Union{Nothing, Tuple{UInt64, AbstractArray{Float64, 3}}}}(nothing)
 
 export Semidiscretization, semidiscretize, restart_with!
 export InitialCondition

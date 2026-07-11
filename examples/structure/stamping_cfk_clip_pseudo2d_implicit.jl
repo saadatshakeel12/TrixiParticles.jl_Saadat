@@ -1,8 +1,12 @@
 # ==========================================================================================
-# Pseudo-2D Thermomechanical Forming of a CFK Clip-Style Part (Implicit)
+# Pseudo-2D Thermomechanical Forming of an Aerospace CFRT Clip (Implicit)
 #
-# Same physics stack as `stamping_cfk_clip_3d_implicit.jl`, but the domain is a
-# thin slab — 1 particle thick along y — so it runs much faster for testing.
+# Product: carbon-fibre reinforced thermoplastic (CFRT) aircraft structural clip.
+# Canonical molding physics stack (plane-strain / thin-3D constraints, Nakamura hold,
+# retraction, WCSPH/TLSPH blend). Procedural trapezoidal cavity by default; STL /
+# user L-die geometry via TP_CLIP_USE_STL=1 (see clip_stl_geometry_setup.jl).
+# Legacy alternate driver (deprecated): misc/stamping_cfk_clip_3d_implicit.jl
+# GPU thin-3D driver: stamping_cfk_clip_3d_l_thin3d_implicit_gpu.jl (TP_CLIP_GPU=1)
 # Everything else (dual-phase constitutive model, viscous/elastic stress cache,
 # plasticity history, flow-orientation kinetics, contact heat flux, implicit
 # TRBDF2 solver) is unchanged.
@@ -19,6 +23,7 @@ using ADTypes
 using LinearSolve
 using RecursiveFactorization
 using KrylovKit
+using SciMLBase: ArrayPartition
 using IncompleteLU
 using PointNeighbors
 using Plots
@@ -47,45 +52,255 @@ function env_int(name, default)
     return parsed
 end
 
+const celsius_to_kelvin_offset = 273.15
+@inline celsius_to_kelvin(temp_c) = temp_c + celsius_to_kelvin_offset
+@inline kelvin_to_celsius(temp_k) = temp_k - celsius_to_kelvin_offset
+
+function env_temp_c(name, default_c)
+    return celsius_to_kelvin(env_float(name, default_c))
+end
+
+function fmt_temp(temp_k)
+    return string(round(kelvin_to_celsius(temp_k); digits=2), " °C (",
+                  round(temp_k; digits=2), " K)")
+end
+
+# GPU parallelization (TP_CLIP_GPU=1 → CUDABackend + FullGridCellList NHS).
+# Thin GPU driver: stamping_cfk_clip_3d_l_thin3d_implicit_gpu.jl
+const clip_use_gpu = env_int("TP_CLIP_GPU", 0) != 0
+if clip_use_gpu
+    using CUDA
+    CUDA.functional() || error("TP_CLIP_GPU=1 but CUDA is not functional on this machine")
+    cuda_device = env_int("TP_CLIP_CUDA_DEVICE", 0)
+    CUDA.device!(cuda_device)
+    const clip_parallelization_backend = CUDABackend()
+    println("GPU backend: CUDA device ", cuda_device, " (", CUDA.name(CUDA.device()), ")")
+    println("  Note: CUDA RHS via CUDABackend; mold kinematics synced on CPU each step")
+else
+    const clip_parallelization_backend = PolyesterBackend()
+end
+
+function clip_gpu_allowscalar(f)
+    if clip_use_gpu
+        CUDA.allowscalar(true)
+        try
+            return f()
+        finally
+            CUDA.allowscalar(false)
+        end
+    end
+    return f()
+end
+
+function clip_ode_vector(n::Integer; T::Type{<:AbstractFloat}=Float64)
+    if clip_use_gpu
+        return CUDA.zeros(T, n)
+    end
+    return zeros(T, n)
+end
+
+function clip_ode_state_from_checkpoint(ck)
+    v = Vector{Float64}(ck["v_ode"])
+    u = Vector{Float64}(ck["u_ode"])
+    if clip_use_gpu
+        return CUDA.CuArray(v), CUDA.CuArray(u)
+    end
+    return v, u
+end
+
+function clip_ode_initial_state(ode_base, hold_checkpoint_restore)
+    if hold_checkpoint_restore !== nothing
+        return clip_ode_state_from_checkpoint(hold_checkpoint_restore)
+    end
+    return ode_base.u0.x[1], ode_base.u0.x[2]
+end
+
+function clip_particle_buffer(eltype, dims...)
+    if clip_use_gpu
+        return CUDA.zeros(eltype, dims...)
+    end
+    return zeros(eltype, dims...)
+end
+
+function clip_host_copy(x)
+    if clip_use_gpu
+        return x isa CUDA.CuArray ? Array(x) : copy(x)
+    end
+    return copy(x)
+end
+
+function clip_host_assign!(dest, src)
+    if clip_use_gpu
+        if dest isa CUDA.CuArray && !(src isa CUDA.CuArray)
+            copyto!(dest, CUDA.CuArray(src))
+        elseif dest isa CUDA.CuArray && src isa CUDA.CuArray
+            copyto!(dest, src)
+        else
+            dest .= src
+        end
+    else
+        dest .= src
+    end
+    return nothing
+end
+
+function clip_nhs_max_points_per_cell(n_tool::Integer)
+    if haskey(ENV, "TP_CLIP_NHS_MAX_POINTS_PER_CELL")
+        return max(64, env_int("TP_CLIP_NHS_MAX_POINTS_PER_CELL", 2048))
+    end
+    # DictionaryCellList default (100) overflows when thin-3D tool slices exceed ~2k particles.
+    return max(256, min(8192, 128 + n_tool ÷ 16))
+end
+
+function clip_build_grid_cell_list(n_points::Integer, max_points_per_cell::Integer)
+    list_size = max(256, 2 * n_points)
+    return SpatialHashingCellList{3}(; list_size, max_points_per_cell=max_points_per_cell)
+end
+
+function clip_build_neighborhood_search(search_radius;
+                                        polymer_coords,
+                                        floor_coords,
+                                        mold_coords,
+                                        extra_z_pad=0.02)
+    n_total = size(polymer_coords, 2) + size(floor_coords, 2) + size(mold_coords, 2)
+    n_tool = size(floor_coords, 2) + size(mold_coords, 2)
+    max_ppc = clip_nhs_max_points_per_cell(n_tool)
+    if clip_use_gpu
+        coords = hcat(polymer_coords, floor_coords, mold_coords)
+        pad = 4 * search_radius
+        min_corner = vec(minimum(coords, dims=2)) .- pad
+        max_corner = vec(maximum(coords, dims=2)) .+ pad
+        max_corner[3] += extra_z_pad
+        cell_list = FullGridCellList(; min_corner, max_corner, max_points_per_cell=max_ppc)
+        return GridNeighborhoodSearch{3}(; cell_list, search_radius)
+    end
+    return GridNeighborhoodSearch{3}(;
+        cell_list=clip_build_grid_cell_list(n_total, max_ppc),
+        search_radius=search_radius)
+end
+
+function clip_build_charge_neighborhood_search(search_radius, coords)
+    n = size(coords, 2)
+    max_ppc = clip_nhs_max_points_per_cell(0)
+    if clip_use_gpu
+        pad = 4 * search_radius
+        min_corner = vec(minimum(coords, dims=2)) .- pad
+        max_corner = vec(maximum(coords, dims=2)) .+ pad
+        cell_list = FullGridCellList(; min_corner, max_corner, max_points_per_cell=max_ppc)
+        return GridNeighborhoodSearch{3}(; cell_list, search_radius)
+    end
+    return GridNeighborhoodSearch{3}(;
+        cell_list=clip_build_grid_cell_list(n, max_ppc),
+        search_radius=search_radius)
+end
+
+function clip_precomputed_nhs_template(; max_neighbors::Integer, n_tool::Integer=0)
+    max_ppc = clip_nhs_max_points_per_cell(n_tool)
+    inner = GridNeighborhoodSearch{3}(;
+        cell_list=clip_build_grid_cell_list(max(n_tool, 1), max_ppc),
+        search_radius=0.0)
+    return PrecomputedNeighborhoodSearch{3}(;
+        update_neighborhood_search=inner, max_neighbors=max_neighbors)
+end
+
+function clip_build_wcsph_neighborhood_search(search_radius, semi)
+    PointNeighbors.copy_neighborhood_search(
+        TrixiParticles.get_neighborhood_search(semi.systems[1], semi.systems[2], semi),
+        search_radius,
+        nparticles(semi.systems[1]))
+end
+
+# WCSPH current-config neighbor loops: on GPU reuse the main simulation grid NHS
+# (CuArray cell list + full-domain bbox from semidiscretize). A separate CPU-built
+# FullGridCellList cannot be re-initialized on device coordinates.
+@inline function clip_wcsph_nhs(semi)
+    clip_use_gpu && return TrixiParticles.get_neighborhood_search(semi.systems[1],
+                                                                  semi.systems[2],
+                                                                  semi)
+    return wcsph_current_nhs
+end
+
 # Implicit Jacobian mode for TRBDF2.
-#   finite  — AutoFiniteDiff (default; compatible with kick_implicit_visible! Float64 scratch buffers)
-#   forward — AutoForwardDiff (experimental: fails if RHS writes Dual into Vector{Float64})
+#   finite — AutoFiniteDiff (default)
 function clip_jacobian_mode()
     mode = lowercase(get(ENV, "TP_CLIP_JACOBIAN_MODE", "finite"))
-    mode in ("finite", "forward") ||
-        error("TP_CLIP_JACOBIAN_MODE must be 'finite' or 'forward' (got $(mode)). " *
+    mode == "finite" ||
+        error("TP_CLIP_JACOBIAN_MODE must be 'finite' (got $(mode)). " *
               "Sparse Jacobian AD is not supported for DynamicalODEProblem in this script.")
-    mode == "forward" &&
-        @warn "TP_CLIP_JACOBIAN_MODE=forward is experimental for this script: " *
-              "kick_implicit_visible! uses Float64 work buffers and may throw " *
-              "MethodError(convert, (Float64, Dual(...))) during Jacobian assembly."
     return mode
 end
 
 function clip_jacobian_autodiff(mode::String)
-    if mode == "forward"
-        return AutoForwardDiff(; chunksize=12)
-    end
     return AutoFiniteDiff()
 end
 
-# Linear solver for TRBDF2 Newton steps (W = I - γJ).
-#   dense / rfluf / lu — RFLUFactorization (default; best for small n_dof)
-#   krylov / gmres    — KrylovKit GMRES (only worthwhile when n_dof ≫ 500)
-function clip_linsolve_solver(n_dof::Int; default_mode::String="dense")
+# Linear solver for implicit Newton steps (W = I - γJ).
+#   dense / rfluf / lu — RFLUFactorization (default; best for n_dof≲1500 clip runs)
+#   krylov / gmres    — GMRES: KrylovJL for matrix_free JVP; KrylovKit for dense+large n_dof
+#   sparse            — Sparse LU factorization (UmfpackFactorization); pairs with sparse Jacobian
+#   colored Jacobian always uses dense/RFLU (W is dense even though assembly is colored)
+function clip_linsolve_solver(n_dof::Int; default_mode::String="dense",
+                              matrix_free::Bool=false,
+                              jacobian_strategy::String="dense")
     mode = lowercase(get(ENV, "TP_CLIP_LINSOLVE", default_mode))
-    mode in ("dense", "rfluf", "lu", "krylov", "gmres") ||
-        error("TP_CLIP_LINSOLVE must be dense|rfluf|lu|krylov|gmres (got $(mode))")
+    if jacobian_strategy == "sparse" && !haskey(ENV, "TP_CLIP_LINSOLVE")
+        mode = "sparse"
+    elseif jacobian_strategy == "colored" && !haskey(ENV, "TP_CLIP_LINSOLVE")
+        mode = "dense"
+    end
+    mode in ("dense", "rfluf", "lu", "krylov", "gmres", "sparse") ||
+        error("TP_CLIP_LINSOLVE must be dense|rfluf|lu|krylov|gmres|sparse (got $(mode))")
+    if mode == "sparse"
+        return LinearSolve.UMFPACKFactorization()
+    end
     if mode in ("krylov", "gmres")
-        # Frequent GMRES restarts with small krylovdim trigger KrylovKit bugs when the
-        # ODE state mixes ArrayPartition with ThreadedBroadcastArray (full molding runs).
-        # Retraction-only uses plain Vector{Float64} states (n_dof≈147), so GMRES runs,
-        # but dense LU is still faster at that size because TRBDF2 builds a full dense W.
+        if matrix_free
+            # matrix_free JVP: KrylovJL is broken with OrdinaryDiffEq JVPs.
+            # Swapping to KrylovKitJL_GMRES to enable matrix-free 3D scaling.
+            krylovdim = env_int("TP_CLIP_KRYLOV_DIM", 120)
+            # Optional crude block-diagonal preconditioner for the flattened (v,u) state:
+            # rescales the u block relative to v to improve conditioning of (I - γJ).
+            #
+            # Enable with: TP_CLIP_MF_PREC=1
+            # Tune with:   TP_CLIP_MF_PREC_V_SCALE, TP_CLIP_MF_PREC_U_SCALE
+            #
+            # Note: This does not approximate J; it only rescales mixed-unit blocks to
+            # reduce GMRES stagnation. It is safe to disable (default).
+            use_prec = env_int("TP_CLIP_MF_PREC", 0) != 0
+            v_scale = env_float("TP_CLIP_MF_PREC_V_SCALE", 1.0)
+            u_scale = env_float("TP_CLIP_MF_PREC_U_SCALE", 1.0)
+            precs = if use_prec
+                function (_A, _p)
+                    n = n_dof
+                    nv = clip_ode_nv[]
+                    nu = clip_ode_nu[]
+                    if nv <= 0 || nu <= 0 || nv + nu != n
+                        return (nothing, nothing)
+                    end
+                    s = Vector{Float64}(undef, n)
+                    @inbounds for i in 1:nv
+                        s[i] = v_scale
+                    end
+                    @inbounds for i in nv+1:n
+                        s[i] = u_scale
+                    end
+                    P = LinearSolve.InvPreconditioner(LinearAlgebra.Diagonal(s))
+                    return (P, nothing)  # left preconditioner only
+                end
+            else
+                LinearSolve.DEFAULT_PRECS
+            end
+            return KrylovKitJL_GMRES(; krylovdim=krylovdim,
+                                       atol=env_float("TP_CLIP_KRYLOV_ATOL", 1.0e-6),
+                                       rtol=env_float("TP_CLIP_KRYLOV_RTOL", 5.0e-2),
+                                       maxiter=env_int("TP_CLIP_KRYLOV_MAXITER", 400),
+                                       verbosity=0,
+                                       precs=precs)
+        end
+        # Dense Jacobian + GMRES (CFRP 3D): KrylovKit with large krylovdim.
         n_dof < 500 &&
-            @warn "TP_CLIP_LINSOLVE=krylov with n_dof=$n_dof: implicit step time is " *
-                  "RHS-dominated; dense LU is typically faster. Krylov helps mainly when " *
-                  "n_dof is large (full 3D molding)."
-        # stamping_cfrp_3d_2_implicit.jl uses krylovdim=40, maxiter=200.
+            @warn "TP_CLIP_LINSOLVE=krylov with n_dof=$n_dof: dense LU is typically faster " *
+                  "unless the Jacobian is very large."
         krylovdim = env_int("TP_CLIP_KRYLOV_DIM", 40)
         return KrylovKitJL_GMRES(; krylovdim=krylovdim,
                                    atol=env_float("TP_CLIP_KRYLOV_ATOL", 1.0e-6),
@@ -96,14 +311,544 @@ function clip_linsolve_solver(n_dof::Int; default_mode::String="dense")
     return RFLUFactorization()
 end
 
+# Implicit time integrator (OrdinaryDiffEq).
+#   implicit_euler — 1 implicit stage; default for clip (pairs with matrix_free JVP)
+#   trbdf2         — 2-stage L-stable (legacy default behaviour)
+#   rodas5         — stiff Rosenbrock (fallback for difficult transients)
+function clip_integrator_mode()
+    mode = lowercase(get(ENV, "TP_CLIP_INTEGRATOR", "trbdf2"))
+    mode in ("trbdf2", "implicit_euler", "rodas5", "explicit") ||
+        error("TP_CLIP_INTEGRATOR must be trbdf2, implicit_euler, rodas5, or explicit (got $(mode))")
+    return mode
+end
+
+# Jacobian assembly for implicit Newton solves.
+#   matrix_free — directional J·v via 2 RHS evals + GMRES (no dense 882×882 build)
+#   dense       — AutoFiniteDiff column differencing + dense/RFLU linear solve
+#   sparse      — SPH-locality coloring + sparse storage + UMFPACK
+#   colored     — same coloring as sparse, dense Jacobian storage + dense/RFLU LU
+function clip_normalize_jacobian_strategy(strategy::String)
+    s = lowercase(strategy)
+    s == "colored_dense" && return "colored"
+    return s
+end
+
+function clip_jacobian_strategy()
+    strategy = clip_normalize_jacobian_strategy(get(ENV, "TP_CLIP_JACOBIAN_STRATEGY", "dense"))
+    strategy in ("dense", "matrix_free", "sparse", "colored") ||
+        error("TP_CLIP_JACOBIAN_STRATEGY must be dense, matrix_free, sparse, or colored " *
+              "(got $(strategy))")
+    return strategy
+end
+
+@inline clip_uses_custom_jacobian(strategy::String) =
+    strategy in ("sparse", "colored")
+
+const clip_ode_flat = Ref(false)
+const clip_ode_nv = Ref(0)
+const clip_ode_nu = Ref(0)
+const CURRENT_JACOBIAN_STRATEGY = Ref("dense")
+const clip_jvp_work = Ref{Union{Nothing, NamedTuple{(:y_plus, :y_minus, :fp, :fm),
+                                                    NTuple{4, Vector{Float64}}}}}(nothing)
+
+const clip_jac_colors = Ref{Vector{Int}}()
+const clip_jac_groups = Ref{Vector{Vector{Int}}}()
+const clip_jac_coloring_n = Ref(0)
+const clip_jac_sparsity_pattern = Ref{Union{Nothing,SparseMatrixCSC{Float64,Int}}}(nothing)
+const clip_in_jacobian_fill = Ref(false)
+const clip_jac_radius_mult = env_float("TP_CLIP_JAC_RADIUS_MULT", 3.5)
+# Print progress during colored/sparse Jacobian fills (color group spam).
+const clip_jac_fill_print = env_int("TP_CLIP_JAC_FILL_PRINT", 1) != 0
+# Rebuild SPH-locality sparsity pattern + coloring from trial Newton state y before each
+# colored Jacobian fill (colored strategy only; sparse CSC structure is fixed at setup).
+const clip_jac_pattern_refresh = env_int("TP_CLIP_JAC_PATTERN_REFRESH", 0) != 0
+const clip_jac_pattern_refresh_count = Ref(0)
+# During colored/sparse Jacobian fill: 0 = freeze NHS at trial state (matches dense
+# AutoFiniteDiff); 1 = refresh NHS on every perturbed RHS (more accurate ∂f/∂y but
+# inconsistent with frozen-NHS Newton residuals → poor convergence).
+const clip_jac_nhs_refresh = env_int("TP_CLIP_JAC_NHS_REFRESH", 0) != 0
+# During colored/sparse Jacobian fill: 1 = freeze thermal dT/dt at trial state (matches dense
+# AutoFiniteDiff NHS freeze); 0 = recompute contact + SPH thermal on every perturbed RHS.
+const clip_jac_thermal_frozen = env_int("TP_CLIP_JAC_THERMAL_FROZEN", 1) != 0
+# Optional: cache thermal dT/dt on first RHS at each time `t` (dense Jacobian / Newton).
+# Same approximation as frozen NHS at fixed `t`; off by default.
+const clip_thermal_same_t_cache = env_int("TP_CLIP_THERMAL_SAME_T_CACHE", 0) != 0
+const clip_thermal_jac_cache_valid = Ref(false)
+const clip_thermal_same_t_updated_at = Ref(-Inf)
+
+# Environmental/ambient heat loss settings (convection and radiation)
+const use_ambient_heat_loss = env_int("TP_CLIP_USE_AMBIENT_HEAT_LOSS", 0) != 0
+const temp_ambient = env_temp_c("TP_CLIP_TEMP_AMBIENT", 25.0)       # °C input; stored as K
+const h_ambient = env_float("TP_CLIP_H_AMBIENT", 15.0)             # W/(m²·K)
+const emissivity_charge = env_float("TP_CLIP_EMISSIVITY", 0.85)     # Emissivity of composite surface
+const stefan_boltzmann = 5.670374e-8                              # W/(m²·K⁴)
+
+const charge_boundary_exposure = Float64[]
+
+# During colored/sparse Jacobian fill: freeze tool–charge contact increment (Reimann +
+# source terms + WCSPH) at the trial state. Off by default until validated on a run.
+const clip_jac_contact_frozen = env_int("TP_CLIP_JAC_CONTACT_FROZEN", 0) != 0
+# Optional: reuse first contact increment at each time `t` (dense Jacobian / Newton).
+const clip_contact_same_t_cache = env_int("TP_CLIP_CONTACT_SAME_T_CACHE", 0) != 0
+const clip_contact_jac_cache_valid = Ref(false)
+const clip_contact_same_t_updated_at = Ref(-Inf)
+
+function clip_reset_jacobian_coloring!()
+    clip_jac_coloring_n[] = 0
+    clip_jac_sparsity_pattern[] = nothing
+    return nothing
+end
+
+function clip_precompute_jacobian_coloring!(jac_sparsity; force::Bool=false)
+    if !force && clip_jac_coloring_n[] > 0
+        return clip_jac_coloring_n[]
+    end
+    println(">>> Precomputing custom SPH Jacobian coloring...")
+    flush(stdout)
+    clip_jac_colors[] = clip_compute_colors(jac_sparsity)
+    n_colors = maximum(clip_jac_colors[])
+    groups = [Int[] for _ in 1:n_colors]
+    for col in 1:size(jac_sparsity, 2)
+        push!(groups[clip_jac_colors[][col]], col)
+    end
+    clip_jac_groups[] = groups
+    clip_jac_coloring_n[] = n_colors
+    println("✓ Precomputed coloring: ", n_colors, " color groups.")
+    flush(stdout)
+    return n_colors
+end
+
+function clip_colored_jacobian_fill!(y, p, t, nv::Int, nu::Int, set_column!)
+    groups = clip_jac_groups[]
+    n_colors = length(groups)
+    n_colors == 0 && error("Jacobian coloring not initialized; call clip_precompute_jacobian_coloring! first")
+    prev_jac_fill = clip_in_jacobian_fill[]
+    clip_in_jacobian_fill[] = true
+    clip_thermal_jac_cache_valid[] = false
+    clip_contact_jac_cache_valid[] = false
+    try
+        f0 = similar(y)
+        clip_combined_rhs!(f0, y, p, t, nv, nu)
+        y_pert = copy(y)
+        f_pert = similar(y)
+        epsilon = 1e-7
+        jac_progress = max(1, env_int("TP_CLIP_SPARSE_JAC_PROGRESS", 100))
+        label = CURRENT_JACOBIAN_STRATEGY[] == "sparse" ? "Sparse" : "Colored dense"
+
+        if clip_jac_fill_print && n_colors > 0
+            nhs_mode = clip_jac_nhs_refresh ? "NHS refresh ON" : "NHS frozen (dense-consistent)"
+            thermal_mode = clip_jac_thermal_frozen ? "thermal frozen" : "thermal refresh ON"
+            contact_mode = clip_jac_contact_frozen ? "contact frozen" : "contact refresh ON"
+            println(">>> Filling ", label, " Jacobian (", n_colors, " RHS groups; ",
+                    nhs_mode, "; ", thermal_mode, "; ", contact_mode, ")...")
+            flush(stdout)
+        end
+
+        for c in 1:n_colors
+            if clip_jac_fill_print && (c == 1 || c == n_colors || c % jac_progress == 0)
+                println(">>> ", label, " Jacobian: color group ", c, "/", n_colors,
+                        " (trial_dt=", trial_dt_state[], " s)")
+                flush(stdout)
+            end
+            cols = groups[c]
+            for col in cols
+                y_pert[col] += epsilon
+            end
+            clip_combined_rhs!(f_pert, y_pert, p, t, nv, nu)
+            for col in cols
+                y_pert[col] = y[col]
+            end
+            for col in cols
+                set_column!(col, f0, f_pert, epsilon)
+            end
+        end
+        if clip_jac_fill_print
+            println(">>> ", label, " Jacobian fill complete (", n_colors, " color groups).")
+            flush(stdout)
+        end
+    finally
+        clip_in_jacobian_fill[] = prev_jac_fill
+    end
+    return nothing
+end
+
+function clip_sparse_jacobian!(J, y, p, t)
+    clip_sync_trial_dt_state!()
+    nv = clip_ode_nv[]
+    nu = clip_ode_nu[]
+    fill!(J.nzval, 0.0)
+    colptr = J.colptr
+    rowval = J.rowval
+    nzval = J.nzval
+    function set_column_sparse!(col, f0, f_pert, epsilon)
+        for idx in colptr[col]:(colptr[col + 1] - 1)
+            row = rowval[idx]
+            nzval[idx] = (f_pert[row] - f0[row]) / epsilon
+        end
+    end
+    clip_colored_jacobian_fill!(y, p, t, nv, nu, set_column_sparse!)
+    println(">>> Factorizing / solving Newton linear system (UMFPACK)...")
+    flush(stdout)
+    return nothing
+end
+
+function clip_maybe_refresh_jacobian_pattern!(y, semi_local, nv::Int, nu::Int)
+    clip_jac_pattern_refresh || return nothing
+    CURRENT_JACOBIAN_STRATEGY[] == "colored" || return nothing
+    u_trial = @view y[nv+1:nv+nu]
+    v_trial = @view y[1:nv]
+    jac_sparsity = clip_build_sparse_jacobian_prototype(semi_local, v_trial, u_trial;
+                                                        quiet=true)
+    old_nnz = clip_jac_sparsity_pattern[] === nothing ? 0 : nnz(clip_jac_sparsity_pattern[])
+    clip_jac_sparsity_pattern[] = jac_sparsity
+    clip_jac_coloring_n[] = 0
+    n_colors = clip_precompute_jacobian_coloring!(jac_sparsity; force=true)
+    clip_jac_pattern_refresh_count[] += 1
+    n = clip_jac_pattern_refresh_count[]
+    if n == 1 || n % 20 == 0
+        println(">>> Jacobian pattern refreshed from trial y (#", n, "): nnz ",
+                old_nnz, " -> ", nnz(jac_sparsity), ", ", n_colors, " color groups.")
+        flush(stdout)
+    end
+    return nothing
+end
+
+function clip_colored_dense_jacobian!(J, y, p, t)
+    clip_sync_trial_dt_state!()
+    nv = clip_ode_nv[]
+    nu = clip_ode_nu[]
+    clip_maybe_refresh_jacobian_pattern!(y, p, nv, nu)
+    sp = clip_jac_sparsity_pattern[]
+    sp === nothing && error("Colored dense Jacobian sparsity pattern not initialized")
+    fill!(J, 0.0)
+    colptr = sp.colptr
+    rowval = sp.rowval
+    function set_column_dense_pattern!(col, f0, f_pert, epsilon)
+        for idx in colptr[col]:(colptr[col + 1] - 1)
+            row = rowval[idx]
+            J[row, col] = (f_pert[row] - f0[row]) / epsilon
+        end
+    end
+    clip_colored_jacobian_fill!(y, p, t, nv, nu, set_column_dense_pattern!)
+    return nothing
+end
+
+function clip_compute_colors(jac_prototype)
+    n = size(jac_prototype, 2)
+    colors = zeros(Int, n)
+    col_ptrs = jac_prototype.colptr
+    rowval = jac_prototype.rowval
+    
+    row_to_cols = [Int[] for _ in 1:size(jac_prototype, 1)]
+    for col in 1:n
+        for r_idx in col_ptrs[col]:(col_ptrs[col+1]-1)
+            r = rowval[r_idx]
+            push!(row_to_cols[r], col)
+        end
+    end
+    
+    for col in 1:n
+        neighbor_cols = Int[]
+        for r_idx in col_ptrs[col]:(col_ptrs[col+1]-1)
+            r = rowval[r_idx]
+            append!(neighbor_cols, row_to_cols[r])
+        end
+        unique!(neighbor_cols)
+        
+        used_colors = colors[neighbor_cols]
+        c = 1
+        while c in used_colors
+            c += 1
+        end
+        colors[col] = c
+    end
+    return colors
+end
+
+@inline function clip_jvp_epsilon(y, vdir)
+    ny = norm(y)
+    nv = norm(vdir)
+    nv < eps(eltype(y)) && return sqrt(eps(eltype(y)))
+    return sqrt(eps(eltype(y))) * max(1.0, ny) / nv
+end
+
+function clip_ensure_jvp_work!(n::Int)
+    w = clip_jvp_work[]
+    if w === nothing || length(w.y_plus) != n
+        clip_jvp_work[] = (y_plus=zeros(n), y_minus=zeros(n), fp=zeros(n), fm=zeros(n))
+    end
+    return clip_jvp_work[]
+end
+
+function clip_combined_rhs!(dy, y, semi_local, t, nv::Int, nu::Int)
+    clip_sync_trial_dt_state!()
+    v = @view y[1:nv]
+    u = @view y[nv+1:nv+nu]
+    dv = @view dy[1:nv]
+    du = @view dy[nv+1:nv+nu]
+    kick_implicit_visible!(dv, v, u, semi_local, t)
+    drift_implicit_visible!(du, v, u, semi_local, t)
+    return nothing
+end
+
+function clip_combined_jvp!(Jv, y, vdir, semi_local, t, nv::Int, nu::Int)
+    w = clip_ensure_jvp_work!(length(y))
+    ε = clip_jvp_epsilon(y, vdir)
+    @. w.y_plus = y + ε * vdir
+    @. w.y_minus = y - ε * vdir
+    clip_combined_rhs!(w.fp, w.y_plus, semi_local, t, nv, nu)
+    clip_combined_rhs!(w.fm, w.y_minus, semi_local, t, nv, nu)
+    @. Jv = (w.fp - w.fm) / (2ε)
+    return nothing
+end
+
+function clip_integrator_vu(integrator)
+    if clip_ode_flat[]
+        nv = clip_ode_nv[]
+        nu = clip_ode_nu[]
+        u = integrator.u
+        return @view(u[1:nv]), @view(u[nv+1:nv+nu])
+    end
+    return integrator.u.x[1], integrator.u.x[2]
+end
+
+function clip_integrator_vu_partition(integrator)
+    if clip_ode_flat[]
+        nv = clip_ode_nv[]
+        u = integrator.u
+        return ArrayPartition(@view(u[1:nv]), @view(u[nv+1:end]))
+    end
+    return integrator.u
+end
+
+# Positions for SPH-locality Jacobian sparsity (current ODE state, not reference mesh).
+function clip_jacobian_pattern_coords(semi, u0_ode)
+    systems = semi.systems
+    ranges_u = semi.ranges_u
+    coords = Vector{Matrix{Float64}}(undef, length(systems))
+    for (idx, sys) in enumerate(systems)
+        n = TrixiParticles.n_integrated_particles(sys)
+        nd = TrixiParticles.ndims(sys)
+        range_u = ranges_u[idx]
+        if n == 0 || isempty(range_u)
+            coords[idx] = Matrix(@view sys.current_coordinates[1:nd, 1:n])
+        else
+            u_sys = TrixiParticles.wrap_u(u0_ode, sys, semi)
+            mat = Matrix{Float64}(undef, nd, n)
+            @inbounds for p in 1:n, d in 1:nd
+                mat[d, p] = u_sys[d, p]
+            end
+            coords[idx] = mat
+        end
+    end
+    return coords
+end
+
+function clip_build_sparse_jacobian_prototype(semi, v0_ode, u0_ode; D_max=0.006, quiet::Bool=false)
+    nv = length(v0_ode)
+    nu = length(u0_ode)
+    n_total = nv + nu
+
+    I_rows = Int[]
+    J_cols = Int[]
+    
+    # 1. Coordinate equations: du/dt = v
+    for i in 1:nu
+        push!(I_rows, nv + i)
+        push!(J_cols, i)
+    end
+    
+    # 2. Velocity equations: dv/dt = f(v, u)
+    systems = semi.systems
+    ranges_v = semi.ranges_v
+    ranges_u = semi.ranges_u
+    
+    coords_state = clip_jacobian_pattern_coords(semi, u0_ode)
+    if !quiet
+        println(">>> Jacobian sparsity pattern: neighbor graph from current ODE positions ",
+                "(not initial/reference mesh).")
+        flush(stdout)
+    end
+    
+    for (A_idx, sys_A) in enumerate(systems)
+        range_v_A = ranges_v[A_idx]
+        range_u_A = ranges_u[A_idx]
+        isempty(range_v_A) && continue
+        N_A = TrixiParticles.n_integrated_particles(sys_A)
+        v_stride_A = TrixiParticles.v_nvariables(sys_A)
+        u_stride_A = TrixiParticles.u_nvariables(sys_A)
+        h_A = TrixiParticles.initial_smoothing_length(sys_A)
+        
+        for i in 1:N_A
+            pos_i = coords_state[A_idx][:, i]
+            v_i_idxs = [range_v_A[1] + d - 1 + v_stride_A * (i - 1) for d in 1:v_stride_A]
+            u_i_idxs = [nv + range_u_A[1] + d - 1 + u_stride_A * (i - 1) for d in 1:u_stride_A]
+            
+            # Self coupling
+            for r in v_i_idxs
+                for c in v_i_idxs
+                    push!(I_rows, r)
+                    push!(J_cols, c)
+                end
+                for c in u_i_idxs
+                    push!(I_rows, r)
+                    push!(J_cols, c)
+                end
+            end
+            
+            # Neighbors and cross coupling
+            for (B_idx, sys_B) in enumerate(systems)
+                range_v_B = ranges_v[B_idx]
+                range_u_B = ranges_u[B_idx]
+                isempty(range_v_B) && continue
+                N_B = TrixiParticles.n_integrated_particles(sys_B)
+                v_stride_B = TrixiParticles.v_nvariables(sys_B)
+                u_stride_B = TrixiParticles.u_nvariables(sys_B)
+                h_B = TrixiParticles.initial_smoothing_length(sys_B)
+                h_contact = max(h_A, h_B)
+                
+                for j in 1:N_B
+                    if A_idx == B_idx && i == j
+                        continue
+                    end
+                    
+                    pos_j = coords_state[B_idx][:, j]
+                    dist = norm(pos_i - pos_j)
+                    
+                    if dist <= clip_jac_radius_mult * h_contact
+                        v_j_idxs = [range_v_B[1] + d - 1 + v_stride_B * (j - 1) for d in 1:v_stride_B]
+                        u_j_idxs = [nv + range_u_B[1] + d - 1 + u_stride_B * (j - 1) for d in 1:u_stride_B]
+                        
+                        for r in v_i_idxs
+                            for c in v_j_idxs
+                                push!(I_rows, r)
+                                push!(J_cols, c)
+                            end
+                            for c in u_j_idxs
+                                push!(I_rows, r)
+                                push!(J_cols, c)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    if !quiet
+        println(">>> Debug Sparse: nv=", nv, " nu=", nu, " n_total=", n_total,
+                " jac_radius_mult=", clip_jac_radius_mult)
+        println(">>> Debug Sparse: I_rows bounds=[", minimum(I_rows), ", ", maximum(I_rows), "]")
+        println(">>> Debug Sparse: J_cols bounds=[", minimum(J_cols), ", ", maximum(J_cols), "]")
+        flush(stdout)
+    end
+    return sparse(I_rows, J_cols, ones(length(I_rows)), n_total, n_total)
+end
+
+function clip_build_ode_problem(v0_ode, u0_ode, tspan, semi_local;
+                                jacobian_strategy::String=clip_jacobian_strategy())
+    CURRENT_JACOBIAN_STRATEGY[] = jacobian_strategy
+    if jacobian_strategy == "matrix_free"
+        nv = length(v0_ode)
+        nu = length(u0_ode)
+        clip_ode_flat[] = true
+        clip_ode_nv[] = nv
+        clip_ode_nu[] = nu
+        y0 = vcat(v0_ode, u0_ode)
+        rhs_local = (dy, y, p, t) -> clip_combined_rhs!(dy, y, p, t, nv, nu)
+        jvp_local = (Jv, y, vdir, p, t) -> clip_combined_jvp!(Jv, y, vdir, p, t, nv, nu)
+        f = ODEFunction(rhs_local; jvp=jvp_local)
+        return ODEProblem(f, y0, tspan, semi_local)
+    elseif jacobian_strategy == "sparse"
+        nv = length(v0_ode)
+        nu = length(u0_ode)
+        clip_ode_flat[] = true
+        clip_ode_nv[] = nv
+        clip_ode_nu[] = nu
+        y0 = vcat(v0_ode, u0_ode)
+        rhs_local = (dy, y, p, t) -> clip_combined_rhs!(dy, y, p, t, nv, nu)
+        println(">>> Building SPH locality-based Sparse Jacobian prototype...")
+        flush(stdout)
+        clip_reset_jacobian_coloring!()
+        jac_sparsity = clip_build_sparse_jacobian_prototype(semi_local, v0_ode, u0_ode)
+        n_colors = clip_precompute_jacobian_coloring!(jac_sparsity)
+        println("✓ Sparse Jacobian prototype built with size $(size(jac_sparsity)) and ",
+                "$(nnz(jac_sparsity)) non-zero entries (", n_colors, " color groups).")
+        flush(stdout)
+        f = ODEFunction(rhs_local; jac=clip_sparse_jacobian!, jac_prototype=jac_sparsity)
+        return ODEProblem(f, y0, tspan, semi_local)
+    elseif jacobian_strategy == "colored"
+        nv = length(v0_ode)
+        nu = length(u0_ode)
+        n_total = nv + nu
+        clip_ode_flat[] = true
+        clip_ode_nv[] = nv
+        clip_ode_nu[] = nu
+        y0 = vcat(v0_ode, u0_ode)
+        rhs_local = (dy, y, p, t) -> clip_combined_rhs!(dy, y, p, t, nv, nu)
+        println(">>> Building SPH locality sparsity pattern for colored dense Jacobian...")
+        flush(stdout)
+        clip_reset_jacobian_coloring!()
+        jac_sparsity = clip_build_sparse_jacobian_prototype(semi_local, v0_ode, u0_ode)
+        clip_jac_sparsity_pattern[] = jac_sparsity
+        n_colors = clip_precompute_jacobian_coloring!(jac_sparsity)
+        jac_prototype = zeros(Float64, n_total, n_total)
+        println("✓ Colored dense Jacobian: ", n_colors, " RHS color groups, ",
+                "pattern nnz=", nnz(jac_sparsity), ", radius_mult=", clip_jac_radius_mult,
+                ", dense storage (", n_total, "×", n_total, "), linear solve = dense LU",
+                clip_jac_pattern_refresh ?
+                    ", pattern refresh ON (rebuild from trial y each fill)" : ".")
+        flush(stdout)
+        f = ODEFunction(rhs_local; jac=clip_colored_dense_jacobian!, jac_prototype=jac_prototype)
+        return ODEProblem(f, y0, tspan, semi_local)
+    end
+    clip_ode_flat[] = false
+    return DynamicalODEProblem(kick_implicit_visible!, drift_implicit_visible!,
+                               v0_ode, u0_ode, tspan, semi_local)
+end
+
+function clip_build_implicit_algorithm(integrator_mode::String;
+                                       linsolve_solver,
+                                       use_matrix_free::Bool,
+                                       jacobian_autodiff,
+                                       nlsolve=nothing)
+    autodiff_arg = (use_matrix_free || jacobian_autodiff === nothing) ? false : jacobian_autodiff
+    nlsolve_kw = nlsolve === nothing ? () : (; nlsolve)
+    if integrator_mode == "implicit_euler"
+        return ImplicitEuler(; linsolve=linsolve_solver, autodiff=autodiff_arg, nlsolve_kw...)
+    elseif integrator_mode == "rodas5"
+        # Rosenbrock methods do not use Newton's method; OrdinaryDiffEq Rodas5 does not accept `nlsolve`.
+        return Rodas5(; linsolve=linsolve_solver, autodiff=autodiff_arg)
+    elseif integrator_mode == "explicit"
+        return CarpenterKennedy2N54()
+    else
+        return TRBDF2(; linsolve=linsolve_solver, autodiff=autodiff_arg, nlsolve_kw...)
+    end
+end
+
 # Simulation phase:
 #   full       — compression + hold + retraction (default)
 #   hold       — compression + hold, save checkpoint, stop before retraction
 #   retraction — load checkpoint, run retraction only
 const CHECKPOINT_VERSION = 2
-const sim_phase = lowercase(get(ENV, "TP_CLIP_SIM_PHASE", "full"))
+const sim_phase = lowercase(get(ENV, "TP_CLIP_SIM_PHASE", "hold"))
 sim_phase in ("full", "hold", "retraction") ||
     error("TP_CLIP_SIM_PHASE must be full, hold, or retraction (got $(sim_phase))")
+# Geometry: pseudo2d (1 y-layer), thin3d (few y-layers, plane constraints), full3d (resolved y).
+function clip_geometry_mode()
+    mode = if haskey(ENV, "TP_CLIP_GEOMETRY")
+        lowercase(ENV["TP_CLIP_GEOMETRY"])
+    elseif env_int("TP_CLIP_CHARGE_LAYERS_Y", 1) > 1
+        "thin3d"
+    else
+        "pseudo2d"
+    end
+    mode in ("pseudo2d", "thin3d", "full3d") ||
+        error("TP_CLIP_GEOMETRY must be 'pseudo2d', 'thin3d', or 'full3d' (got $(mode))")
+    return Symbol(mode)
+end
+const geometry_mode = clip_geometry_mode()
+const geometry_name_tag = geometry_mode == :full3d ? "3d" : "pseudo2d"
 # Run tag from particle spacing [mm]: 1.8 -> "18", 2.6 -> "26" (used in VTU prefix + checkpoint name).
 const ps_mm_nominal = env_float("TP_CLIP_PS_MM", 1.8)
 @inline function ps_mm_run_tag(ps_mm::Real)
@@ -113,7 +858,8 @@ const ps_run_tag = ps_mm_run_tag(ps_mm_nominal)
 const save_checkpoint_at_hold = env_int("TP_CLIP_SAVE_CHECKPOINT", 1) != 0
 const checkpoint_path = get(ENV, "TP_CLIP_CHECKPOINT",
                             joinpath("out",
-                                     "molding_cfk_pseudo2d_hold_checkpoint_" * ps_run_tag * ".dat"))
+                                     "molding_cfk_" * geometry_name_tag * "_hold_checkpoint_" *
+                                     ps_run_tag * ".dat"))
 # TLSPH equilibration after solidification, before checkpoint (WCSPH off during tail).
 # Stress relaxation at hold temperature while the die stays closed (thermoplastic creep /
 # contact redistribution). Default 0.15 s — increase if checkpoint still shows tool overlap.
@@ -125,14 +871,6 @@ const use_volumetric_plasticity = env_int("TP_CLIP_VOLUMETRIC_PLASTICITY", 1) !=
 const hold_end_fp_reset = env_int("TP_CLIP_HOLD_END_FP_RESET", use_volumetric_plasticity ? 0 : 1) != 0
 const volumetric_plastic_relax_rate = env_float("TP_CLIP_JP_RELAX_RATE", 1.0)
 const elastic_bulk_J_ref = 1.0
-# Charge cohesion during springback: Monaghan tensile stabilisation (psi<0); optional gap-column Vf floor.
-const charge_tensile_psi = env_float("TP_CLIP_CHARGE_TENSILE_PSI",
-                                     sim_phase == "retraction" ? -0.1 : 0.0)
-const charge_tensile_exponent = max(2, env_int("TP_CLIP_CHARGE_TENSILE_EXPONENT", 4))
-const gap_vf_override = haskey(ENV, "TP_CLIP_GAP_VF") ? env_float("TP_CLIP_GAP_VF", 0.02) : nothing
-# Do not release charge kinematics faster than elastic σ is ramped on (prevents tow-band delamination).
-const retraction_kin_cap_by_elastic = sim_phase == "retraction" &&
-    env_int("TP_CLIP_RETRACTION_KIN_CAP_ELASTIC", 1) != 0
 # After punch lift: continue mechanics until springback equilibrates (mold gap-based contact already off).
 const retraction_springback_dwell_s = env_float("TP_CLIP_RETRACTION_SPRINGBACK_DWELL_S", 0.05)
 const retraction_springback_equil_max_speed = env_float("TP_CLIP_RETRACTION_SPRINGBACK_EQUIL_MAX_SPEED", 0.05)
@@ -140,10 +878,19 @@ const retraction_springback_equil_span_rate_mm_s =
     env_float("TP_CLIP_RETRACTION_SPRINGBACK_EQUIL_SPAN_RATE_MM_S", 0.02)
 const retraction_springback_equil_patience =
     max(1, env_int("TP_CLIP_RETRACTION_SPRINGBACK_EQUIL_PATIENCE", 8))
-# Hold kinematics: hybrid (default) = frozen during solidification hold, active during TLSPH tail;
-# frozen = no motion entire closed-die hold; active = creep motion throughout hold.
+# Optional closed-die hold_creep before punch lift (default off — ramps run from retraction t0).
+const retraction_pre_lift_creep_s = sim_phase == "retraction" || sim_phase == "full" ?
+    env_float("TP_CLIP_RETRACTION_PRE_LIFT_CREEP_S", 0.0) : 0.0
+const retraction_pre_lift_elastic_frac =
+    env_float("TP_CLIP_RETRACTION_PRE_LIFT_ELASTIC_FRAC", 0.85)
+# After pre-lift, optional brief charge-kin freeze while punch begins lift (mechanics already at 1).
+const retraction_post_lift_kin_freeze_s = (sim_phase == "retraction" || sim_phase == "full") &&
+    retraction_pre_lift_creep_s > 0.0 ?
+    env_float("TP_CLIP_RETRACTION_POST_LIFT_KIN_FREEZE_S", 0.01) : 0.0
+# Hold kinematics: frozen (default) = no motion during solidification hold + TLSPH tail;
+# hybrid = frozen until tail then active; active = creep motion throughout hold.
 function clip_hold_kinematics_mode()
-    mode = lowercase(get(ENV, "TP_CLIP_HOLD_KINEMATICS", "hybrid"))
+    mode = lowercase(get(ENV, "TP_CLIP_HOLD_KINEMATICS", "frozen"))
     if !haskey(ENV, "TP_CLIP_HOLD_KINEMATICS") && haskey(ENV, "TP_CLIP_HOLD_FREEZE_KINEMATICS")
         return env_int("TP_CLIP_HOLD_FREEZE_KINEMATICS", 0) != 0 ? :frozen : :active
     end
@@ -167,15 +914,23 @@ const disable_wcsph = env_int("TP_CLIP_DISABLE_WCSPH", 0) != 0
     return retraction_cfrp_style && retraction_started[]
 end
 
+function clip_compress_integrator()
+    sim_phase in ("full", "hold") || return :implicit
+    mode = lowercase(get(ENV, "TP_CLIP_COMPRESS_INTEGRATOR", "implicit"))
+    mode in ("implicit", "explicit") ||
+        error("TP_CLIP_COMPRESS_INTEGRATOR must be implicit or explicit (got $(mode))")
+    return Symbol(mode)
+end
+
 function clip_retraction_integrator()
     sim_phase != "retraction" && return :implicit
-    mode = lowercase(get(ENV, "TP_CLIP_RETRACTION_INTEGRATOR", "implicit"))
+    mode = lowercase(get(ENV, "TP_CLIP_RETRACTION_INTEGRATOR", "explicit"))
     mode in ("implicit", "explicit") ||
         error("TP_CLIP_RETRACTION_INTEGRATOR must be 'implicit' or 'explicit' (got $(mode))")
     return Symbol(mode)
 end
 
-function clip_retraction_explicit_algorithm()
+function clip_explicit_euler_algorithm()
     # VelocityVerlet requires drift du ≡ v exactly; kinematics ramp scales du in
     # drift_implicit_visible!, so only symplectic Euler is valid here.
     scheme = lowercase(get(ENV, "TP_CLIP_RETRACTION_EXPLICIT_SCHEME", "euler"))
@@ -189,6 +944,17 @@ function clip_retraction_explicit_algorithm()
     end
 end
 
+clip_retraction_explicit_algorithm() = clip_explicit_euler_algorithm()
+
+const compression_integrator = clip_compress_integrator()
+const compression_use_explicit = compression_integrator == :explicit
+const compression_explicit_dt = compression_use_explicit ?
+    env_float("TP_CLIP_COMPRESS_EXPLICIT_DT", 2.0e-5) : 0.0
+const compression_explicit_hold_dt = compression_use_explicit ?
+    env_float("TP_CLIP_COMPRESS_EXPLICIT_HOLD_DT", 5.0e-3) : 0.0
+const compression_explicit_ignore_unstable = compression_use_explicit &&
+    env_int("TP_CLIP_COMPRESS_EXPLICIT_IGNORE_UNSTABLE", 1) != 0
+
 const retraction_integrator = clip_retraction_integrator()
 const retraction_use_explicit = retraction_integrator == :explicit
 # Explicit springback: freeze T (no conduction / HTC in kick) — mechanics-only is much cheaper.
@@ -197,15 +963,36 @@ const retraction_explicit_freeze_t = retraction_use_explicit &&
 const retraction_explicit_dt = env_float("TP_CLIP_RETRACTION_EXPLICIT_DT", 5.0e-7)
 # After the explicit mech-ramp freeze, springback needs a smaller dt (5e-7 blows up at release).
 const retraction_explicit_dt_springback = retraction_use_explicit ?
-    env_float("TP_CLIP_RETRACTION_EXPLICIT_DT_SPRINGBACK", 1.0e-7) :
+    env_float("TP_CLIP_RETRACTION_EXPLICIT_DT_SPRINGBACK", 5.0e-7) :
     retraction_explicit_dt
 # SciMLBase default unstable_check aborts on any NaN/Inf in u; explicit contact can spike
 # briefly before the accepted-step repair runs — keep going and let the callback fix state.
 const retraction_explicit_ignore_unstable = retraction_use_explicit &&
     env_int("TP_CLIP_RETRACTION_EXPLICIT_IGNORE_UNSTABLE", 1) != 0
 
+@inline function clip_use_explicit_solver()
+    return compression_use_explicit || retraction_use_explicit
+end
+
 @inline function retraction_explicit_active()
     return retraction_use_explicit
+end
+
+function enforce_explicit_compression_dt!(integrator)
+    compression_use_explicit || return nothing
+    if integrator.t >= t_compress
+        hold_dt = compression_explicit_hold_dt
+        if integrator.dt != hold_dt
+            integrator.dt = hold_dt
+            if !compression_explicit_hold_dt_announced[]
+                compression_explicit_hold_dt_announced[] = true
+                println(">>> Explicit hold: dt increased to ", hold_dt,
+                        " s (press dt was ", compression_explicit_dt, " s)")
+                flush(stdout)
+            end
+        end
+    end
+    return nothing
 end
 
 # Explicit retraction uses the same blended σ/contact/kinematics ramp as implicit.
@@ -229,8 +1016,9 @@ end
     return enable_safety_clamps
 end
 
-println("--- SIMULATION STARTING (pseudo-2D) ---")
+println("--- SIMULATION STARTING (", geometry_mode, ") ---")
 println("Threads available: ", nthreads())
+println("Geometry mode: ", geometry_mode, " (output tag=", geometry_name_tag, ")")
 println("Particle spacing: ", ps_mm_nominal, " mm (run tag=", ps_run_tag, ")")
 println("Simulation phase: ", sim_phase,
         " (checkpoint: ", abspath(checkpoint_path), ")")
@@ -241,6 +1029,12 @@ println("Simulation phase: ", sim_phase,
             hold_kinematics_mode == :hybrid ? ", kinematics active in tail only" :
             ", kinematics active (full hold creep)",
             ") before checkpoint")
+(sim_phase == "retraction" || sim_phase == "full") && retraction_pre_lift_creep_s > 0.0 &&
+    println("Retraction pre-lift creep: ", retraction_pre_lift_creep_s,
+            " s closed-die (σ/contact/kin ramp 0→1, hold_creep; mold fixed until lift;",
+            " post-lift mechanics stay at 1 — no second ramp;",
+            retraction_post_lift_kin_freeze_s > 0.0 ?
+                "; post-lift kin hold " * string(retraction_post_lift_kin_freeze_s) * " s" : "")
 (sim_phase == "full" || sim_phase == "hold") && hold_end_spencer_align &&
     println("Hold end: Spencer fibre reference aligned to hold F (I4=1 at demold)")
 use_volumetric_plasticity &&
@@ -259,8 +1053,15 @@ sim_phase == "retraction" && retraction_cfrp_style &&
 sim_phase == "retraction" && retraction_tlsph_only && !retraction_cfrp_style &&
     println("Retraction: TLSPH elastoplastic + charge conduction + tool–charge HTC; ",
             "WCSPH, Nakamura, molten drag, and flow-orientation kinetics are OFF")
+compression_use_explicit && begin
+    _, explicit_scheme_name = clip_explicit_euler_algorithm()
+    println("Compression integrator: explicit ", explicit_scheme_name,
+            " (press dt=", compression_explicit_dt,
+            " s; hold dt=", compression_explicit_hold_dt,
+            " s; ignore SciML unstable abort=", compression_explicit_ignore_unstable, ")")
+end
 sim_phase == "retraction" && retraction_use_explicit && begin
-    _, explicit_scheme_name = clip_retraction_explicit_algorithm()
+    _, explicit_scheme_name = clip_explicit_euler_algorithm()
     println("Retraction integrator: explicit ", explicit_scheme_name,
             " (dt=", retraction_explicit_dt_springback,
             " s; same σ/contact ramp as implicit; matched kick/drift kin scaling; freeze T=",
@@ -385,6 +1186,7 @@ function capture_hold_checkpoint_state(integrator, semi_local)
     cyl_sys = semi_local.systems[1]
     floor_sys = semi_local.systems[2]
     mold_sys = semi_local.systems[3]
+    v_ck, u_ck = clip_integrator_vu(integrator)
     return Dict{String, Any}(
         "version" => CHECKPOINT_VERSION,
         "t" => integrator.t,
@@ -398,27 +1200,27 @@ function capture_hold_checkpoint_state(integrator, semi_local)
                                   compression_thickness_ratio=compression_thickness_ratio,
                                   hold_tlsph_tail_s=hold_tlsph_tail_s,
                                   hold_tlsph_equilibrated=hold_tlsph_tail_s > 0.0),
-        "v_ode" => copy(integrator.u.x[1]),
-        "u_ode" => copy(integrator.u.x[2]),
-        "deformation_grad" => copy(cyl_sys.deformation_grad),
-        "charge_temp" => copy(cyl_sys.temp),
-        "floor_temp" => copy(floor_sys.temp),
-        "mold_temp" => copy(mold_sys.temp),
+        "v_ode" => clip_host_copy(v_ck),
+        "u_ode" => clip_host_copy(u_ck),
+        "deformation_grad" => clip_host_copy(cyl_sys.deformation_grad),
+        "charge_temp" => clip_host_copy(cyl_sys.temp),
+        "floor_temp" => clip_host_copy(floor_sys.temp),
+        "mold_temp" => clip_host_copy(mold_sys.temp),
         "Fp_state" => copy(Fp_state[]),
         "Fp_committed" => copy(Fp_committed[]),
         "alpha_committed" => copy(alpha_committed[]),
-        "J_ref_particle_buf" => copy(J_ref_particle_buf),
-        "J_p_particle_buf" => copy(J_p_particle_buf),
-        "crystallinity_particle_buf" => copy(crystallinity_particle_buf),
-        "liquid_fraction_particle_buf" => copy(liquid_fraction_particle_buf),
-        "solid_fraction_particle_buf" => copy(solid_fraction_particle_buf),
-        "ys_particle_buf" => copy(ys_particle_buf),
-        "hard_particle_buf" => copy(hard_particle_buf),
-        "vis_particle_buf" => copy(vis_particle_buf),
-        "thermal_softening_particle_buf" => copy(thermal_softening_particle_buf),
+        "J_ref_particle_buf" => clip_host_copy(J_ref_particle_buf),
+        "J_p_particle_buf" => clip_host_copy(J_p_particle_buf),
+        "crystallinity_particle_buf" => clip_host_copy(crystallinity_particle_buf),
+        "liquid_fraction_particle_buf" => clip_host_copy(liquid_fraction_particle_buf),
+        "solid_fraction_particle_buf" => clip_host_copy(solid_fraction_particle_buf),
+        "ys_particle_buf" => clip_host_copy(ys_particle_buf),
+        "hard_particle_buf" => clip_host_copy(hard_particle_buf),
+        "vis_particle_buf" => clip_host_copy(vis_particle_buf),
+        "thermal_softening_particle_buf" => clip_host_copy(thermal_softening_particle_buf),
         "orientation_tensor" => copy(orientation_tensor_state[]),
         "fiber_direction" => copy(fiber_direction),
-        "vel_grad_buf" => copy(vel_grad_buf),
+        "vel_grad_buf" => clip_host_copy(vel_grad_buf),
         "nhs_updated_at_t" => nhs_updated_at_t[],
         "wcsph_ramp_scale" => wcsph_ramp_scale[],
         "solidification_reached_time" => solidification_reached_time[],
@@ -469,10 +1271,10 @@ function restore_hold_checkpoint_state!(ck, semi_local)
     floor_sys = semi_local.systems[2]
     mold_sys = semi_local.systems[3]
 
-    cyl_sys.deformation_grad .= ck["deformation_grad"]
-    cyl_sys.temp .= ck["charge_temp"]
-    floor_sys.temp .= ck["floor_temp"]
-    mold_sys.temp .= ck["mold_temp"]
+    clip_host_assign!(cyl_sys.deformation_grad, ck["deformation_grad"])
+    clip_host_assign!(cyl_sys.temp, ck["charge_temp"])
+    clip_host_assign!(floor_sys.temp, ck["floor_temp"])
+    clip_host_assign!(mold_sys.temp, ck["mold_temp"])
 
     v_ck = ck["v_ode"]
     u_ck = ck["u_ode"]
@@ -490,22 +1292,22 @@ function restore_hold_checkpoint_state!(ck, semi_local)
     Fp_state[] .= ck["Fp_state"]
     Fp_committed[] .= ck["Fp_committed"]
     alpha_committed[] .= ck["alpha_committed"]
-    J_ref_particle_buf .= ck["J_ref_particle_buf"]
+    clip_host_assign!(J_ref_particle_buf, ck["J_ref_particle_buf"])
     if haskey(ck, "J_p_particle_buf")
-        J_p_particle_buf .= ck["J_p_particle_buf"]
+        clip_host_assign!(J_p_particle_buf, ck["J_p_particle_buf"])
     else
         fill!(J_p_particle_buf, 1.0)
     end
-    crystallinity_particle_buf .= ck["crystallinity_particle_buf"]
-    liquid_fraction_particle_buf .= ck["liquid_fraction_particle_buf"]
-    solid_fraction_particle_buf .= ck["solid_fraction_particle_buf"]
-    ys_particle_buf .= ck["ys_particle_buf"]
-    hard_particle_buf .= ck["hard_particle_buf"]
-    vis_particle_buf .= ck["vis_particle_buf"]
-    thermal_softening_particle_buf .= ck["thermal_softening_particle_buf"]
+    clip_host_assign!(crystallinity_particle_buf, ck["crystallinity_particle_buf"])
+    clip_host_assign!(liquid_fraction_particle_buf, ck["liquid_fraction_particle_buf"])
+    clip_host_assign!(solid_fraction_particle_buf, ck["solid_fraction_particle_buf"])
+    clip_host_assign!(ys_particle_buf, ck["ys_particle_buf"])
+    clip_host_assign!(hard_particle_buf, ck["hard_particle_buf"])
+    clip_host_assign!(vis_particle_buf, ck["vis_particle_buf"])
+    clip_host_assign!(thermal_softening_particle_buf, ck["thermal_softening_particle_buf"])
     orientation_tensor_state[] .= ck["orientation_tensor"]
     fiber_direction .= ck["fiber_direction"]
-    vel_grad_buf .= ck["vel_grad_buf"]
+    clip_host_assign!(vel_grad_buf, ck["vel_grad_buf"])
     nhs_updated_at_t[] = ck["nhs_updated_at_t"]
     wcsph_ramp_scale[] = ck["wcsph_ramp_scale"]
     solidification_reached_time[] = ck["solidification_reached_time"]
@@ -520,6 +1322,7 @@ function restore_hold_checkpoint_state!(ck, semi_local)
     springback_equil_streak[] = 0
     springback_equil_prev_snap[] = nothing
     retraction_start_time[] = Inf
+    retraction_lift_start_time[] = Inf
     mold_retraction_complete_time[] = Inf
     retraction_state_prepared[] = false
     retraction_reference_span_x[] = 0.0
@@ -527,7 +1330,10 @@ function restore_hold_checkpoint_state!(ck, semi_local)
     charge_mechanics_release_announced[] = false
     retraction_elastic_ramp_announced[] = false
     retraction_kinematics_release_announced[] = false
+    retraction_pre_lift_creep_announced[] = false
+    retraction_lift_started_announced[] = false
     TrixiParticles.initialize_neighborhood_searches!(semi_local)
+    clip_sync_tool_kinematics_gpu!(semi_local, ck["t"])
     TrixiParticles.foreach_system(semi_local) do system
         TrixiParticles.initialize!(system, semi_local)
         v_sys = TrixiParticles.wrap_v(v_ck, system, semi_local)
@@ -575,9 +1381,15 @@ end
 # ==========================================================================================
 
 particle_spacing = ps_mm_nominal * 1e-3
+const tool_particle_spacing = haskey(ENV, "TP_CLIP_TOOL_PS_MM") ?
+    env_float("TP_CLIP_TOOL_PS_MM", particle_spacing * 1e3) * 1e-3 :
+    particle_spacing
+include(joinpath(@__DIR__, "clip_stl_geometry_setup.jl"))
+include(joinpath(@__DIR__, "clip_blankholder.jl"))
+const use_stl_geometry = clip_use_stl_geometry()
 
 # Mass scaling kept for consistency with the 3D file (stays at 1.0 here).
-mass_scaling = 1.0
+mass_scaling = parse(Float64, get(ENV, "TP_CLIP_MASS_SCALING", "1.0"))
 
 # Composite feedstock (carbon-fibre reinforced thermoplastic, CF-PP)
 matrix_density = 1180.0 * mass_scaling
@@ -586,13 +1398,10 @@ matrix_E = 3.2e9
 glass_E = 230.0e9                       # CF standard modulus (T700/T300), vs glass 72 GPa
 # Bulk modulus of the polymer matrix in the melt state.
 # Thermoplastic melts (PA6, PP, PPS) are nearly incompressible: K_melt ~ 1.0-1.5 GPa
-# (Zoller & Walsh 1995, PVT data).  Physical value ~1.5e9 Pa, but using a reduced
-# numerical bulk modulus here: large enough to keep density variations < ~1% under
-# typical stamping pressures (~1 MPa), small enough that the TRBDF2 Jacobian is
-# well-conditioned.  Revert to 1.5e9 if accurate compressibility modelling is needed.
-# Numerically reduced from physical ~1.5 GPa: keeps TRBDF2 Jacobian well-conditioned.
-# EOS blends K_melt (near-solidification) → K_liq (hot melt).
-matrix_K_melt = 1e8
+# (Zoller & Walsh 1995, PVT data).  Wang et al. (2010) piston-die PP Tait: K = B/C
+# ≈ 890 MPa (melt window) and ≈ 721 MPa @ 180°C preheat — used for all WCSPH EOS forms
+# (Monaghan 1994, log, smooth C¹).  See cfk_clip_physics_validation validation 07.
+matrix_K_melt = 890_166_380.0
 matrix_cp = 1800.0
 glass_cp = 710.0           # CF specific heat [J/(kg·K)], vs glass 840 J/(kg·K) (Chung 2010)
 matrix_k = 0.22
@@ -605,10 +1414,10 @@ glass_k = 1.0              # CF transverse thermal conductivity [W/(m·K)], stan
 # solidification match validation 06 / Ijaz (2007) GFPP hold timeline (≈29 s to α≥0.92).
 # Override: TP_CLIP_THERMAL_CONDUCTIVITY_SCALE (1.0 = physical k only).
 thermal_conductivity_scale = env_float("TP_CLIP_THERMAL_CONDUCTIVITY_SCALE", 4.5)
-matrix_tmelt = 398.0      # K (125°C) — iPP crystallisation onset on cooling, Brucato 2002 / Pantani 2005
-glass_tmelt = 1700.0
-matrix_temp_liq = 378.0   # K (105°C) — iPP crystallisation completion on cooling, Brucato 2002
-glass_temp_liq = 1500.0
+matrix_tmelt = celsius_to_kelvin(398.0)      # °C input; stored as K for absolute-temperature laws.
+glass_tmelt = celsius_to_kelvin(1700.0)
+matrix_temp_liq = celsius_to_kelvin(378.0)   # °C input; crystallization completion on cooling.
+glass_temp_liq = celsius_to_kelvin(1500.0)
 # Enthalpy of fusion for iPP: 165 J/g (literature ΔHf for 100% crystalline = 209 J/g × ~79% crystallinity).
 # Source: Wunderlich 1990, Brucato 2002. Replaces previous 110 kJ/kg DSC-melting value.
 matrix_latent_heat = 1.65e5
@@ -627,15 +1436,15 @@ matrix_latent_heat = 1.65e5
 nakamura_n      = 3.0          # Avrami exponent
 nakamura_K0     = env_float("TP_CLIP_NAKAMURA_K0", 891251.0) # pre-exponential [1/s]
 nakamura_U_star = 6284.0       # J/mol
-nakamura_T_inf  = 223.0        # K
+nakamura_T_inf  = celsius_to_kelvin(223.0)   # °C input; stored as K
 nakamura_Kg     = 245471.0     # K² — Lauritzen–Hoffman nucleation constant
-nakamura_T_m0   = 453.0        # K  (equilibrium melting point)
+nakamura_T_m0   = celsius_to_kelvin(453.0)   # °C input; equilibrium melting point stored as K
 nakamura_R      = 8.31446      # J/(mol·K)
 nakamura_seed_crystallinity = env_float("TP_CLIP_NAKAMURA_SEED", 1.0e-6)
 # Flag: when true the Nakamura ODE drives latent-heat release and phase fractions;
 # the temperature-based apparent-cp fallback is disabled to avoid double counting.
 use_nakamura_kinetics = true
-thermal_softening_reference_temp = 270.0
+thermal_softening_reference_temp = celsius_to_kelvin(270.0)
 matrix_viscosity = env_float("TP_CLIP_MATRIX_VISCOSITY_PA_S", 1.86e8) # Pa·s at T_liq — Cross–WLF η_ref vs Laun (1986) iPP
 matrix_viscosity_ref_temp = matrix_temp_liq
 # Previous hot-flow form kept below as commented reference:
@@ -670,6 +1479,17 @@ matrix_h_contact = 2.5e4  # W/m²K — tool–part contact HTC, Bernet 1999 / Ye
 glass_h_contact = 6.0e4   # W/m²K — CF surface vs metal tool (similar range to GF)
 mu_friction = env_float("TP_CLIP_MU_FRICTION", 0.3)  # Coulomb friction coefficient, tool–part interface
                                                       # 0.3 is representative for steel vs CFRTP (Guzman 2018)
+# IMEX split (optional): keep stiff tool contact implicit, but apply "soft" wall coupling
+# (molten drag + Coulomb friction) explicitly after each accepted step to reduce Newton/JVP load.
+const imex_soft_terms = env_int("TP_CLIP_IMEX_SOFT_TERMS", 0) != 0
+# Monaghan tensile artificial stress: keeps SPH neighbors connected under opening/bending tension.
+# Disabled on GPU: tensile_stress_cache_tlsph allocates CPU arrays incompatible with CUDA kernels.
+const _clip_tensile_stress_enabled = env_int("TP_CLIP_TENSILE_STRESS", 0) != 0
+const clip_tensile_stress = (_clip_tensile_stress_enabled && !clip_use_gpu) ?
+    TensileArtificialStressMonaghan(psi=env_float("TP_CLIP_TENSILE_PSI", -0.1), exponent=4) :
+    nothing
+clip_use_gpu && _clip_tensile_stress_enabled &&
+    println("  - tensile artificial stress: OFF on GPU (use CPU driver for Monaghan ψ)")
 
 # Coefficient of Thermal Expansion (CTE) for thermal residual stress / springback.
 # CF T700: α∥ ≈ −0.5 ppm/K (longitudinal), α⊥ ≈ 22 ppm/K (transverse).
@@ -692,11 +1512,64 @@ ci_ard_perp = 0.005
 orientation_coupling_gain = 0.30
 
 # Meso-architecture — alternating 0/90 plies with tow bands.
-n_plies = 7          # with only ~3 layers through thickness, keep 2 plies (0, 90)
+n_plies = max(2, env_int("TP_CLIP_N_PLIES", geometry_mode == :full3d ? 3 : 7))
 fiber_vf_in_tow = 0.58
-fiber_vf_resin_rich = 0.02
+if haskey(ENV, "TP_CLIP_UNIFORM_FIBER_VF")
+    uniform_vf = env_float("TP_CLIP_UNIFORM_FIBER_VF", fiber_vf_in_tow)
+    fiber_vf_in_tow = uniform_vf
+    fiber_vf_resin_rich = uniform_vf
+elseif haskey(ENV, "TP_CLIP_GAP_VF")
+    fiber_vf_resin_rich = env_float("TP_CLIP_GAP_VF", 0.35)
+else
+    fiber_vf_resin_rich = 0.02
+end
 tow_width = 0.0040
 tow_gap = 0.0015
+
+function clip_uniform_fiber_orientation()
+    haskey(ENV, "TP_CLIP_UNIFORM_FIBER_ORIENTATION") || return nothing
+    axis = lowercase(strip(ENV["TP_CLIP_UNIFORM_FIBER_ORIENTATION"]))
+    if axis in ("x", "+x", "1", "0")
+        return StaticArrays.SVector(1.0, 0.0, 0.0)
+    elseif axis in ("y", "+y")
+        return StaticArrays.SVector(0.0, 1.0, 0.0)
+    elseif axis in ("z", "+z")
+        return StaticArrays.SVector(0.0, 0.0, 1.0)
+    else
+        error("TP_CLIP_UNIFORM_FIBER_ORIENTATION must be 'x', 'y', or 'z' (got $(axis))")
+    end
+end
+const uniform_fiber_orientation = clip_uniform_fiber_orientation()
+
+function apply_uniform_fiber_orientation!(fiber_dir, orient::StaticArrays.SVector{3, Float64})
+    n = size(fiber_dir, 2)
+    @inbounds for p in 1:n
+        fiber_dir[1, p] = orient[1]
+        fiber_dir[2, p] = orient[2]
+        fiber_dir[3, p] = orient[3]
+    end
+    return nothing
+end
+
+function clip_uniform_charge_temp_k()
+    if haskey(ENV, "TP_CLIP_UNIFORM_CHARGE_TEMP_C")
+        return env_temp_c("TP_CLIP_UNIFORM_CHARGE_TEMP_C", 340.0)
+    end
+    haskey(ENV, "TP_CLIP_UNIFORM_CHARGE_TEMP_K") || return nothing
+    return env_temp_c("TP_CLIP_UNIFORM_CHARGE_TEMP_K", 340.0)
+end
+const uniform_charge_temp_k = clip_uniform_charge_temp_k()
+
+function apply_uniform_charge_temperature!(cyl_sys, semi_local, v_ode, temp_k::Float64)
+    v_cyl = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
+    NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
+    t_set = clamp(temp_k, temp_min_clip, temp_max_clip)
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        cyl_sys.temp[particle] = t_set
+        v_cyl[NDIMS_CYL + 1, particle] = t_set
+    end
+    return nothing
+end
 
 # Physical setup dimensions held fixed when particle spacing changes.
 # These values match the current pseudo-2D baseline at particle_spacing = 0.8 mm.
@@ -705,7 +1578,7 @@ charge_bottom_clearance = 3.0 * particle_spacing
 initial_gap_upper_target = 0.0033
 base_thickness = 0.0033
 holder_thickness = 0.0033
-punch_side_clearance = 0.0011
+punch_side_clearance = 0.003
 # Thermal contact is evaluated from nearest particle-center distance in the x-z plane.
 # In the drafted pseudo-2D tool geometry, a half-spacing gate is too tight and can
 # miss real wall/floor contact on the discrete lattice, leaving temperature unchanged.
@@ -721,26 +1594,35 @@ base_layers = max(1, ceil(Int, base_thickness / particle_spacing))
 # of the drafted trapezoidal cavity with margin > smoothing length per side,
 # so contact-kernel interaction with the side walls stays zero at t = 0.
 charge_length = 0.018             # 16 mm (doubled from 8 mm; cavity floor ≈ 16.9 mm wide)
-charge_layers_y = max(1, env_int("TP_CLIP_CHARGE_LAYERS_Y", 1))
+const charge_width_target = env_float("TP_CLIP_CHARGE_WIDTH_MM", 3.6) * 1e-3
+if geometry_mode == :full3d
+    charge_layers_y = haskey(ENV, "TP_CLIP_CHARGE_LAYERS_Y") ?
+                      max(2, env_int("TP_CLIP_CHARGE_LAYERS_Y", 2)) :
+                      max(2, ceil(Int, charge_width_target / particle_spacing))
+elseif geometry_mode == :thin3d
+    charge_layers_y = max(2, env_int("TP_CLIP_CHARGE_LAYERS_Y", 3))
+else
+    charge_layers_y = max(1, env_int("TP_CLIP_CHARGE_LAYERS_Y", 1))
+end
 charge_width = charge_layers_y * particle_spacing
 charge_thickness = charge_thickness_target
 
-n_charge = (ceil(Int, charge_length / particle_spacing),
-            charge_layers_y,
-            max(2, ceil(Int, charge_thickness / particle_spacing)))
-
-# Recenter the discrete particle lattice on the geometric mid-plane.
-# When `ceil` adds an extra x-column, anchoring the charge at `-0.5 * charge_length`
-# shifts the actual particle cloud off center and breaks left-right symmetry.
-charge_length_discrete = n_charge[1] * particle_spacing
-charge_thickness_discrete = n_charge[3] * particle_spacing
-charge_top_target = 0.00165 + charge_thickness_target
-charge_top_actual = charge_bottom_clearance + charge_thickness_discrete
+if !use_stl_geometry
+    n_charge = (ceil(Int, charge_length / particle_spacing),
+                charge_layers_y,
+                max(2, ceil(Int, charge_thickness / particle_spacing)))
+    # Recenter the discrete particle lattice on the geometric mid-plane.
+    charge_length_discrete = n_charge[1] * particle_spacing
+    charge_thickness_discrete = n_charge[3] * particle_spacing
+    charge_top_target = 0.00165 + charge_thickness_target
+    charge_top_actual = charge_bottom_clearance + charge_thickness_discrete
+    charge_origin = (-0.5 * charge_length_discrete, -0.5 * charge_width,
+                     charge_bottom_clearance)
+end
 # Target compressed charge height as a fraction of the discrete lattice thickness (outer envelope).
 compression_thickness_ratio = env_float("TP_CLIP_COMPRESSION_RATIO", 0.9)
 compression_thickness_ratio > 0.0 && compression_thickness_ratio <= 1.0 ||
     error("TP_CLIP_COMPRESSION_RATIO must be in (0, 1] (got $(compression_thickness_ratio))")
-final_thickness_target = compression_thickness_ratio * charge_thickness_discrete
 
 # ==========================================================================================
 # DEEP-DRAW TOOLING LAYOUT (x–z cross-section, 1 particle thick in y)
@@ -769,17 +1651,12 @@ cavity_internal_width = 0.026             # 26 mm top width — accepts 12 mm ch
 cavity_depth = 0.014                      # 14 mm deep
 nz_cavity_wall = ceil(Int, cavity_depth / particle_spacing)
 holder_layers = max(1, ceil(Int, holder_thickness / particle_spacing))
-# Keep the actual charge placement spacing-dependent; the punch stroke then
-# follows the current discretized charge top.
-charge_origin = (-0.5 * charge_length_discrete, -0.5 * charge_width,
-                 charge_bottom_clearance)
 # ==========================================================================================
 
 function build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
                                   matrix_density, glass_density,
                                   n_plies, fiber_vf_in_tow, fiber_vf_resin_rich,
-                                  tow_width, tow_gap,
-                                  gap_vf_override=nothing)
+                                  tow_width, tow_gap)
     nx, ny, nz = n_charge
     n_total = nx * ny * nz
 
@@ -795,13 +1672,29 @@ function build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
 
     x0, y0, z0 = charge_origin
     ply_thickness = nz > 0 ? (nz * particle_spacing) / n_plies : particle_spacing
-    tow_pitch = tow_width + tow_gap
-    x_center = x0 + 0.5 * nx * particle_spacing
     tow_cols_pseudo2d = max(1, round(Int, tow_width / particle_spacing))
     gap_cols_pseudo2d = max(1, round(Int, tow_gap / particle_spacing))
-    tow_width_pseudo2d = tow_cols_pseudo2d * particle_spacing
-    tow_pitch_pseudo2d = (tow_cols_pseudo2d + gap_cols_pseudo2d) * particle_spacing
     tow_pitch_cols_pseudo2d = tow_cols_pseudo2d + gap_cols_pseudo2d
+
+    @inline function particle_in_tow_band(i, j, ply_aligned_x)
+        if ny == 1
+            # Single y-layer slab: tow columns indexed along x (legacy pseudo-2D).
+            center_offset_twice = 2 * i - nx - 1
+            phase_shift_twice = ply_aligned_x ? tow_pitch_cols_pseudo2d : 0
+        elseif ply_aligned_x
+            # 0° ply: fibres along x → tow/gap bands across y (mirror-symmetric in j).
+            center_offset_twice = 2 * j - ny - 1
+            phase_shift_twice = tow_pitch_cols_pseudo2d
+        else
+            # 90° ply: fibres along y → tow/gap bands across x (mirror-symmetric in i).
+            center_offset_twice = 2 * i - nx - 1
+            phase_shift_twice = 0
+        end
+        wrapped_offset_twice = mod(center_offset_twice + phase_shift_twice +
+                                   tow_pitch_cols_pseudo2d,
+                                   2 * tow_pitch_cols_pseudo2d) - tow_pitch_cols_pseudo2d
+        return abs(wrapped_offset_twice) <= tow_cols_pseudo2d - 1
+    end
 
     p = 0
     for k in 1:nz, j in 1:ny, i in 1:nx
@@ -819,33 +1712,16 @@ function build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
         ply_id = clamp(floor(Int, z_rel / ply_thickness) + 1, 1, n_plies)
         ply_aligned_x = isodd(ply_id)
 
-        if ny == 1
-            # Snap the pseudo-2D tow pattern to whole particle columns and center it on the
-            # charge so the cross-section stays mirror-symmetric on the discrete lattice.
-            phase_shift = ply_aligned_x ? 0.5 * tow_pitch_pseudo2d : 0.0
-            distance_to_tow_center = mod((x - x_center) + phase_shift +
-                                         0.5 * tow_pitch_pseudo2d,
-                                         tow_pitch_pseudo2d) - 0.5 * tow_pitch_pseudo2d
-            in_tow = abs(distance_to_tow_center) < 0.5 * tow_width_pseudo2d
+        in_tow = particle_in_tow_band(i, j, ply_aligned_x)
 
-            # Use a column-index selector tied to the charge mid-plane so mirrored columns
-            # always receive the same classification after `ceil` changes the particle count.
-            center_offset_twice = 2 * i - nx - 1
-            phase_shift_twice = ply_aligned_x ? tow_pitch_cols_pseudo2d : 0
-            wrapped_offset_twice = mod(center_offset_twice + phase_shift_twice +
-                                       tow_pitch_cols_pseudo2d,
-                                       2 * tow_pitch_cols_pseudo2d) - tow_pitch_cols_pseudo2d
-            in_tow = abs(wrapped_offset_twice) <= tow_cols_pseudo2d - 1
-        else
-            selector = ply_aligned_x ? (y - y0) : (x - x0)
-            in_tow = mod(selector, tow_pitch) <= tow_width
-        end
-
-        vf_local = in_tow ? fiber_vf_in_tow :
-                   (gap_vf_override === nothing ? fiber_vf_resin_rich : gap_vf_override)
+        vf_local = in_tow ? fiber_vf_in_tow : fiber_vf_resin_rich
         fiber_volume_fraction[p] = vf_local
 
-        if ply_aligned_x
+        if uniform_fiber_orientation !== nothing
+            fiber_direction[1, p] = uniform_fiber_orientation[1]
+            fiber_direction[2, p] = uniform_fiber_orientation[2]
+            fiber_direction[3, p] = uniform_fiber_orientation[3]
+        elseif ply_aligned_x
             fiber_direction[1, p] = 1.0
             fiber_direction[2, p] = 0.0
             fiber_direction[3, p] = 0.0
@@ -871,17 +1747,56 @@ function build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
     return ic, fiber_volume_fraction, fiber_direction, idx_fiber_rich, idx_matrix_rich
 end
 
-polymer, fiber_volume_fraction, fiber_direction,
-idx_fiber_rich, idx_matrix_rich =
-    build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
-                             matrix_density=matrix_density,
-                             glass_density=glass_density,
-                             n_plies=n_plies,
-                             fiber_vf_in_tow=fiber_vf_in_tow,
-                             fiber_vf_resin_rich=fiber_vf_resin_rich,
-                             tow_width=tow_width,
-                             tow_gap=tow_gap,
-                             gap_vf_override=gap_vf_override)
+factor = 1.1
+smoothing_kernel = SchoenbergQuinticSplineKernel{3}()
+smoothing_length = factor * particle_spacing
+tool_smoothing_length = factor * tool_particle_spacing
+
+const stl_molding_geometry = Ref{Any}(nothing)
+if use_stl_geometry
+    stl_molding_geometry[] = clip_setup_stl_molding_geometry(;
+        particle_spacing=particle_spacing,
+        tool_particle_spacing=tool_particle_spacing,
+        geometry_mode=geometry_mode,
+        charge_layers_y=charge_layers_y,
+        smoothing_kernel=smoothing_kernel,
+        smoothing_length=smoothing_length,
+        matrix_density=matrix_density,
+        glass_density=glass_density,
+        n_plies=n_plies,
+        fiber_vf_in_tow=fiber_vf_in_tow,
+        fiber_vf_resin_rich=fiber_vf_resin_rich,
+        tow_width=tow_width,
+        tow_gap=tow_gap,
+        env_float=env_float)
+    geo = stl_molding_geometry[]
+    polymer = geo.polymer
+    fiber_volume_fraction = geo.fiber_volume_fraction
+    fiber_direction = geo.fiber_direction
+    idx_fiber_rich = geo.idx_fiber_rich
+    idx_matrix_rich = geo.idx_matrix_rich
+    floor_particles = geo.floor_particles
+    mold_particles = geo.mold_particles
+    charge_length = geo.charge_length
+    charge_width = geo.charge_width
+    charge_thickness = geo.charge_thickness
+    charge_length_discrete = geo.charge_length_discrete
+    charge_width_discrete = geo.charge_width_discrete
+    charge_thickness_discrete = geo.charge_thickness_discrete
+else
+    polymer, fiber_volume_fraction, fiber_direction,
+    idx_fiber_rich, idx_matrix_rich =
+        build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
+                                 matrix_density=matrix_density,
+                                 glass_density=glass_density,
+                                 n_plies=n_plies,
+                                 fiber_vf_in_tow=fiber_vf_in_tow,
+                                 fiber_vf_resin_rich=fiber_vf_resin_rich,
+                                 tow_width=tow_width,
+                                 tow_gap=tow_gap)
+end
+
+final_thickness_target = compression_thickness_ratio * charge_thickness_discrete
 
 density_cylinder = mean(polymer.density)
 
@@ -944,23 +1859,54 @@ h_contact_particle = matrix_h_contact .* (1.0 .- phase_vf_particle) .+
 
 orientation_scalar_particle = ones(length(phase_vf_particle))
 
-viscosity_min_clip = 1.0e2
-viscosity_max_clip = 5.0e7
+viscosity_min_clip = env_float("TP_CLIP_VISCOSITY_MIN_CLIP", 1.0e2)
+viscosity_max_clip = env_float("TP_CLIP_VISCOSITY_MAX_CLIP", 5.0e7)
+# Cross–WLF update smoothing: 1.0 = instant (legacy); lower values lag η toward the
+# target law and reduce TRBDF2/implicit-Euler dt collapse from sharp η jumps at contact.
+viscosity_update_alpha = clamp(env_float("TP_CLIP_VISCOSITY_UPDATE_ALPHA", 1.0), 1.0e-4, 1.0)
+# Cross–WLF η refresh cadence. RHS interval 0 = skip during implicit Newton (update on
+# accepted steps only). N≥1 = recompute η every N RHS evaluations.
+const viscosity_rhs_update_interval = env_int("TP_CLIP_VISCOSITY_UPDATE_INTERVAL", 0)
+const viscosity_step_update_interval = max(1, env_int("TP_CLIP_VISCOSITY_STEP_UPDATE_INTERVAL", 1))
+const viscosity_rhs_call_count = Ref(0)
+const viscosity_step_count = Ref(0)
+viscosity_update_alpha < 1.0 - 1.0e-12 &&
+    println("  - Cross–WLF viscosity smoothing: alpha=", viscosity_update_alpha,
+            " (log-blend per η update)")
+(viscosity_rhs_update_interval != 1 || viscosity_step_update_interval != 1) &&
+    println("  - viscosity update cadence: RHS every ",
+            viscosity_rhs_update_interval == 0 ? "never (accepted steps only)" :
+            string(viscosity_rhs_update_interval),
+            ", accepted step every ", viscosity_step_update_interval,
+            viscosity_rhs_update_interval == 0 ?
+                " (Cross–WLF incl. shear rate via vel_grad on accepted steps)" : "")
 temp_min_clip = 200.0
 temp_max_clip = 2000.0
 
-factor = 1.4
-smoothing_kernel = SchoenbergQuinticSplineKernel{3}()
-#smoothing_kernel = CubicSplineKernel{3}()
-smoothing_length = factor * particle_spacing
-
-println("✓ CFK raw charge initialized (pseudo-2D slab):")
+println(use_stl_geometry ?
+        "✓ CFK raw charge initialized (STL + packing):" :
+        "✓ CFK raw charge initialized (pseudo-2D slab):")
 println("  - size [mm] = ", round.(StaticArrays.SVector(charge_length_discrete, charge_width,
                                               charge_thickness_discrete) .* 1e3,
                                       digits=2))
 println("  - particles = ", nparticles(polymer))
-gap_vf_override !== nothing &&
-    println("  - gap column Vf override = ", round(gap_vf_override, digits=4))
+haskey(ENV, "TP_CLIP_UNIFORM_FIBER_VF") &&
+    println("  - uniform fibre Vf = ", round(fiber_vf_in_tow, digits=4),
+            " (TP_CLIP_UNIFORM_FIBER_VF; tow/gap bands disabled in material)")
+uniform_fiber_orientation !== nothing &&
+    println("  - uniform fibre orientation = [",
+            uniform_fiber_orientation[1], ", ",
+            uniform_fiber_orientation[2], ", ",
+            uniform_fiber_orientation[3], "] (TP_CLIP_UNIFORM_FIBER_ORIENTATION)")
+uniform_charge_temp_k !== nothing &&
+    println("  - uniform charge temperature = ", fmt_temp(uniform_charge_temp_k),
+            " (TP_CLIP_UNIFORM_CHARGE_TEMP_C; applied after checkpoint restore)")
+clip_tensile_stress !== nothing &&
+    println("  - tensile artificial stress: Monaghan psi=",
+            clip_tensile_stress.psi, " (TP_CLIP_TENSILE_PSI)")
+haskey(ENV, "TP_CLIP_GAP_VF") && !haskey(ENV, "TP_CLIP_UNIFORM_FIBER_VF") &&
+    println("  - gap / resin-rich Vf = ", round(fiber_vf_resin_rich, digits=4),
+            " (TP_CLIP_GAP_VF)")
 println("  - architecture = ", n_plies, " plies (alternating), tow width=", tow_width * 1e3,
         " mm, tow gap=", tow_gap * 1e3, " mm")
 println("  - mean fibre volume fraction Vf = ", round(vf_mean, digits=4))
@@ -970,7 +1916,8 @@ println("  - homogenized rho = ", round(density_cylinder, digits=2),
         " kg/m^3, E = ", round(E_composite_eff / 1e9, digits=3), " GPa")
 println("  - effective conductivity scale = ", thermal_conductivity_scale,
     "x (pseudo-2D accelerated cooling)")
-println("  - phase-specific tmelt matrix/glass = ", matrix_tmelt, " / ", glass_tmelt, " K")
+println("  - phase-specific tmelt matrix/glass = ", fmt_temp(matrix_tmelt), " / ",
+        fmt_temp(glass_tmelt))
 println("  - matrix latent heat = ", matrix_latent_heat, " J/kg")
 
 # ==========================================================================================
@@ -993,8 +1940,10 @@ cyl_z_max = maximum(polymer.coordinates[3, :])
 # Option 1 — open the initial gap to ~2 * smoothing_length so the mold-motion
 # ramp completes *before* first contact. This prevents the stiff t=0 contact +
 # heat-flux transient that collapses TRBDF2's dt to ~1e-7.
-initial_gap       = 2 * smoothing_length
-initial_gap_upper = max(initial_gap_upper_target, 2 * smoothing_length)
+if !use_stl_geometry
+    initial_gap       = 2 * smoothing_length
+    initial_gap_upper = max(initial_gap_upper_target, 2 * smoothing_length)
+end
 
 if sim_phase == "retraction"
     isfile(checkpoint_path) ||
@@ -1026,66 +1975,151 @@ if sim_phase == "retraction"
     flush(stdout)
 end
 
+# Reference frame / tooling: procedural trapezoidal cavity, or STL-packed user geometry.
+use_pseudo2d_projection = geometry_mode == :pseudo2d
+apply_y_plane_constraint = if haskey(ENV, "TP_CLIP_APPLY_Y_PLANE_CONSTRAINT")
+    env_int("TP_CLIP_APPLY_Y_PLANE_CONSTRAINT", 1) != 0
+else
+    geometry_mode in (:pseudo2d, :thin3d)
+end
+
+let c_el = sqrt(matrix_E / matrix_density)
+    s = env_float("TP_CLIP_Y_CONSTRAINT_SCALE", 1.0)
+    global y_constraint_damp   = sqrt(s) * 20.0 * c_el / particle_spacing
+    global y_constraint_spring = (0.5 * y_constraint_damp)^2
+end
+const y_constraint_explicit_scale = if !retraction_use_explicit
+    1.0
+elseif haskey(ENV, "TP_CLIP_Y_CONSTRAINT_EXPLICIT_SCALE")
+    env_float("TP_CLIP_Y_CONSTRAINT_EXPLICIT_SCALE", 1.0)
+else
+    omega_n = 0.5 * y_constraint_damp
+    min(1.0, env_float("TP_CLIP_Y_CONSTRAINT_EXPLICIT_SAFETY", 0.9) * 2.0 /
+        (retraction_explicit_dt_springback * omega_n))
+end
+
+@inline function thin3d_y_constraint_coeffs()
+    if y_constraint_explicit_scale >= 1.0 - 1.0e-12
+        return y_constraint_damp, y_constraint_spring
+    end
+    s = y_constraint_explicit_scale
+    return s * y_constraint_damp, s * s * y_constraint_spring
+end
+
+let c_el = sqrt(matrix_E / matrix_density)
+    s = env_float("TP_CLIP_RESTING_SHELF_Z_SCALE", 1.0)
+    global shelf_z_constraint_damp   = sqrt(s) * 20.0 * c_el / particle_spacing
+    global shelf_z_constraint_spring = (0.5 * shelf_z_constraint_damp)^2
+end
+const shelf_z_constraint_explicit_scale = if !compression_use_explicit
+    1.0
+elseif haskey(ENV, "TP_CLIP_SHELF_Z_CONSTRAINT_EXPLICIT_SCALE")
+    env_float("TP_CLIP_SHELF_Z_CONSTRAINT_EXPLICIT_SCALE", 1.0)
+else
+    omega_n = 0.5 * shelf_z_constraint_damp
+    min(1.0, env_float("TP_CLIP_SHELF_Z_CONSTRAINT_EXPLICIT_SAFETY", 0.9) * 2.0 /
+        (compression_explicit_dt * omega_n))
+end
+const apply_resting_shelf_z_constraint = if haskey(ENV, "TP_CLIP_RESTING_SHELF_Z_CONSTRAINT")
+    env_int("TP_CLIP_RESTING_SHELF_Z_CONSTRAINT", 0) != 0
+else
+    !clip_blankholder_enabled() && apply_y_plane_constraint
+end
+
+# Constraint-free thin3d: full 3D WCSPH pressure/viscosity resists out-of-plane bulging via
+# neighbor bulk pressure (no y/z spring penalties that stiffen the implicit Jacobian).
+const wcsph_full3d_pressure = if haskey(ENV, "TP_CLIP_WCSPH_FULL3D")
+    env_int("TP_CLIP_WCSPH_FULL3D", 0) != 0
+elseif geometry_mode == :thin3d && !apply_y_plane_constraint
+    true
+else
+    false
+end
+const wcsph_bulk_scale = env_float("TP_CLIP_WCSPH_BULK_SCALE", 1.0)
+const wcsph_bulk_viscosity_pa_s = if haskey(ENV, "TP_CLIP_WCSPH_BULK_VISCOSITY_PA_S")
+    max(0.0, env_float("TP_CLIP_WCSPH_BULK_VISCOSITY_PA_S", 0.0))
+elseif wcsph_full3d_pressure
+    1.0e6   # Pa·s volumetric damping when y/z kinematic constraints are off
+else
+    0.0
+end
+const enable_wcsph_liquid_viscosity = if haskey(ENV, "TP_CLIP_WCSPH_LIQUID_VISCOSITY")
+    env_int("TP_CLIP_WCSPH_LIQUID_VISCOSITY", 0) != 0
+else
+    wcsph_full3d_pressure
+end
+const lag_wcsph_liquid_viscosity = true
+
+@inline function resting_shelf_z_constraint_coeffs()
+    if shelf_z_constraint_explicit_scale >= 1.0 - 1.0e-12
+        return shelf_z_constraint_damp, shelf_z_constraint_spring
+    end
+    s = shelf_z_constraint_explicit_scale
+    return s * shelf_z_constraint_damp, s * s * shelf_z_constraint_spring
+end
+
+@info "Y-layer mode" geometry_mode charge_layers_y use_pseudo2d_projection apply_y_plane_constraint charge_width_mm=(charge_width*1e3) particle_spacing_mm=(particle_spacing*1e3)
+wcsph_full3d_pressure &&
+    println("  - WCSPH full-3D pressure: ON (bulk confinement via neighbor pressure, not y/z springs)")
+enable_wcsph_liquid_viscosity &&
+    println("  - WCSPH liquid viscosity: ON (lagged current-config shear dissipation)")
+wcsph_bulk_viscosity_pa_s > 0.0 &&
+    println("  - WCSPH bulk viscosity: ζ=", wcsph_bulk_viscosity_pa_s, " Pa·s")
+wcsph_bulk_scale < 1.0 - 1.0e-12 &&
+    println("  - WCSPH bulk scale: ", wcsph_bulk_scale, " (softened melt bulk modulus)")
+geometry_mode == :thin3d &&
+    @info "Thin-3D mode active: for similar runtime to 1-layer, set TP_CLIP_PS_MM=$(round(0.8*sqrt(Float64(charge_layers_y)), digits=2))"
+geometry_mode == :full3d &&
+    @info "Full-3D mode: resolved y-width $(round(charge_width*1e3; digits=2)) mm ($(charge_layers_y) layers); no y hard-lock"
+const retraction_lock_y = sim_phase == "retraction" && geometry_mode == :thin3d &&
+    env_int("TP_CLIP_RETRACTION_LOCK_Y", 1) != 0
+
+@inline function hard_lock_y_kinematics()
+    return use_pseudo2d_projection || retraction_lock_y
+end
+
+retraction_lock_y && println("Retraction: thin-3D y kinematics hard-locked (v_y=du_y=dv_y=0; layers fixed)")
+sim_phase == "retraction" && geometry_mode == :thin3d && !retraction_lock_y &&
+    println("Retraction: thin-3D y spring-damper active (lock_y off)",
+            retraction_use_explicit ?
+                "; explicit y-scale=$(round(y_constraint_explicit_scale; sigdigits=3))" :
+                "")
+
+if use_stl_geometry
+    geo = stl_molding_geometry[]
+    z_base_top = geo.z_base_top
+    z_base_bot = geo.z_base_bot
+    z_blocks_top = z_base_top + geo.cavity_depth
+    z_punch_bot = geo.z_punch_bot
+    z_punch_top = geo.z_punch_top
+    tool_length = geo.tool_length
+    cavity_depth = geo.cavity_depth
+    initial_gap_upper = geo.gap_punch
+    initial_stroke = z_punch_bot - (z_base_top + final_thickness_target)
+else
 # Reference frame: cavity FLOOR at z = 0 (this is where the charge sits).
-# The charge is built at z0 = 0 (see charge_origin), so its bottom face
-# automatically rests on the cavity floor.
-#   - z = 0               → cavity floor = top of base plate
-#   - z = cavity_depth    → top face of die (land/shoulder, outside the cavity)
-#   - z = -base_layers*ps → bottom of die base plate
 z_base_top   = 0.0
 z_blocks_top = z_base_top + cavity_depth
 z_base_bot   = z_base_top - base_layers * particle_spacing
 
-# -------- Trapezoidal die + mating trapezoidal punch (angled walls / draft) --------
-# Both die cavity and punch share the SAME master grid so they mate particle-for-
-# particle, with a one-ps clearance per side. The cavity is widest at the top
-# (where the charge enters) and narrows toward the floor — classic draft geometry
-# as in the reference figure. The punch mirrors the cavity shape exactly, offset
-# inward by one particle spacing per side.
 nx_tool = ceil(Int, tool_length / particle_spacing)
 ny_tool = charge_layers_y
 tool_origin_y = -0.5 * ny_tool * particle_spacing
 tool_origin_x = -0.5 * tool_length
-use_pseudo2d_projection = charge_layers_y == 1 && ny_tool == 1
-# Thin-3D mode (charge_layers_y > 1) uses the same plane-strain constraints as pseudo-2D
-# apply_y_plane_constraint: gates the F22=1 plane-strain fix for both pseudo-2D and thin-3D.
-# Kernel support in y is always poor for thin slabs (1–3 y-neighbours), so F22 must be
-# corrected in both cases.
-#
-# Velocity / displacement constraints differ by mode:
-#   pseudo-2D  → hard zeros (v_y=0, du_y=0, dv_y=0): all particles collapse to y=0.
-#   thin-3D    → stiff spring-damper in dv_y: particles stay near their initial y-planes
-#                but TRBDF2 sees a non-zero Jacobian column (∂(dv_y)/∂v_y = -y_constraint_damp)
-#                so Newton converges without the force artifacts hard-zeroing produces.
-apply_y_plane_constraint = use_pseudo2d_projection || charge_layers_y > 1
-
-# Spring-damper parameters for the thin-3D y-plane constraint.
-# Elastic wave speed → sets the constraint stiffness so TRBDF2 (L-stable) damps y-motion
-# within 1–2 timesteps while the Jacobian remains well-conditioned.
-let c_el = sqrt(matrix_E / matrix_density)                  # elastic wave speed [m/s]
-    global y_constraint_damp   = 20.0 * c_el / particle_spacing  # [s^-1] damping coefficient
-    global y_constraint_spring = (0.5 * y_constraint_damp)^2     # [s^-2] spring = omega_n^2
-end
-@info "Y-layer mode" charge_layers_y use_pseudo2d_projection apply_y_plane_constraint charge_width_mm=(charge_width*1e3) particle_spacing_mm=(particle_spacing*1e3)
-charge_layers_y > 1 && @info "Thin-3D mode active: for similar runtime to 1-layer, set TP_CLIP_PS_MM=$(round(0.8*sqrt(Float64(charge_layers_y)), digits=2))"
 
 # Redefined geometry: set bottom width directly, derive draft angle.
-cavity_top_half_w = 0.5 * cavity_internal_width   # widest (at z_blocks_top)
-cavity_bot_half_w = 0.5 * (charge_length + 0.003) # 1.5mm clearance per side
+cavity_top_half_w = 0.5 * cavity_internal_width
+cavity_bot_half_w = 0.5 * (charge_length + 0.003)
 wall_inset = cavity_top_half_w - cavity_bot_half_w
 draft_angle = atan(wall_inset / cavity_depth)
 @info "Derived draft angle for wider cavity" angle_deg=rad2deg(draft_angle)
 
-# Cavity half-width as a function of z ∈ [z_base_top, z_blocks_top].
 @inline function cavity_half_width_at(z)
     frac = (z - z_base_top) / (z_blocks_top - z_base_top)
     frac = clamp(frac, 0.0, 1.0)
     return cavity_bot_half_w + frac * (cavity_top_half_w - cavity_bot_half_w)
 end
 
-# Build die particles by filtering a rectangular grid:
-#   - base plate: full rectangle from z_base_bot to z_base_top
-#   - wall region: z ∈ [z_base_top, z_blocks_top], keep if |x| > half_w(z)
 function build_die_particles(ps, x_min, x_max, y_origin, ny,
                              z_base_bot, z_base_top, z_blocks_top,
                              half_width_fn, density)
@@ -1200,9 +2234,22 @@ mold_particles = build_punch_particles(particle_spacing,
                                        z_punch_bot, z_punch_top,
                                        punch_half_width_at_start,
                                        z_holder_bot, holder_layers, floor_density)
+end  # !use_stl_geometry
 
 floor_z_max = maximum(floor_particles.coordinates[3,:])
 mold_z_min  = minimum(mold_particles.coordinates[3,:])
+if use_stl_geometry
+    println("✓ Compression-mold tooling built (STL / user L-die):")
+    println("  - tool extent x [mm] = ", round(tool_length * 1e3; digits=2))
+    println("  - charge size [mm] = ", round.(StaticArrays.SVector(charge_length, charge_width,
+                                                  charge_thickness) .* 1e3; digits=2))
+    println("  - gap (mold bot ↔ charge top) = ", round(mold_z_min - cyl_z_max; digits=6),
+            " m, initial stroke to seat = ", round(initial_stroke * 1e3; digits=3), " mm")
+    println("  - h_charge = ", smoothing_length * 1e3, " mm, h_tool = ",
+            tool_smoothing_length * 1e3, " mm")
+    println("  - Tool particles (floor/mold) = ", nparticles(floor_particles), " / ",
+            nparticles(mold_particles))
+else
 println("✓ Compression-mold tooling built (pseudo-2D, trapezoidal / drafted walls):")
 println("  - tool_length = ", tool_length * 1e3, " mm, slab thickness y = ",
         particle_spacing * 1e3, " mm")
@@ -1223,16 +2270,17 @@ println("  - Contact at t=0? ",
         (mold_z_min - cyl_z_max) < factor * particle_spacing, " (mold)")
 println("  - Tool particles (floor/mold) = ", nparticles(floor_particles), " / ",
         nparticles(mold_particles))
+end
 
 # Numerical safety rails for pseudo-2D debug runs.
 # With all fundamental issues fixed (dt sync, 2D kernel correction, and plane-strain),
 # these artificial limiters are no longer needed and just ruin Newton convergence.
-enable_safety_clamps = false
-enable_velocity_safety_clamps = false
+enable_safety_clamps = env_int("TP_CLIP_SAFETY_CLAMPS", 0) != 0
+enable_velocity_safety_clamps = env_int("TP_CLIP_VELOCITY_SAFETY_CLAMPS", 0) != 0
 # F/Fp repair runs in the accepted-step callback only. Doing it inside kick_implicit!
 # corrupts the finite-difference Jacobian (each column perturbation can flip the
 # J-threshold check and write a different F into shared buffers).
-enable_emergency_repair_clamp = false
+enable_emergency_repair_clamp = env_int("TP_CLIP_EMERGENCY_REPAIR_CLAMP", 0) != 0
 x_safety_bound = 0.5 * tool_length + safety_margin
 z_safety_min = z_base_bot - safety_margin
 z_safety_max = z_punch_top + safety_margin
@@ -1242,10 +2290,11 @@ max_cylinder_accel = 1.0e5    # m/s^2
 const retraction_accel_clamp = sim_phase == "retraction" &&
     env_int("TP_CLIP_RETRACTION_ACCEL_CLAMP", 1) != 0
 const retraction_max_accel = sim_phase == "retraction" ?
-    env_float("TP_CLIP_RETRACTION_MAX_ACCEL", 5.0e2) : max_cylinder_accel
+    env_float("TP_CLIP_RETRACTION_MAX_ACCEL", 5.0e3) : max_cylinder_accel
 # Targeted limiter for liquid/mushy mechanics (WCSPH branch). This is applied
 # even when global safety clamps are disabled, since the dt-collapse trigger is
 # liquid-force acceleration spikes in the latent regime.
+# Overwritten after melt-aware contact caps are configured (Layer 4 alignment).
 max_liquid_accel = 2.5e5      # m/s^2
 
 # ==========================================================================================
@@ -1282,8 +2331,22 @@ molten_wall_drag_factor = env_float("TP_CLIP_MOLTEN_WALL_DRAG_FACTOR", 0.05)
 molten_wall_drag_max_rate = env_float("TP_CLIP_MOLTEN_WALL_DRAG_MAX_RATE", 1.0e5) # 1/s
 
 # Target stroke: drive the punch from its start position (z_punch_bot) down until
-# the charge is compressed to `final_thickness` (= compression_thickness_ratio × initial).
-target_stroke = z_punch_bot - (z_base_top + final_thickness)
+# the charge is compressed to `final_thickness_target` (= compression_thickness_ratio × initial).
+target_stroke = z_punch_bot - (z_base_top + final_thickness_target)
+const _clip_cad_data_dir = get(ENV, "TP_CLIP_CAD_DIR",
+                               joinpath(@__DIR__, "..", "preprocessing", "data_user_l_die"))
+const _clip_user_l_die_pack = use_stl_geometry && clip_pack_use_user_l_die_tools(_clip_cad_data_dir)
+if !haskey(ENV, "TP_CLIP_TARGET_STROKE_MM") &&
+   env_int("TP_CLIP_SEAT_PUNCH_TO_MOLD", _clip_user_l_die_pack ? 1 : 0) != 0 &&
+   _clip_user_l_die_pack
+    target_stroke = clip_user_l_die_mating_stroke(mold_particles)
+    println(">>> User L-die: seat punch to mold (mating stroke) = ",
+            round(target_stroke * 1e3; digits=3), " mm")
+elseif haskey(ENV, "TP_CLIP_TARGET_STROKE_MM")
+    target_stroke = max(0.0, env_float("TP_CLIP_TARGET_STROKE_MM", 0.0) * 1e-3)
+    println(">>> Override: TP_CLIP_TARGET_STROKE_MM = ",
+            round(target_stroke * 1e3; digits=3), " mm")
+end
 t_full = (target_stroke / abs(mold_velocity_state)) + 0.5 * t_ramp_mold
 t_down_end = t_full
 z_shift_down_end = if t_down_end < t_ramp_mold
@@ -1348,7 +2411,9 @@ function build_compress_hold_vtu_save_times(t_final)
     return times
 end
 post_solidification_dwell = env_float("TP_CLIP_POST_SOLID_DWELL_S", 2.0e-3)
-retraction_duration_max = abs(z_shift_down_end) / abs(mold_velocity_state)
+retraction_duration_max = abs(z_shift_down_end) / abs(mold_velocity_state) +
+                          0.5 * env_float("TP_CLIP_RETRACTION_RAMP_S",
+                                          env_float("TP_CLIP_RETRACTION_KINEMATICS_RELEASE_S", 0.05))
 t_total = t_compress + solidification_hold_budget + post_solidification_dwell +
       hold_tlsph_tail_s + retraction_duration_max + retraction_springback_dwell_s
 println("  - compression target = ", round(100 * compression_thickness_ratio; digits=0),
@@ -1389,12 +2454,7 @@ end
     elseif t < t_down_end
         return mold_velocity_state
     elseif retraction_started[]
-        dt_ret = t - retraction_start_time[]
-        if dt_ret < retraction_ramp_s
-            return abs(mold_velocity_state) * dt_ret / retraction_ramp_s
-        else
-            return abs(mold_velocity_state)
-        end
+        return mold_lift_z_velocity_at(t)
     else
         return 0.0
     end
@@ -1407,18 +2467,39 @@ mold_retraction_complete = Ref(false)
 springback_equil_streak = Ref(0)
 springback_equil_prev_snap = Ref{Any}(nothing)
 retraction_start_time = Ref(Inf)
+retraction_lift_start_time = Ref(Inf)
 mold_retraction_complete_time = Ref(Inf)
 solidification_reached_time = Ref(Inf)
 retraction_state_prepared = Ref(false)
 # Solidification hold: freeze charge u/v and skip mechanics RHS; thermal + Nakamura continue.
+const compression_explicit_hold_dt_announced = Ref(false)
 const charge_hold_phase_dtmax = env_float("TP_CLIP_HOLD_DTMAX", 5.0e-3)
-const retraction_ramp_s = env_float("TP_CLIP_RETRACTION_RAMP_S", 0.02)
-# Tool traction / molten-drag / mechanical-dv blend window (v5 used 0.03 s).
-const retraction_hold_release_s = env_float("TP_CLIP_RETRACTION_HOLD_RELEASE_S", 0.1)
-# Spencer + matrix elastic stress ramp — keep long enough to avoid dt collapse.
-const retraction_elastic_ramp_s = env_float("TP_CLIP_RETRACTION_ELASTIC_RAMP_S", 0.2)
-# Kinematics release (default ≥ elastic ramp so σ is on before charge moves freely).
-const retraction_kinematics_release_s = env_float("TP_CLIP_RETRACTION_KINEMATICS_RELEASE_S", 0.22)
+# Kinematics + kin-scaled punch lift ramp (default 0.05 s; starts after elastic σ is on).
+const retraction_kinematics_release_s = env_float("TP_CLIP_RETRACTION_KINEMATICS_RELEASE_S", 0.05)
+# Mold lift velocity ramp: default tracks kinematics release (override via TP_CLIP_RETRACTION_RAMP_S).
+const retraction_ramp_s = env_float("TP_CLIP_RETRACTION_RAMP_S", retraction_kinematics_release_s)
+# Contact/hold: instant-on unless TP_CLIP_RETRACTION_MECH_RAMP_S or HOLD_RELEASE_S is set.
+const retraction_mech_ramp_instant = !haskey(ENV, "TP_CLIP_RETRACTION_MECH_RAMP_S") &&
+    !haskey(ENV, "TP_CLIP_RETRACTION_HOLD_RELEASE_S")
+const retraction_mech_ramp_s = (sim_phase == "retraction" || sim_phase == "full") ?
+    env_float("TP_CLIP_RETRACTION_MECH_RAMP_S", 0.05) : 0.1
+const retraction_hold_release_s = haskey(ENV, "TP_CLIP_RETRACTION_HOLD_RELEASE_S") ?
+    env_float("TP_CLIP_RETRACTION_HOLD_RELEASE_S", retraction_mech_ramp_s) :
+    retraction_mech_ramp_s
+# Elastic σ only: short default ramp during retraction (contact stays instant-on).
+const retraction_elastic_ramp_instant = sim_phase == "retraction" &&
+    env_int("TP_CLIP_RETRACTION_ELASTIC_RAMP_INSTANT", 0) != 0
+const retraction_elastic_ramp_s = if sim_phase == "retraction"
+    env_float("TP_CLIP_RETRACTION_ELASTIC_RAMP_S", 0.03)
+elseif haskey(ENV, "TP_CLIP_RETRACTION_ELASTIC_RAMP_S")
+    env_float("TP_CLIP_RETRACTION_ELASTIC_RAMP_S", retraction_mech_ramp_s)
+else
+    retraction_mech_ramp_s
+end
+# Kin/lift hold at 0 until elastic σ ramp finishes (skipped when elastic is instant-on or pre-lift creep).
+const retraction_kinematics_ramp_delay_s =
+    (!retraction_elastic_ramp_instant && retraction_pre_lift_creep_s <= 0.0) ?
+    retraction_elastic_ramp_s : 0.0
 const retraction_contact_gap_off_ps = env_float("TP_CLIP_RETRACTION_CONTACT_GAP_OFF_PS", 2.5)
 const retraction_contact_gap_on_ps = env_float("TP_CLIP_RETRACTION_CONTACT_GAP_ON_PS", 0.75)
 # Smooth mold-contact release when span grows past hold reference (not a step to zero).
@@ -1437,12 +2518,21 @@ const retraction_contact_on_springback = sim_phase == "retraction" &&
     env_int("TP_CLIP_RETRACTION_CONTACT_ON_SPRINGBACK", 1) != 0
 sim_phase == "retraction" && (retraction_contact_e_scale[] = retraction_contact_e_ramp ?
     retraction_contact_e_start : retraction_contact_e_scale_value)
-sim_phase == "retraction" && retraction_kin_cap_by_elastic &&
-    println("Retraction kinematics capped by elastic σ ramp (tow-band cohesion)")
 sim_phase == "retraction" && println(
-    "Retraction stability fixes: implicit default; hold/elastic/kin ramps=",
-    retraction_hold_release_s, "/", retraction_elastic_ramp_s, "/",
-    retraction_kinematics_release_s, " s; ",
+    "Retraction stability fixes: implicit default; contact ",
+    retraction_mech_ramp_instant ? "instant-on at checkpoint; " :
+        "ramp " * string(retraction_hold_release_s) * " s (legacy); ",
+    "elastic σ ",
+    retraction_elastic_ramp_instant ? "instant-on; " :
+        "ramp " * string(retraction_elastic_ramp_s) * " s; ",
+    "kin ramp ", retraction_kinematics_release_s, " s",
+    retraction_kinematics_ramp_delay_s > 0.0 ?
+        " (after elastic " * string(retraction_elastic_ramp_s) * " s); " : "; ",
+    "mold lift kin-scaled (ramp ", retraction_ramp_s, " s); ",
+    retraction_pre_lift_creep_s > 0.0 ?
+        "pre-lift creep " * string(retraction_pre_lift_creep_s) *
+        " s (continuous post-lift σ/contact/kin); " :
+        "kin+lift ramp from checkpoint; ",
     retraction_contact_on_springback ?
         "floor+mold contact stay on during springback; " :
         "floor contact off on span growth; smooth mold span release (band=" *
@@ -1474,7 +2564,8 @@ const retraction_fail_fast_min_t_adv = env_float("TP_CLIP_RETRACTION_FAIL_FAST_M
 const retraction_fail_fast_stall_counter = Ref(0)
 retraction_fail_fast_t_prev = Ref(-Inf)
 const retraction_info_interval = sim_phase == "retraction" ?
-    max(1, env_int("TP_CLIP_RETRACTION_INFO_INTERVAL", 1)) : 2
+    max(1, env_int("TP_CLIP_RETRACTION_INFO_INTERVAL", 1)) :
+    max(1, env_int("TP_CLIP_INFO_INTERVAL", 1))
 # Per-step blow-up diagnostics (max |dv|, gaps, spans, J) during retraction-only runs.
 const retraction_diag_enabled = sim_phase == "retraction" &&
     env_int("TP_CLIP_RETRACTION_DIAG", 1) != 0
@@ -1502,6 +2593,45 @@ retraction_diag_instability_announced = Ref(false)
 const hold_relax_substeps = max(1, env_int("TP_CLIP_HOLD_RELAX_SUBSTEPS", 6))
 hold_tlsph_tail_announced = Ref(false)
 hold_tlsph_equilibration_now = Ref(false)
+retraction_pre_lift_creep_announced = Ref(false)
+retraction_lift_started_announced = Ref(false)
+
+@inline function retraction_pre_lift_creep_active(t)
+    retraction_pre_lift_creep_s <= 0.0 && return false
+    !retraction_started[] && return false
+    return t < retraction_lift_start_time[]
+end
+
+function arm_retraction_phase!(t)
+    retraction_started[] = true
+    retraction_start_time[] = t
+    retraction_lift_start_time[] = t + retraction_pre_lift_creep_s
+    return nothing
+end
+
+@inline function retraction_pre_lift_ramp_elapsed(t)
+    return max(t - retraction_start_time[], 0.0)
+end
+
+@inline function retraction_pre_lift_ramp_scale(t, duration_frac)
+    duration_frac <= 0.0 && return 1.0
+    !retraction_pre_lift_creep_active(t) && retraction_started[] && return 1.0
+    dur = max(retraction_pre_lift_creep_s * duration_frac, eps(Float64))
+    return smoothstep01(retraction_pre_lift_ramp_elapsed(t) / dur)
+end
+
+# With pre-lift creep, σ/contact/kin reach 1 before punch lift — do not re-ramp from 0 at lift.
+@inline function retraction_continuous_post_lift_ramps()
+    return retraction_pre_lift_creep_s > 0.0
+end
+
+# Optional post-lift kin hold (pre-lift path only); kin motion otherwise follows kin_scale ramp.
+@inline function retraction_charge_kinematics_gated(t)
+    !retraction_started[] && return false
+    retraction_pre_lift_creep_active(t) && return false
+    retraction_post_lift_kin_freeze_s > 0.0 || return false
+    return (t - retraction_lift_start_time[]) < retraction_post_lift_kin_freeze_s
+end
 
 @inline function hold_tlsph_tail_start_t()
     return solidification_reached_time[] + post_solidification_dwell
@@ -1522,8 +2652,10 @@ end
     return dwell_elapsed >= post_solidification_dwell + hold_tlsph_tail_s
 end
 
-# Mold closed, charge v/u frozen — thermal-only hold OR TLSPH equilibration tail.
+# Mold closed, charge v/u frozen — thermal-only hold OR TLSPH equilibration tail / pre-lift creep.
 @inline function hold_kinematics_frozen(t)
+    retraction_pre_lift_creep_active(t) && return true
+    retraction_charge_kinematics_gated(t) && return true
     sim_phase == "retraction" && return false
     t < t_compress && return false
     retraction_started[] && return false
@@ -1538,12 +2670,14 @@ end
 
 # Closed-die hold (compression end → retraction): plastic commit substeps + optional skip_heat.
 @inline function hold_plastic_relax_active(t)
-    sim_phase == "retraction" && return false
     t < t_compress && return false
+    retraction_pre_lift_creep_active(t) && return true
+    sim_phase == "retraction" && return false
     return !retraction_started[]
 end
 
 @inline function charge_hold_thermal_only(t)
+    retraction_pre_lift_creep_active(t) && return false
     hold_kinematics_frozen(t) || return false
     return !hold_tlsph_tail_active(t)
 end
@@ -1560,7 +2694,12 @@ end
     if !retraction_started[]
         return 1.0
     end
-    elapsed = t - retraction_start_time[]
+    if retraction_pre_lift_creep_active(t)
+        return retraction_pre_lift_ramp_scale(t, retraction_pre_lift_elastic_frac)
+    end
+    retraction_continuous_post_lift_ramps() && return 1.0
+    retraction_mech_ramp_instant && return 1.0
+    elapsed = t - retraction_lift_start_time[]
     return smoothstep01(elapsed / retraction_hold_release_s)
 end
 
@@ -1568,20 +2707,139 @@ end
     if !retraction_started[]
         return 1.0
     end
-    elapsed = t - retraction_start_time[]
+    if retraction_pre_lift_creep_active(t)
+        return retraction_pre_lift_ramp_scale(t, retraction_pre_lift_elastic_frac)
+    end
+    retraction_continuous_post_lift_ramps() && return 1.0
+    retraction_elastic_ramp_instant && return 1.0
+    elapsed = t - retraction_lift_start_time[]
     return smoothstep01(elapsed / retraction_elastic_ramp_s)
+end
+
+@inline function retraction_kinematics_elapsed(t)
+    elapsed = t - retraction_lift_start_time[]
+    return max(0.0, elapsed - retraction_kinematics_ramp_delay_s)
 end
 
 @inline function retraction_kinematics_scale(t)
     if !retraction_started[]
         return 1.0
     end
-    elapsed = t - retraction_start_time[]
-    kin = smoothstep01(elapsed / retraction_kinematics_release_s)
-    if retraction_kin_cap_by_elastic
-        kin = min(kin, retraction_elastic_scale(t))
+    if retraction_pre_lift_creep_active(t)
+        return retraction_pre_lift_ramp_scale(t, 1.0)
     end
-    return kin
+    retraction_charge_kinematics_gated(t) && return 0.0
+    retraction_continuous_post_lift_ramps() && return 1.0
+    kin_elapsed = retraction_kinematics_elapsed(t)
+    kin_elapsed <= 0.0 && return 0.0
+    return smoothstep01(kin_elapsed / retraction_kinematics_release_s)
+end
+
+@inline function smoothstep01_deriv(x)
+    y = clamp(x, 0.0, 1.0)
+    return 6.0 * y * (1.0 - y)
+end
+
+# Unscaled punch lift trajectory (as if kinematics were fully released from t0).
+@inline function mold_lift_z_full_shift(dt_lift)
+    T_ramp = retraction_ramp_s
+    if dt_lift <= 0.0
+        return 0.0
+    elseif dt_lift < T_ramp
+        return 0.5 * abs(mold_velocity_state) / T_ramp * dt_lift^2
+    else
+        dt_capped = min(dt_lift, retraction_duration_max)
+        return abs(mold_velocity_state) * (dt_capped - 0.5 * T_ramp)
+    end
+end
+
+@inline function mold_lift_z_full_velocity(dt_lift)
+    T_ramp = retraction_ramp_s
+    if dt_lift <= 0.0
+        return 0.0
+    elseif dt_lift < T_ramp
+        return abs(mold_velocity_state) * dt_lift / T_ramp
+    else
+        return abs(mold_velocity_state)
+    end
+end
+
+# Punch lift scaled by the same kinematics smoothstep as charge drift/velocity.
+@inline function mold_lift_z_shift_at(t)
+    if !retraction_started[] || retraction_pre_lift_creep_active(t)
+        return z_shift_motion_end
+    end
+    kin_elapsed = retraction_kinematics_elapsed(t)
+    kin = retraction_kinematics_scale(t)
+    return z_shift_motion_end + kin * mold_lift_z_full_shift(kin_elapsed)
+end
+
+@inline function mold_lift_z_velocity_at(t)
+    if !retraction_started[] || retraction_pre_lift_creep_active(t)
+        return 0.0
+    end
+    kin_elapsed = retraction_kinematics_elapsed(t)
+    kin_elapsed <= 0.0 && return 0.0
+    kin = retraction_kinematics_scale(t)
+    T_kin = retraction_kinematics_release_s
+    kin_dot = if kin_elapsed >= T_kin
+        0.0
+    else
+        smoothstep01_deriv(kin_elapsed / T_kin) / T_kin
+    end
+    z_delta = mold_lift_z_full_shift(kin_elapsed)
+    v_full = mold_lift_z_full_velocity(min(kin_elapsed, retraction_duration_max))
+    return kin_dot * z_delta + kin * v_full
+end
+
+@inline function clip_mold_z_shift_unified(t)
+    z_shift = if t <= t_compress
+        mold_z_shift_at_time(t)
+    elseif retraction_started[]
+        mold_lift_z_shift_at(t)
+    else
+        z_shift_motion_end
+    end
+    return clamp(z_shift, z_shift_motion_end, 0.0)
+end
+
+function clip_apply_mold_kinematics_cpu!(mold_sys, t)
+    mold_sys.clamped_particles_moving[] = true
+    z_shift = clip_mold_z_shift_unified(t)
+    ε = sqrt(eps(Float64))
+    z_m = clip_mold_z_shift_unified(t - ε)
+    z_p = clip_mold_z_shift_unified(t + ε)
+    vz = (z_p - z_m) / (2ε)
+    az = (z_p - 2z_shift + z_m) / (ε^2)
+    initial_coords = TrixiParticles.initial_coordinates(mold_sys)
+    cache = mold_sys.cache
+    has_motion_cache = hasproperty(cache, :velocity)
+    @inbounds for particle in TrixiParticles.eachparticle(mold_sys)
+        for i in 1:2
+            mold_sys.current_coordinates[i, particle] = initial_coords[i, particle]
+            if has_motion_cache
+                cache.velocity[i, particle] = 0.0
+                cache.acceleration[i, particle] = 0.0
+            end
+        end
+        mold_sys.current_coordinates[3, particle] = initial_coords[3, particle] + z_shift
+        if has_motion_cache
+            cache.velocity[3, particle] = vz
+            cache.acceleration[3, particle] = az
+        end
+    end
+    return nothing
+end
+
+function clip_sync_tool_kinematics_gpu!(semi_local, t)
+    clip_use_gpu || return nothing
+    clip_apply_mold_kinematics_cpu!(semi_local.systems[3], t)
+    return nothing
+end
+
+function clip_set_stress_cache!(cyl_sys)
+    TrixiParticles.STRESS_TENSOR_CACHE[] = (objectid(cyl_sys), v_stress_buf)
+    return nothing
 end
 
 # Optional: ramp tool–charge penalty stiffness over a dedicated short window (not kin ramp).
@@ -1589,7 +2847,11 @@ end
     if !retraction_contact_e_ramp || !retraction_started[]
         return
     end
-    elapsed = t - retraction_start_time[]
+    if retraction_continuous_post_lift_ramps() && !retraction_pre_lift_creep_active(t)
+        retraction_contact_e_scale[] = retraction_contact_e_scale_value
+        return
+    end
+    elapsed = t - retraction_lift_start_time[]
     ramp = smoothstep01(elapsed / retraction_contact_e_ramp_s)
     retraction_contact_e_scale[] = retraction_contact_e_start +
         (retraction_contact_e_scale_value - retraction_contact_e_start) * ramp
@@ -1630,6 +2892,85 @@ end
     return true
 end
 
+function apply_imex_wall_drag_and_friction!(cyl_sys, floor_sys, mold_sys, semi_local,
+                                            v_wrap_state, t::Real, dt::Real)
+    dt <= 0 && return nothing
+    charge_hold_thermal_only(t) && return nothing
+
+    contact_damp_dist = 0.8 * smoothing_length
+    bh_sys = blankholder_neighbor_system[]
+    resting_buf = charge_resting_on_shelf_buf[]
+
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        x_i = cyl_sys.current_coordinates[1, particle]
+        z_i = cyl_sys.current_coordinates[3, particle]
+        gap_floor_drag = tool_surface_gap(floor_sys, x_i, z_i, particle_spacing; side=:lower)
+        gap_mold_drag = tool_surface_gap(mold_sys, x_i, z_i, particle_spacing; side=:upper)
+        near_floor = gap_floor_drag <= contact_damp_dist
+        near_mold = gap_mold_drag <= contact_damp_dist
+        near_blankholder = false
+        gap_bh_drag = Inf
+        if bh_sys !== nothing && resting_buf !== nothing && particle <= length(resting_buf) &&
+           resting_buf[particle]
+            gap_bh_drag = tool_surface_gap(bh_sys, x_i, z_i, particle_spacing; side=:upper)
+            near_blankholder = gap_bh_drag <= contact_damp_dist
+        end
+
+        # Molten wall no-slip drag (off during solid retraction).
+        lf_wall = liquid_fraction_particle_buf[particle]
+        if !retraction_solid_mechanics_only() && lf_wall > 1.0e-4 &&
+           (near_floor || near_mold || near_blankholder)
+            ρ_i = cyl_sys.material_density[particle]
+            η_i = vis_particle_buf[particle]
+            drag_rate = molten_wall_drag_factor * lf_wall * η_i /
+                        (ρ_i * smoothing_length * smoothing_length)
+            drag_rate = min(drag_rate, molten_wall_drag_max_rate)
+
+            if near_floor
+                act = 1.0 - clamp(gap_floor_drag / max(contact_damp_dist, eps(Float64)), 0.0, 1.0)
+                act = act * act * (3.0 - 2.0 * act)
+                v_wrap_state[1, particle] -= dt * act * drag_rate * v_wrap_state[1, particle]
+                v_wrap_state[2, particle] -= dt * act * drag_rate * v_wrap_state[2, particle]
+                v_wrap_state[3, particle] -= dt * act * drag_rate * v_wrap_state[3, particle]
+            end
+
+            if near_mold
+                act = 1.0 - clamp(gap_mold_drag / max(contact_damp_dist, eps(Float64)), 0.0, 1.0)
+                act = act * act * (3.0 - 2.0 * act)
+                v_wall_z = mold_z_velocity_at_time(t)
+                v_wrap_state[1, particle] -= dt * act * drag_rate * v_wrap_state[1, particle]
+                v_wrap_state[2, particle] -= dt * act * drag_rate * v_wrap_state[2, particle]
+                v_wrap_state[3, particle] -= dt * act * drag_rate *
+                                             (v_wrap_state[3, particle] - v_wall_z)
+            end
+
+            if near_blankholder
+                act = 1.0 - clamp(gap_bh_drag / max(contact_damp_dist, eps(Float64)), 0.0, 1.0)
+                act = act * act * (3.0 - 2.0 * act)
+                v_wrap_state[1, particle] -= dt * act * drag_rate * v_wrap_state[1, particle]
+                v_wrap_state[2, particle] -= dt * act * drag_rate * v_wrap_state[2, particle]
+                v_wrap_state[3, particle] -= dt * act * drag_rate * v_wrap_state[3, particle]
+            end
+        end
+
+        # Coulomb friction at tool–part contact (solid-fraction weighted).
+        if near_floor || near_mold || near_blankholder
+            sf = solid_fraction_particle_buf[particle]
+            if sf > 1.0e-4
+                mu_eff  = mu_friction * sf
+                p_n     = max(0.0, -v_stress_buf[3, 3, particle])
+                rho_i   = cyl_sys.material_density[particle]
+                a_fric  = mu_eff * p_n / (rho_i * particle_spacing)
+                v_rel_x = v_wrap_state[1, particle]
+                if abs(v_rel_x) > 1.0e-12
+                    v_wrap_state[1, particle] -= dt * a_fric * sign(v_rel_x)
+                end
+            end
+        end
+    end
+    return nothing
+end
+
 @inline function charge_mechanics_fully_released(hold_release)
     return !charge_partial_mechanics_ramp(hold_release)
 end
@@ -1668,6 +3009,7 @@ function floor_reimann_activation_factor(t, cyl_sys)
     if !retraction_started[]
         return 1.0
     end
+    retraction_pre_lift_creep_active(t) && return 1.0
     hold = hold_release_factor(t)
     retraction_contact_on_springback && return hold
     # Legacy: floor contact ramps off as the charge expands (springback).
@@ -1682,6 +3024,7 @@ function mold_reimann_activation_factor(cyl_sys, mold_sys, t)
     if !retraction_started[]
         return 1.0
     end
+    retraction_pre_lift_creep_active(t) && return 1.0
     hold_release_factor(t) < 1.0 - 1.0e-8 && return 0.0
     min_gap = Inf
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
@@ -1767,20 +3110,6 @@ function count_charge_nonfinite_state(cyl_sys, v_cyl)
     return n_bad
 end
 
-function charge_max_sorted_x_gap_mm(cyl_sys)
-    xs = Float64[]
-    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-        push!(xs, cyl_sys.current_coordinates[1, particle])
-    end
-    length(xs) < 2 && return 0.0
-    sort!(xs)
-    max_gap = 0.0
-    @inbounds for i in 2:length(xs)
-        max_gap = max(max_gap, xs[i] - xs[i - 1])
-    end
-    return max_gap * 1e3
-end
-
 function build_retraction_diag_snapshot(integrator, cyl_sys, floor_sys, mold_sys, v_cyl)
     xs = @view cyl_sys.current_coordinates[1, :]
     zs = @view cyl_sys.current_coordinates[3, :]
@@ -1806,7 +3135,6 @@ function build_retraction_diag_snapshot(integrator, cyl_sys, floor_sys, mold_sys
         max_abs_vz = max_abs_vz,
         span_x_mm = span_x * 1e3,
         span_z_mm = span_z * 1e3,
-        max_x_gap_mm = charge_max_sorted_x_gap_mm(cyl_sys),
         span_ratio = charge_span_ratio(cyl_sys),
         J_min = J_min,
         J_max = J_max,
@@ -1830,8 +3158,7 @@ function print_retraction_diag_snapshot(label, snap)
             " m/s² max_speed=", round(snap.max_speed; sigdigits=4),
             " m/s max|vz|=", round(snap.max_abs_vz; sigdigits=4), " m/s")
     println("    span_x=", round(snap.span_x_mm; digits=4), " mm span_z=",
-            round(snap.span_z_mm; digits=4), " mm max_x_gap=",
-            round(snap.max_x_gap_mm; digits=4), " mm span_ratio=",
+            round(snap.span_z_mm; digits=4), " mm span_ratio=",
             round(snap.span_ratio; digits=5),
             " J_min=", round(snap.J_min; sigdigits=4),
             " (p=", snap.J_min_particle, ") J_max=", round(snap.J_max; sigdigits=4))
@@ -1851,7 +3178,7 @@ end
 function write_retraction_diag_csv_row(io, snap)
     println(io, snap.step, ",", snap.t, ",", snap.dt, ",", snap.kick_max_dv, ",",
             snap.max_speed, ",", snap.max_abs_vz, ",", snap.span_x_mm, ",",
-            snap.span_z_mm, ",", snap.max_x_gap_mm, ",", snap.span_ratio, ",", snap.J_min, ",",
+            snap.span_z_mm, ",", snap.span_ratio, ",", snap.J_min, ",",
             snap.J_max, ",", snap.J_min_particle, ",", snap.min_mold_gap_mm, ",",
             snap.min_floor_gap_mm, ",", snap.hold_rel, ",", snap.elas_scale, ",",
             snap.kin_scale, ",", snap.mech_dv_scale, ",", snap.floor_act, ",",
@@ -2022,11 +3349,10 @@ function charge_wcsph_ramp_scale_value(cyl_sys)
     return charge_span_within_reference(cyl_sys) ? 1.0 : 0.0
 end
 
-const retraction_vtu_suffix = get(ENV, "TP_CLIP_RETRACTION_VTU_SUFFIX", "")
-const vtu_output_prefix = sim_phase == "retraction" ?
-                          "molding_cfk_pseudo2d_elastic_" * ps_run_tag * "_ret" *
-                          retraction_vtu_suffix * "_solution" :
-                          "molding_cfk_pseudo2d_elastic_" * ps_run_tag * "_solution"
+const _vtu_output_prefix_default = sim_phase == "retraction" ?
+                          "molding_cfk_" * geometry_name_tag * "_elastic_" * ps_run_tag * "_ret_solution" :
+                          "molding_cfk_" * geometry_name_tag * "_elastic_" * ps_run_tag * "_solution"
+const vtu_output_prefix = get(ENV, "TP_CLIP_VTU_PREFIX", _vtu_output_prefix_default)
 sim_phase == "retraction" &&
     println(">>> VTU prefix (retraction): ", vtu_output_prefix)
 sim_phase == "retraction" &&
@@ -2053,7 +3379,8 @@ function save_vtu_snapshot!(integrator; iter_override=nothing,
     catch
         zero(integrator.u)
     end
-    TrixiParticles.trixi2vtk(dvdu_ode, integrator.u, integrator.p, integrator.t;
+    TrixiParticles.trixi2vtk(dvdu_ode, clip_integrator_vu_partition(integrator), integrator.p,
+                             integrator.t;
                              iter=iter,
                              prefix=vtu_output_prefix,
                              max_coordinates=Inf,
@@ -2069,7 +3396,8 @@ function complete_mold_retraction!(integrator)
         return complete_retraction_simulation!(integrator; reason="mold stroke complete (dwell=0)")
     end
     cyl_sys = integrator.p.systems[1]
-    v_cyl = TrixiParticles.wrap_v(integrator.u.x[1], cyl_sys, integrator.p)
+    v_cyl_ref, _ = clip_integrator_vu(integrator)
+    v_cyl = TrixiParticles.wrap_v(v_cyl_ref, cyl_sys, integrator.p)
     springback_equil_streak[] = 0
     springback_equil_prev_snap[] = build_retraction_diag_snapshot(integrator, cyl_sys,
         integrator.p.systems[2], integrator.p.systems[3], v_cyl)
@@ -2109,6 +3437,74 @@ function freeze_charge_mechanical_state!(v_cyl, cyl_sys)
     return nothing
 end
 
+@inline function clip_thermal_freeze_restore!(dv_cyl, cyl_sys, t)
+    NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
+    if clip_jac_thermal_frozen && clip_in_jacobian_fill[] && clip_thermal_jac_cache_valid[]
+        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+            dv_cyl[NDIMS_CYL + 1, particle] = clip_thermal_dv_cache[particle]
+        end
+        return true
+    end
+    if clip_thermal_same_t_cache && !clip_in_jacobian_fill[] && t == clip_thermal_same_t_updated_at[]
+        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+            dv_cyl[NDIMS_CYL + 1, particle] = clip_thermal_dv_cache[particle]
+        end
+        return true
+    end
+    return false
+end
+
+function clip_thermal_freeze_capture!(dv_cyl, cyl_sys, t)
+    NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        clip_thermal_dv_cache[particle] = dv_cyl[NDIMS_CYL + 1, particle]
+    end
+    if clip_in_jacobian_fill[] && clip_jac_thermal_frozen
+        clip_thermal_jac_cache_valid[] = true
+    end
+    if clip_thermal_same_t_cache && !clip_in_jacobian_fill[]
+        clip_thermal_same_t_updated_at[] = t
+    end
+    return nothing
+end
+
+@inline function clip_contact_freeze_restore_active(t)
+    if clip_jac_contact_frozen && clip_in_jacobian_fill[] && clip_contact_jac_cache_valid[]
+        return true
+    end
+    if clip_contact_same_t_cache && !clip_in_jacobian_fill[] &&
+       t == clip_contact_same_t_updated_at[]
+        return true
+    end
+    return false
+end
+
+function clip_apply_cached_contact_increment!(dv_ode, cyl_sys, semi_local)
+    dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        dv_cyl[1, particle] += clip_contact_dv_inc_cache[1, particle]
+        dv_cyl[2, particle] += clip_contact_dv_inc_cache[2, particle]
+        dv_cyl[3, particle] += clip_contact_dv_inc_cache[3, particle]
+    end
+    return nothing
+end
+
+function clip_capture_contact_increment!(dv_ode, pre_snap, cyl_sys, semi_local, t)
+    dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        clip_contact_dv_inc_cache[1, particle] = dv_cyl[1, particle] - pre_snap[1, particle]
+        clip_contact_dv_inc_cache[2, particle] = dv_cyl[2, particle] - pre_snap[2, particle]
+        clip_contact_dv_inc_cache[3, particle] = dv_cyl[3, particle] - pre_snap[3, particle]
+    end
+    if clip_in_jacobian_fill[] && clip_jac_contact_frozen
+        clip_contact_jac_cache_valid[] = true
+    end
+    if clip_contact_same_t_cache && !clip_in_jacobian_fill[]
+        clip_contact_same_t_updated_at[] = t
+    end
+    return nothing
+end
+
 function apply_charge_hold_thermal_kick!(dv_ode, v_ode, semi_local, t)
     cyl_sys = semi_local.systems[1]
     floor_sys = semi_local.systems[2]
@@ -2126,9 +3522,18 @@ function apply_charge_hold_thermal_kick!(dv_ode, v_ode, semi_local, t)
         cyl_sys.temp[particle] = clamp(t_trial, temp_min_clip, temp_max_clip)
     end
 
+    dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
+    if clip_thermal_freeze_restore!(dv_cyl, cyl_sys, t)
+        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+            dv_cyl[1, particle] = 0.0
+            dv_cyl[2, particle] = 0.0
+            dv_cyl[3, particle] = 0.0
+        end
+        return dv_ode
+    end
+
     contact_heat_flux = compute_contact_heat_flux!(contact_heat_flux_buf, cyl_sys,
                                                    floor_sys, mold_sys, particle_spacing)
-    dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
     TrixiParticles.thermal_rhs_sph3d!(cyl_sys, dv_cyl, v_cyl, 0.0,
                                       particle_spacing, bound_coordinate_thermal, semi_local)
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
@@ -2147,10 +3552,21 @@ function apply_charge_hold_thermal_kick!(dv_ode, v_ode, semi_local, t)
             dv_cyl[NDIMS_CYL + 1, particle] -= contact_heat_flux[particle] /
                                               (rho_i * cp_eff * particle_spacing)
         end
+        if use_ambient_heat_loss
+            exposure = charge_boundary_exposure[particle]
+            if exposure > 0.0
+                rho_i = cyl_sys.material_density[particle]
+                flux_conv = h_ambient * (T_i - temp_ambient)
+                flux_rad = stefan_boltzmann * emissivity_charge * (T_i^4 - temp_ambient^4)
+                dT_dt_loss = exposure * (flux_conv + flux_rad) / (rho_i * cp_eff * particle_spacing)
+                dv_cyl[NDIMS_CYL + 1, particle] -= dT_dt_loss
+            end
+        end
         dv_cyl[1, particle] = 0.0
         dv_cyl[2, particle] = 0.0
         dv_cyl[3, particle] = 0.0
     end
+    clip_thermal_freeze_capture!(dv_cyl, cyl_sys, t)
 
     return dv_ode
 end
@@ -2161,7 +3577,9 @@ function apply_charge_hold_rhs!(dv_ode, v_ode, u_ode, semi_local, t)
     # consistent through solidification without reintroducing stiff tool interaction.
     enable_elastic_stress || return dv_ode
     cyl_sys = semi_local.systems[1]
-    if t != nhs_updated_at_t[]
+    if clip_in_jacobian_fill[] && clip_jac_nhs_refresh
+        TrixiParticles.update_nhs!(semi_local, u_ode)
+    elseif t != nhs_updated_at_t[] || (clip_ode_flat[] && CURRENT_JACOBIAN_STRATEGY[] == "matrix_free")
         TrixiParticles.update_nhs!(semi_local, u_ode)
         nhs_updated_at_t[] = t
     end
@@ -2179,25 +3597,28 @@ end
 
 function apply_charge_plane_strain_F_fix!(cyl_sys)
     apply_y_plane_constraint || return nothing
+    deform = cyl_sys.deformation_grad
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-        cyl_sys.deformation_grad[2, 1, particle] = 0.0
-        cyl_sys.deformation_grad[2, 2, particle] = 1.0
-        cyl_sys.deformation_grad[2, 3, particle] = 0.0
-        cyl_sys.deformation_grad[1, 2, particle] = 0.0
-        cyl_sys.deformation_grad[3, 2, particle] = 0.0
+        deform[2, 1, particle] = 0.0
+        deform[2, 2, particle] = 1.0
+        deform[2, 3, particle] = 0.0
+        deform[1, 2, particle] = 0.0
+        deform[3, 2, particle] = 0.0
     end
     return nothing
 end
 
 # Ḟ = L·F on accepted steps during retraction (position-based F skipped in NL iterates).
 function advance_F_from_vel_grad!(cyl_sys, vel_grad_cache, dt)
-    I3 = StaticArrays.SMatrix{3, 3, Float64}(I)
+    I_mat = StaticArrays.SMatrix{TrixiParticles.ndims(cyl_sys),
+                                 TrixiParticles.ndims(cyl_sys), Float64}(I)
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-        L_corr = TrixiParticles.extract_smatrix(cyl_sys.correction_matrix, cyl_sys, particle)
-        L = StaticArrays.SMatrix{3, 3, Float64}(vel_grad_cache[:, :, particle]) * L_corr'
+        L_corr = TrixiParticles.correction_matrix(cyl_sys, particle)
+        L = TrixiParticles.extract_smatrix(vel_grad_cache, Val(TrixiParticles.ndims(cyl_sys)),
+                                           particle) * L_corr'
         F_old = TrixiParticles.deformation_gradient(cyl_sys, particle)
-        F_new = (I3 + dt * L) * F_old
-        for jj in 1:3, ii in 1:3
+        F_new = (I_mat + dt * L) * F_old
+        for jj in 1:TrixiParticles.ndims(cyl_sys), ii in 1:TrixiParticles.ndims(cyl_sys)
             cyl_sys.deformation_grad[ii, jj, particle] = F_new[ii, jj]
         end
     end
@@ -2222,7 +3643,7 @@ function apply_charge_interact_skip_penalty_only!(dv_ode, v_ode, semi_local)
 
     PointNeighbors.foreach_point_neighbor(
         system_coords, system_coords, nhs;
-        parallelization_backend=TrixiParticles.PolyesterBackend(),
+        parallelization_backend=clip_parallelization_backend,
         points=TrixiParticles.each_integrated_particle(cyl_sys)
     ) do particle, neighbor, initial_pos_diff, initial_distance
         initial_distance^2 < eps(TrixiParticles.initial_smoothing_length(cyl_sys)^2) && return
@@ -2291,36 +3712,42 @@ function system_interaction_ramped!(dv_ode, v_ode, u_ode, semi_local,
         end
     end
 
+    bh_sys = blankholder_neighbor_system[]
+    if bh_sys !== nothing
+        for (system, neighbor) in ((cyl_sys, bh_sys), (bh_sys, cyl_sys))
+            TrixiParticles.interact!(dv_ode, v_ode, u_ode, system, neighbor, semi_local)
+        end
+    end
+
     return dv_ode
 end
 
-mold_motion = PrescribedMotion(
-    (x, t) -> begin
-        z_shift = if t <= t_compress
-            mold_z_shift_at_time(t)
-        elseif retraction_started[]
-            dt_ret = t - retraction_start_time[]
-            dt_lift = min(dt_ret, retraction_duration_max)
-            if dt_lift < retraction_ramp_s
-                z_shift_motion_end +
-                    0.5 * abs(mold_velocity_state) / retraction_ramp_s * dt_lift^2
+mold_motion = if clip_use_gpu
+    # Dummy motion: kinematics applied on CPU in clip_apply_mold_kinematics_cpu!.
+    # Keeps velocity/acceleration buffers in the system cache for GPU layout.
+    PrescribedMotion((x, t) -> x, t -> false)
+else
+    PrescribedMotion(
+        (x, t) -> begin
+            z_shift = if t <= t_compress
+                mold_z_shift_at_time(t)
+            elseif retraction_started[]
+                mold_lift_z_shift_at(t)
             else
-                z_shift_motion_end +
-                    abs(mold_velocity_state) * (dt_lift - 0.5 * retraction_ramp_s)
+                z_shift_motion_end
             end
-        else
-            z_shift_motion_end
-        end
-        z_shift = clamp(z_shift, z_shift_motion_end, 0.0)
-        x + StaticArrays.SVector(0.0, 0.0, z_shift)
-    end,
-    t -> true)
+            z_shift = clamp(z_shift, z_shift_motion_end, 0.0)
+            x + StaticArrays.SVector(0.0, 0.0, z_shift)
+        end,
+        t -> true)
+end
 
 bound_coordinate_thermal = (3, minimum(floor_particles.coordinates[3, :]))
 
 println("✓ Thermomechanical regime configured:")
-println("  - Viscous regime: activated when T > matrix_temp_liq = ", matrix_temp_liq, " K")
-println("  - Composite feedstock: glass fibres embedded in thermoplastic matrix")
+println("  - Viscous regime: activated when T > matrix_temp_liq = ",
+        fmt_temp(matrix_temp_liq))
+println("  - Composite feedstock: carbon fibres in thermoplastic matrix (CF–PP organosheet)")
 
 # ==========================================================================================
 # STEP 5: Build the TLSPH systems
@@ -2347,18 +3774,53 @@ E_boundary = 0.01 * material_polymer.E
 const compression_contact_e_scale_default = matrix_K_melt / material_polymer.E
 compression_contact_e_scale[] = env_float("TP_CLIP_COMPRESSION_CONTACT_E_SCALE",
                                         compression_contact_e_scale_default)
+contact_penalty_alpha[] = env_float("TP_CLIP_CONTACT_PENALTY_ALPHA", 0.25)
+contact_overlap_sat_frac[] = env_float("TP_CLIP_CONTACT_OVERLAP_SAT_FRAC", 0.5)
+_legacy_contact_cap = env_float("TP_CLIP_CONTACT_TOTAL_ACCEL_CAP", 1.0e4)
+contact_total_accel_cap[] = _legacy_contact_cap
+contact_accel_cap_solid[] = env_float("TP_CLIP_CONTACT_ACCEL_CAP_SOLID", _legacy_contact_cap)
+contact_accel_cap_molten[] = env_float("TP_CLIP_CONTACT_ACCEL_CAP_MOLENT", 8.0e4)
+melt_contact_softness[] = env_float("TP_CLIP_MELT_CONTACT_SOFTNESS", 0.15)
 println("  - compression Reimann contact E scale = ",
         round(compression_contact_e_scale[], digits=4),
         " (default K_melt/E = ",
         round(compression_contact_e_scale_default, digits=4), ")")
+println("  - contact penalty: α=", contact_penalty_alpha[],
+        " ps deadband, overlap sat=", contact_overlap_sat_frac[], " ps")
+println("  - melt-aware contact: k_n scale (molten)=", melt_contact_softness[],
+        ", |a|_cap solid=", contact_accel_cap_solid[],
+        " molten=", contact_accel_cap_molten[], " m/s²")
+_clip_max_liquid = env_float("TP_CLIP_MAX_LIQUID_ACCEL", 2.5e5)
+max_liquid_accel = max(_clip_max_liquid, contact_accel_cap_molten[])
+println("  - max liquid mechanics |a| = ", max_liquid_accel,
+        " m/s² (≥ molten contact cap)")
 
 import PointNeighbors: DictionaryCellList
 
-nhs_template = PrecomputedNeighborhoodSearch{3}(; max_neighbors=400)
+const tool_smoothing_h = use_stl_geometry ? tool_smoothing_length : smoothing_length
+bh_particles, blankholder_system, charge_resting_on_shelf =
+    clip_setup_blankholder(polymer, particle_spacing, floor_density, tool_smoothing_h,
+                           smoothing_kernel, E_boundary, material_polymer)
+blankholder_neighbor_system[] = blankholder_system
+charge_resting_on_shelf_buf[] = charge_resting_on_shelf
+n_bh_particles = blankholder_system === nothing ? 0 : nparticles(bh_particles)
+apply_resting_shelf_z_constraint &&
+    println("  - resting-shelf z spring-damper: ON (",
+            count(charge_resting_on_shelf), " / ", nparticles(polymer),
+            " charge particles; replaces blankholder hold-down on flange)")
+const _clip_n_tool_particles = nparticles(floor_particles) + nparticles(mold_particles) +
+    n_bh_particles
+_clip_n_tool_particles > 2000 &&
+    println("  - NHS max_points_per_cell = ",
+            clip_nhs_max_points_per_cell(_clip_n_tool_particles),
+            " (tool particles = ", _clip_n_tool_particles, ")")
+nhs_template = clip_precomputed_nhs_template(;
+    max_neighbors=use_stl_geometry ? max(300, env_int("TP_CLIP_NHS_MAX_NEIGHBORS", 400)) : 200,
+    n_tool=_clip_n_tool_particles)
 
 floor_system = TotalLagrangianSPHSystem(floor_particles,
                                         smoothing_kernel,
-                                        smoothing_length,
+                                        tool_smoothing_h,
                                         E_boundary,
                                         material_polymer.nu,
                                         material_polymer.beta,
@@ -2372,11 +3834,12 @@ floor_system = TotalLagrangianSPHSystem(floor_particles,
                                         material_polymer.tmelt,
                                         material_polymer.yield_stress;
                                         clamped_particles=collect(1:nparticles(floor_particles)),
-                                        acceleration=(0.0, 0.0, 0.0))
+                                        acceleration=(0.0, 0.0, 0.0),
+                                        self_interaction_nhs=nothing)
 
 mold_system = TotalLagrangianSPHSystem(mold_particles,
                                        smoothing_kernel,
-                                       smoothing_length,
+                                       tool_smoothing_h,
                                        E_boundary,
                                        material_polymer.nu,
                                        material_polymer.beta,
@@ -2392,14 +3855,7 @@ mold_system = TotalLagrangianSPHSystem(mold_particles,
                                        clamped_particles=collect(1:nparticles(mold_particles)),
                                        clamped_particles_motion=mold_motion,
                                        acceleration=(0.0, 0.0, 0.0),
-                                       self_interaction_nhs=nhs_template)
-
-const charge_tensile_stress = charge_tensile_psi < 0.0 ?
-    TensileArtificialStressMonaghan(psi=charge_tensile_psi,
-                                    exponent=charge_tensile_exponent) : nothing
-charge_tensile_stress !== nothing &&
-    println("Charge tensile stabilisation: Monaghan psi=", charge_tensile_psi,
-            " exponent=", charge_tensile_exponent)
+                                       self_interaction_nhs=nothing)
 
 cylinder_system = TotalLagrangianSPHSystem(polymer,
                                            smoothing_kernel,
@@ -2419,30 +3875,87 @@ cylinder_system = TotalLagrangianSPHSystem(polymer,
                                            acceleration=(0.0, 0.0, 0.0),
                                            penalty_force=PenaltyForceGanzenmueller(
                                                alpha=env_float("TP_CLIP_PENALTY_ALPHA", 0.05)),
-                                           tensile_stress=charge_tensile_stress,
                                            viscosity=ArtificialViscosityMonaghan(alpha=0.5,
                                                                                    beta=4.0),
+                                           tensile_stress=clip_tensile_stress,
                                            self_interaction_nhs=nhs_template)
 
 # ==========================================================================================
 # STEP 6: Semidiscretization and solve
 # ==========================================================================================
-semi = Semidiscretization(cylinder_system, floor_system, mold_system;
-                          neighborhood_search=GridNeighborhoodSearch{3}(;
-                              cell_list=DictionaryCellList{3}(),
-                              search_radius=smoothing_length))
+mold_nhs_coords = blankholder_system === nothing ?
+    mold_particles.coordinates :
+    hcat(mold_particles.coordinates, bh_particles.coordinates)
+semi = if blankholder_system === nothing
+    Semidiscretization(cylinder_system, floor_system, mold_system;
+                       neighborhood_search=clip_build_neighborhood_search(
+                           smoothing_length;
+                           polymer_coords=polymer.coordinates,
+                           floor_coords=floor_particles.coordinates,
+                           mold_coords=mold_nhs_coords),
+                       parallelization_backend=clip_parallelization_backend)
+else
+    Semidiscretization(cylinder_system, floor_system, mold_system, blankholder_system;
+                       neighborhood_search=clip_build_neighborhood_search(
+                           smoothing_length;
+                           polymer_coords=polymer.coordinates,
+                           floor_coords=floor_particles.coordinates,
+                           mold_coords=mold_nhs_coords),
+                       parallelization_backend=clip_parallelization_backend)
+end
 
-# Preheat: charge above solidification window (matrix_tmelt=398 K → 180°C = 453 K → fully molten).
-preheating_target_temp = 453.0
-tool_preheat_temp = 320.0
+function initialize_charge_boundary_exposure!(exposure_vec, semi_local)
+    cyl_sys = semi_local.systems[1]
+    n_part = nparticles(cyl_sys)
+    resize!(exposure_vec, n_part)
+    fill!(exposure_vec, 0.0)
+    
+    if !use_ambient_heat_loss
+        return nothing
+    end
+    
+    initial_coords = TrixiParticles.initial_coordinates(cyl_sys)
+    rho = cyl_sys.material_density[1]
+    
+    W_sum = zeros(n_part)
+    TrixiParticles.foreach_point_neighbor(cyl_sys, cyl_sys, initial_coords, initial_coords, semi_local) do particle, neighbor, r_nb, _
+        vol_nb = cyl_sys.mass[neighbor] / rho
+        r_scalar = sqrt(TrixiParticles.dot(r_nb, r_nb))
+        W_sum[particle] += vol_nb * TrixiParticles.smoothing_kernel(cyl_sys, r_scalar, particle)
+    end
+    
+    W_max = maximum(W_sum)
+    if W_max > 0.0
+        for i in 1:n_part
+            exposure_vec[i] = max(0.0, 1.0 - W_sum[i] / W_max)
+        end
+    end
+    
+    println(">>> Boundary exposure factor initialized for charge:")
+    println("    - max exposure = ", round(maximum(exposure_vec); digits=4))
+    println("    - mean exposure = ", round(mean(exposure_vec); digits=4))
+    println("    - count of exposed particles (exposure > 0.01) = ", count(x -> x > 0.01, exposure_vec))
+    flush(stdout)
+    return nothing
+end
+
+initialize_charge_boundary_exposure!(charge_boundary_exposure, semi)
+
+# Preheat temperatures are specified in °C and stored as K for thermal laws.
+preheating_target_temp = celsius_to_kelvin(env_float("TP_CLIP_CHARGE_TEMP", 453.0))
+tool_preheat_temp = celsius_to_kelvin(env_float("TP_CLIP_TOOL_TEMP", 320.0))
 
 println("\n=== PREHEATING PHASE ===")
 semi.systems[1].temp .= preheating_target_temp
-semi.systems[2].temp .= tool_preheat_temp
-semi.systems[3].temp .= tool_preheat_temp
-println("✓ Cylinder preheated: T = $preheating_target_temp K")
-println("✓ Floor preheated:    T = $tool_preheat_temp K")
-println("✓ Mold  preheated:    T = $tool_preheat_temp K")
+for sys in semi.systems[2:end]
+    sys.temp .= tool_preheat_temp
+end
+println("✓ Cylinder preheated: T = ", fmt_temp(preheating_target_temp))
+println("✓ Floor preheated:    T = ", fmt_temp(tool_preheat_temp))
+println("✓ Mold  preheated:    T = ", fmt_temp(tool_preheat_temp))
+blankholder_system !== nothing &&
+    println("✓ Blankholder preheated: T = ", fmt_temp(tool_preheat_temp),
+            " (kinematically fixed)")
 println("=== PREHEATING COMPLETE ===\n")
 
 hold_checkpoint_restore = nothing
@@ -2459,7 +3972,8 @@ if sim_phase == "retraction"
     validate_checkpoint_meta!(hold_checkpoint_restore, meta_now;
                               motion_from_checkpoint=retraction_motion_from_checkpoint)
     t_ret0 = hold_checkpoint_restore["t"]
-    t_ret1 = t_ret0 + retraction_duration_max + retraction_springback_dwell_s
+    t_ret1 = t_ret0 + retraction_pre_lift_creep_s + retraction_duration_max +
+        retraction_springback_dwell_s
     if retraction_probe_s > 0.0
         t_ret1 = min(t_ret1, t_ret0 + retraction_probe_s)
         println(">>> Retraction PROBE: tspan capped to ", retraction_probe_s,
@@ -2482,6 +3996,26 @@ else
     tspan = (0.0, t_total)
 end
 
+if sim_phase in ("full", "hold") && env_int("TP_CLIP_RESTORE_CHECKPOINT", 0) != 0
+    isfile(checkpoint_path) ||
+        error("TP_CLIP_RESTORE_CHECKPOINT=1 but checkpoint not found: $(abspath(checkpoint_path))")
+    hold_checkpoint_restore = load_hold_checkpoint(checkpoint_path)
+    meta_now = checkpoint_meta(; particle_spacing=particle_spacing,
+                               n_charge=n_cylinder_particles,
+                               n_floor=nparticles(floor_particles),
+                               n_mold=nparticles(mold_particles),
+                               t_compress=t_compress,
+                               z_shift_down_end=z_shift_down_end,
+                               mold_velocity_state=mold_velocity_state,
+                               compression_thickness_ratio=compression_thickness_ratio)
+    validate_checkpoint_meta!(hold_checkpoint_restore, meta_now)
+    t_ck = hold_checkpoint_restore["t"]
+    tspan = (t_ck, t_total)
+    println(">>> RESTORE from checkpoint: t0=", round(t_ck; digits=6),
+            " s, tspan=", tspan)
+    flush(stdout)
+end
+
 # VTU save schedule (compress/hold/full). Retraction-only uses fixed dt instead.
 const compress_hold_vtu_save_times = sim_phase == "retraction" ?
     Float64[] : build_compress_hold_vtu_save_times(t_total)
@@ -2498,22 +4032,22 @@ if periodic_checkpoint_with_vtu && sim_phase != "retraction"
     flush(stdout)
 end
 
-ode_base = semidiscretize(semi, tspan)
-
 # ==========================================================================================
 # PSEUDO-2D TLSPH FIX: Compute the 2x2 Gradient Correction Matrix
 # The default 3D correction_matrix_inversion_step! sees det(L) = 0 because all particles
 # are coplanar in y, so it falls back to the identity matrix L_inv = I. This completely
 # disables kernel correction, ruining TLSPH stability.
 # We manually re-compute the x-z components of L, invert the 2x2 block, and set y=1.
+# Must run on CPU before semidiscretize (GPU transfer happens in semidiscretize).
 # ==========================================================================================
 println(">>> Applying pseudo-2D kernel correction matrix fix...")
 TrixiParticles.foreach_system(semi) do system
     TrixiParticles.set_zero!(system.correction_matrix)
     initial_coords = TrixiParticles.initial_coordinates(system)
-    
+
     TrixiParticles.foreach_point_neighbor(system, system, initial_coords, initial_coords,
-                                          semi) do particle, neighbor, pos_diff, distance
+                                          semi;
+                                          parallelization_backend=PolyesterBackend()) do particle, neighbor, pos_diff, distance
         grad_kernel = TrixiParticles.smoothing_kernel_grad(system, pos_diff, distance, particle)
         iszero(grad_kernel) && return
         volume = system.mass[neighbor] / system.material_density[neighbor]
@@ -2528,7 +4062,7 @@ TrixiParticles.foreach_system(semi) do system
         Lzx = L[3, 1]; Lz = L[3, 3]
         detL2d = Lx * Lz - Lxz * Lzx
         L_inv = Matrix(1.0I, 3, 3)
-        
+
         # Regularize the determinant to avoid catastrophic jumps when detL2d < 1e-9
         # that drop kernel correction entirely and result in massive unphysical forces.
         detL2d_reg = sign(detL2d) * max(abs(detL2d), 1e-6)
@@ -2547,53 +4081,71 @@ end
 println(">>> Pseudo-2D kernel correction applied.")
 # ==========================================================================================
 
-v_stress_buf          = zeros(3, 3, n_cylinder_particles)
-v_stress_elastic_buf  = zeros(3, 3, n_cylinder_particles)
-v_stress_viscous_buf  = zeros(3, 3, n_cylinder_particles)
-vel_grad_buf          = zeros(3, 3, n_cylinder_particles)
-wcsph_visc_lagged_dv_buf = zeros(3, n_cylinder_particles)
-charge_dv_mech_marker_buf = zeros(3, n_cylinder_particles)
-wcsph_visc_scratch_dv_ode = zeros(length(ode_base.u0.x[1]))
-wcsph_liquid_density_ref_buf = zeros(n_cylinder_particles)
-wcsph_liquid_density_curr_buf = zeros(n_cylinder_particles)
-wcsph_pressure_buf = zeros(n_cylinder_particles)
-wcsph_L_curr_buf = zeros(2, 2, n_cylinder_particles)
-wcsph_tau_vis_buf = zeros(2, 2, n_cylinder_particles)
+ode_base = clip_gpu_allowscalar(() -> semidiscretize(semi, tspan))
+semi = ode_base.p
+if clip_use_gpu
+    clip_gpu_allowscalar() do
+        clip_apply_mold_kinematics_cpu!(semi.systems[3], tspan[1])
+    end
+end
+
+v_stress_buf          = clip_particle_buffer(Float64, 3, 3, n_cylinder_particles)
+v_stress_elastic_buf  = clip_particle_buffer(Float64, 3, 3, n_cylinder_particles)
+v_stress_viscous_buf  = clip_particle_buffer(Float64, 3, 3, n_cylinder_particles)
+vel_grad_buf          = clip_particle_buffer(Float64, 3, 3, n_cylinder_particles)
+wcsph_visc_lagged_dv_buf = clip_particle_buffer(Float64, 3, n_cylinder_particles)
+charge_dv_mech_marker_buf = clip_particle_buffer(Float64, 3, n_cylinder_particles)
+wcsph_visc_scratch_dv_ode = clip_ode_vector(length(ode_base.u0.x[1]))
+wcsph_liquid_density_ref_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+wcsph_liquid_density_curr_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+wcsph_pressure_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+wcsph_rho0_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+wcsph_latent_weight_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+wcsph_L_curr_buf = wcsph_full3d_pressure ?
+    clip_particle_buffer(Float64, 3, 3, n_cylinder_particles) :
+    clip_particle_buffer(Float64, 2, 2, n_cylinder_particles)
+wcsph_tau_vis_buf = wcsph_full3d_pressure ?
+    clip_particle_buffer(Float64, 3, 3, n_cylinder_particles) :
+    clip_particle_buffer(Float64, 2, 2, n_cylinder_particles)
 # Use systems from `semi` (TLSPH copies inside Semidiscretization differ from local constructors).
 const wcsph_nhs_search_radius = TrixiParticles.compact_support(semi.systems[1], semi.systems[1])
-const wcsph_current_nhs = PointNeighbors.copy_neighborhood_search(
-    TrixiParticles.get_neighborhood_search(semi.systems[1], semi.systems[2], semi),
-    wcsph_nhs_search_radius,
-    n_cylinder_particles)
+const wcsph_current_nhs = clip_use_gpu ? nothing :
+    clip_build_wcsph_neighborhood_search(wcsph_nhs_search_radius, semi)
 const wcsph_liquid_density_ref_initialized = Ref(false)
 
 nhs_updated_at_t = Ref(-Inf)
 contact_diag_interval = 5000
 
 enable_contact_diag = false
-contact_heat_flux_buf = zeros(n_cylinder_particles)
-ys_particle_buf = zeros(n_cylinder_particles)
-hard_particle_buf = zeros(n_cylinder_particles)
-vis_particle_buf = zeros(n_cylinder_particles)
-thermal_softening_particle_buf = zeros(n_cylinder_particles)
-liquid_fraction_particle_buf = zeros(n_cylinder_particles)
-solid_fraction_particle_buf  = zeros(n_cylinder_particles)
+contact_heat_flux_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+clip_thermal_dv_cache = clip_particle_buffer(Float64, n_cylinder_particles)
+clip_contact_dv_inc_cache = clip_particle_buffer(Float64, 3, n_cylinder_particles)
+clip_contact_dv_pre_snap = clip_particle_buffer(Float64, 3, n_cylinder_particles)
+ys_particle_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+hard_particle_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+vis_particle_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+thermal_softening_particle_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+liquid_fraction_particle_buf = clip_particle_buffer(Float64, n_cylinder_particles)
+solid_fraction_particle_buf  = clip_particle_buffer(Float64, n_cylinder_particles)
 # J_ref: volumetric reference Jacobian set to det(F) while a particle is liquid.
 # At re-solidification J_ref = J_at_solidification, so K·log(J_e/J_ref) = K·log(1) = 0,
 # giving zero volumetric elastic stress at the moment of re-solidification and
 # eliminating the sudden 1–2 GPa pressure spike that collapses TRBDF2 Δt.
-J_ref_particle_buf = ones(n_cylinder_particles)
+J_ref_particle_buf = clip_use_gpu ? CUDA.ones(Float64, n_cylinder_particles) :
+                                    ones(n_cylinder_particles)
 # Volumetric plastic Jacobian J_p (Strategy E). Stress-free bulk: J_e_vol = det(F)/J_p = 1.
-J_p_particle_buf = ones(n_cylinder_particles)
+J_p_particle_buf = clip_use_gpu ? CUDA.ones(Float64, n_cylinder_particles) :
+                                  ones(n_cylinder_particles)
 # Nakamura crystallinity state: α_c ∈ [0, 1].  0 = fully liquid, 1 = fully crystallized.
 # Initialised to 0 because the charge starts fully molten at ~430 K > T_melt.
-crystallinity_particle_buf = zeros(n_cylinder_particles)
+crystallinity_particle_buf = clip_particle_buffer(Float64, n_cylinder_particles)
 # The charge is preheated above matrix_tmelt, so initialize phase buffers as molten.
 # The Nakamura seed is applied only when cooling enters the crystallization range.
 fill!(liquid_fraction_particle_buf, 1.0)
 fill!(solid_fraction_particle_buf, 0.0)
 fill!(thermal_softening_particle_buf, 0.0)
-vis_particle_buf .= viscosity_base_particle
+contact_liquid_fraction_buf[] = liquid_fraction_particle_buf
+clip_host_assign!(vis_particle_buf, viscosity_base_particle)
 orientation_tensor_state = Ref(zeros(3, 3, n_cylinder_particles))
 solidification_hold_announced = Ref(false)
 solidification_complete = Ref(false)
@@ -2608,6 +4160,18 @@ first_elastic_regime    = Ref(true)
 # huge forces and particle ejection. Initialize dt_cap to match dtmax (set later at line ~1172).
 dt_cap = 1.0e-5
 trial_dt_state = Ref(dt_cap)
+const clip_integrator_dt = Ref(dt_cap)
+
+@inline function clip_sync_trial_dt_state!()
+    trial_dt_state[] = clip_integrator_dt[]
+    return nothing
+end
+
+function clip_sync_trial_dt_from_integrator!(integrator)
+    clip_integrator_dt[] = integrator.dt
+    trial_dt_state[] = integrator.dt
+    return nothing
+end
 
 rhs_time_pos_ns = Ref(0)
 rhs_time_nhs_ns = Ref(0)
@@ -2618,6 +4182,13 @@ rhs_time_boundary_ns = Ref(0)
 rhs_time_final_ns = Ref(0)
 rhs_time_stress_interact_ns = Ref(0)
 rhs_time_thermal_ns = Ref(0)
+
+# Cache tool pos/quant updates within repeated RHS evaluations at the same time `t`.
+# During implicit Newton/Jacobian fills we call RHS many times with identical `t`,
+# while tool kinematics depend only on `t` (charge depends on trial `u`).
+const clip_tool_pos_quant_cache = env_int("TP_CLIP_TOOL_POS_QUANT_CACHE", 0) != 0
+const clip_tool_pos_updated_at_t = Ref(-Inf)
+const clip_tool_quant_updated_at_t = Ref(-Inf)
 
 rhs_time_pos_last_ns = Ref(0)
 rhs_time_nhs_last_ns = Ref(0)
@@ -2652,11 +4223,14 @@ rhs_time_callback_orientation_ns = Ref(0)    # update_flow_orientation_kinetics!
 
 const formulation_profile_enabled = env_int("TP_CLIP_FORMULATION_PROFILE", 0) != 0
 const formulation_profile_interval = max(1, env_int("TP_CLIP_FORMULATION_PROFILE_INTERVAL", 1000))
+const formulation_profile_time_dt = env_float("TP_CLIP_FORMULATION_PROFILE_TIME_DT", 0.0)
 const formulation_profile_path = get(ENV, "TP_CLIP_FORMULATION_PROFILE_LOG",
                                      joinpath("out", "formulation_profile.log"))
 const formulation_profile_step_count = Ref(0)
 const rhs_eval_count = Ref(0)
+const rhs_heartbeat_interval = max(0, env_int("TP_CLIP_RHS_HEARTBEAT", 0))
 const formulation_profile_last_t = Ref(0.0)
+const formulation_profile_next_t = Ref(formulation_profile_time_dt > 0.0 ? formulation_profile_time_dt : Inf)
 const formulation_profile_io = Ref{Union{IO, Nothing}}(nothing)
 
 function formulation_profile_reset_counters!()
@@ -2703,7 +4277,7 @@ function print_formulation_timing_report_final!(t; label="final")
                            rhs_time_stress_blend_ns[]) / rhs_evals)),
         @sprintf("  Thermal + crystallization     %8.3f ms/eval",
                  ns_to_ms((thermal_ns + crystallization_ns) / rhs_evals)),
-        "Note: TRBDF2 Jacobian + dense LU not included.",
+        "Note: implicit Jacobian + linear solves not included.",
     ], '\n')
     println(report)
     flush(stdout)
@@ -2781,7 +4355,7 @@ function print_formulation_timing_report!(integrator; label="snapshot")
                  100 * (rhs_time_pos_ns[] + rhs_time_quant_ns[] + rhs_time_implicit_ns[] +
                         rhs_time_pressure_ns[] + rhs_time_boundary_ns[] +
                         rhs_time_final_ns[]) / rhs_total_ns),
-        "Note: TRBDF2 Jacobian + dense LU linear solves are NOT in RHS timers (dominant during micro-dt).",
+        "Note: implicit Jacobian + linear solves are NOT in RHS timers (dominant during micro-dt).",
     ]
     report = join(lines, '\n')
     println(report)
@@ -2818,10 +4392,25 @@ const diag_heat_dT_K      = 50.0
 # RHS stiffness diagnostic: fires once per stall event.
 # A stall is a new event when t > diag_stiff_last_t + 1e-4 (0.1 ms gap).
 # Prints the dominant stress term so the root cause is identifiable.
+const stall_diag_enabled = env_int("TP_CLIP_STALL_DIAG", 0) != 0
+const stiff_diag_enabled = env_int("TP_CLIP_STIFF_DIAG", stall_diag_enabled ? 1 : 0) != 0
+const force_stage_diag_enabled = env_int("TP_CLIP_FORCE_STAGE_DIAG", stall_diag_enabled ? 1 : 0) != 0
+const solver_diag_enabled = env_int("TP_CLIP_SOLVER_DIAG", stall_diag_enabled ? 1 : 0) != 0
+const stiff_diag_start_t = env_float("TP_CLIP_STIFF_DIAG_START_T", 0.18)
+const solver_diag_dt_threshold = env_float("TP_CLIP_SOLVER_DIAG_DT", 1.0e-7)
 const diag_stiff_last_t = Ref(-1.0)   # sim time of last diagnostic print
 const diag_force_stage_last_t = Ref(-1.0)
-const diag_force_stage_start_t = env_float("TP_CLIP_FORCE_STAGE_START_T", 0.0)
+const diag_force_stage_start_t = env_float("TP_CLIP_FORCE_STAGE_START_T", 0.18)
 const diag_force_stage_dt = env_float("TP_CLIP_FORCE_STAGE_DT", 1.0e-4)
+
+if stall_diag_enabled
+    println(">>> Stall diagnostics ON: stiff=", stiff_diag_enabled,
+            " (t≥", stiff_diag_start_t, " s), force-stage=", force_stage_diag_enabled,
+            ", solver-dt<", solver_diag_dt_threshold, " s")
+    formulation_profile_enabled || @warn "TP_CLIP_STALL_DIAG=1 without TP_CLIP_FORMULATION_PROFILE=1: " *
+        "enable formulation profile to see RHS timing breakdown."
+    flush(stdout)
+end
 
 # function contact_condition(cyl_sys, floor_sys, mold_sys, i, contact_dist)
 #     z_i         = cyl_sys.current_coordinates[3, i]
@@ -2843,11 +4432,12 @@ const diag_force_stage_dt = env_float("TP_CLIP_FORCE_STAGE_DT", 1.0e-4)
     end
 end
 
-function apply_retraction_charge_accel_caps!(dv_cyl, cyl_sys, t)
+function apply_retraction_charge_accel_caps!(dv_cyl, cyl_sys, t; cap_y::Bool=false)
     apply_velocity_safety_clamps() || return nothing
     accel_cap = retraction_charge_accel_cap(t)
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
         dv_cyl[1, particle] = soft_limit(dv_cyl[1, particle], accel_cap)
+        cap_y && (dv_cyl[2, particle] = soft_limit(dv_cyl[2, particle], accel_cap))
         dv_cyl[3, particle] = soft_limit(dv_cyl[3, particle], accel_cap)
     end
     return nothing
@@ -2884,34 +4474,34 @@ function force_stage_maxima(prev_dv, dv_ode, cyl_sys, semi_local)
 end
 
 function print_force_stage_delta!(label, prev_dv, dv_ode, cyl_sys, semi_local, t)
-    # Diagnostics disabled.
-    # max_abs, pid_abs, max_delta, pid_delta =
-    #     force_stage_maxima(prev_dv, dv_ode, cyl_sys, semi_local)
-    # dv_now = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
-    # prev_dv .= dv_now
-    #
-    # pid = pid_delta > 0 ? pid_delta : pid_abs
-    # if pid > 0
-    #     println(stderr,
-    #             "  FORCE-STAGE ", label,
-    #             "  |dv|max=", round(max_abs; digits=4),
-    #             " p=", pid_abs,
-    #             "  |Δdv|=", round(max_delta; digits=4),
-    #             " pΔ=", pid_delta,
-    #             "  T=", round(cyl_sys.temp[pid]; digits=2),
-    #             "  lf=", round(liquid_fraction_particle_buf[pid]; digits=3),
-    #             "  sf=", round(solid_fraction_particle_buf[pid]; digits=3),
-    #             "  pos=(",
-    #             round(cyl_sys.current_coordinates[1, pid] * 1e3; digits=2),
-    #             ", ",
-    #             round(cyl_sys.current_coordinates[3, pid] * 1e3; digits=2),
-    #             ") mm")
-    # else
-    #     println(stderr,
-    #             "  FORCE-STAGE ", label,
-    #             "  |dv|max=", round(max_abs; digits=4),
-    #             "  |Δdv|=", round(max_delta; digits=4))
-    # end
+    force_stage_diag_enabled || return nothing
+    max_abs, pid_abs, max_delta, pid_delta =
+        force_stage_maxima(prev_dv, dv_ode, cyl_sys, semi_local)
+    dv_now = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
+    prev_dv .= dv_now
+
+    pid = pid_delta > 0 ? pid_delta : pid_abs
+    if pid > 0
+        println(stderr,
+                "  FORCE-STAGE ", label,
+                "  |dv|max=", round(max_abs; digits=4),
+                " p=", pid_abs,
+                "  |Δdv|=", round(max_delta; digits=4),
+                " pΔ=", pid_delta,
+                "  T=", round(cyl_sys.temp[pid]; digits=2),
+                "  lf=", round(liquid_fraction_particle_buf[pid]; digits=3),
+                "  sf=", round(solid_fraction_particle_buf[pid]; digits=3),
+                "  pos=(",
+                round(cyl_sys.current_coordinates[1, pid] * 1e3; digits=2),
+                ", ",
+                round(cyl_sys.current_coordinates[3, pid] * 1e3; digits=2),
+                ") mm")
+    else
+        println(stderr,
+                "  FORCE-STAGE ", label,
+                "  |dv|max=", round(max_abs; digits=4),
+                "  |Δdv|=", round(max_delta; digits=4))
+    end
     return nothing
 end
 
@@ -3136,8 +4726,22 @@ function step_nakamura_crystallinity!(crystallinity_buf, temp,
 end
 
 function project_orientation_tensor!(A)
+    @inbounds for ij in eachindex(A)
+        if !isfinite(A[ij])
+            fill!(A, 0.0)
+            A[1, 1] = A[2, 2] = A[3, 3] = 1.0 / 3.0
+            return A
+        end
+    end
     A_sym = 0.5 .* (A .+ A')
-    eig = eigen(Symmetric(A_sym))
+    eig = try
+        eigen(Symmetric(A_sym))
+    catch err
+        err isa ArgumentError || rethrow()
+        fill!(A, 0.0)
+        A[1, 1] = A[2, 2] = A[3, 3] = 1.0 / 3.0
+        return A
+    end
     vals = clamp.(eig.values, 1.0e-8, 1.0)
     vals ./= sum(vals)
     A_proj = eig.vectors * Diagonal(vals) * eig.vectors'
@@ -3179,9 +4783,21 @@ function update_flow_orientation_kinetics!(A_state, orientation_scalar, vel_grad
         A = view(A_state, :, :, i)
         L = view(vel_grad, :, :, i)
 
+        bad_L = false
+        for ij in eachindex(L)
+            if !isfinite(L[ij])
+                bad_L = true
+                break
+            end
+        end
+        bad_L && continue
+
         D = 0.5 .* (L .+ L')
         W = 0.5 .* (L .- L')
         gamma_dot = sqrt(2.0 * sum(D .* D))
+        if !isfinite(gamma_dot) || gamma_dot > 1.0e8
+            continue
+        end
 
         trAD = sum(A .* D)
         jeffery = W * A - A * W +
@@ -3217,12 +4833,13 @@ function refresh_velocity_gradient_cache!(system, v, semi, vel_grad_cache)
     nhs = TrixiParticles.get_neighborhood_search(system, system, semi)
     PointNeighbors.foreach_point_neighbor(
         initial_coords, initial_coords, nhs;
-        parallelization_backend=TrixiParticles.PolyesterBackend()
+        parallelization_backend=clip_parallelization_backend
     ) do particle, neighbor, pos_diff_initial, initial_distance
         initial_distance^2 < eps(TrixiParticles.initial_smoothing_length(system)^2) && return
 
         volume = @inbounds system.mass[neighbor] / system.material_density[neighbor]
-        vel_diff = v[:, particle] - v[:, neighbor]
+        NDIMS = TrixiParticles.ndims(system)
+        vel_diff = TrixiParticles.extract_svector(v, Val(NDIMS), particle) - TrixiParticles.extract_svector(v, Val(NDIMS), neighbor)
         grad_kernel = TrixiParticles.smoothing_kernel_grad(system, pos_diff_initial,
                                                            initial_distance, particle)
         result_v = volume * vel_diff * grad_kernel'
@@ -3241,11 +4858,9 @@ function viscous_stress_from_cached_grad!(system, vis;
                                           include_bulk_term=true,
                                           solid_fraction_buf=nothing,
                                           skip_solid_fraction=1.0)
-    (; young_modulus, poisson_ratio) = system
-
     n_particles = size(vel_grad_buf, 3)
-    v_vis = v_vis_buf !== nothing ? v_vis_buf : zeros(Float64, 3, 3, n_particles)
-    K = young_modulus / (3 - 6 * poisson_ratio)
+    v_vis = v_vis_buf !== nothing ? v_vis_buf :
+            zeros(eltype(system.young_modulus), 3, 3, n_particles)
 
     Threads.@threads for particle in 1:n_particles
         if solid_fraction_buf !== nothing && solid_fraction_buf[particle] >= skip_solid_fraction
@@ -3257,61 +4872,30 @@ function viscous_stress_from_cached_grad!(system, vis;
         L_corr = @inbounds TrixiParticles.correction_matrix(system, particle)
         J = max(det(F), 1e-6)
 
-        _L = vel_grad_buf[:, :, particle] * L_corr'
+        _L = StaticArrays.SMatrix{3, 3}(@view vel_grad_buf[:, :, particle]) * L_corr'
         d = 0.5 * (_L + _L')
         dev_d = d - 1 / 3 * tr(d) * I
 
-        tau = 2 * vis[particle] * dev_d
-        # Clip deviatoric viscous stress norm to matrix_yield_stress to prevent
-        # unphysically large σ_v (caused by huge vel-grad when a particle is being
-        # compressed against the mold wall) from driving Δt to femtoseconds.
-        # This is equivalent to a Bingham-like yield cap: viscous flow cannot exceed
-        # the solid-state yield stress regardless of strain rate.
+        tau = 2.0 * vis[particle] * dev_d
         tau_norm = sqrt(sum(tau .^ 2))
         if tau_norm > matrix_yield_stress
             tau = tau * (matrix_yield_stress / tau_norm)
         end
+
         if include_bulk_term
-            # Solid-skeleton bulk for semi-solid particles. Use matrix_K_melt (≈0.1 GPa)
-            # instead of the composite K (≈22 GPa): above matrix_tmelt the crystalline
-            # stiffness is gone; using K_composite here produces O(100 MPa) pressure
-            # from sub-1% overlaps and collapses Δt. The fiber-composite stiffness is
-            # handled by the elastic path (active below tmelt via matrix_blend).
             lf = solid_fraction_buf !== nothing ? (1.0 - solid_fraction_buf[particle]) : 1.0
             p_vol = (1.0 - lf) * matrix_K_melt * log(J)
             tau += p_vol * I
         end
 
-        # Clamp singular values of F before computing FinvT. For liquid/semi-liquid
-        # particles that have flowed far from their reference position, F becomes
-        # highly anisotropic and pinv(F) has large eigenvalues that amplify even a
-        # physically-capped Kirchhoff stress tau by 10–100× in PK space.
-        # This is a TLSPH discretisation artifact (reference-config framework breaking
-        # down under large deformation), not a real stress amplification.
-        # Clamping singular values to [s_min, s_max] is the standard FEM large-deformation
-        # stabilisation: preserves accuracy for moderate deformations while preventing
-        # singularity. Physically: the viscous SPH kernel gradient contribution
-        # saturates once the particle has moved beyond ~2× its reference spacing.
-        # Blend out TLSPH viscous contribution for liquid/semi-liquid particles.
-        # Above matrix_tmelt the reference-config framework (F, L_corr) is no longer
-        # valid: particles have rearranged far from reference, so FinvT and L_corr
-        # become ill-conditioned and amplify stress by 10–100×. This is a discretisation
-        # artefact, not physics. The elastic path uses the same 5K blend to zero out
-        # its contribution; we do the same here so both paths are consistent.
-        # For T > matrix_tmelt+2.5K: visc_blend=0 → no TLSPH viscous term.
-        # For T < matrix_tmelt-2.5K: visc_blend=1 → full TLSPH viscous term.
-        # Liquid-phase behaviour is handled by apply_wcsph_liquid_pressure!.
-        # NOTE: do NOT use a nonzero floor here — even 5% TLSPH viscous on a liquid
-        # particle with ill-conditioned F causes thermal runaway (T→2000K) via
-        # viscous dissipation far exceeding conduction.
         temp_p = system.temp[particle]
         visc_blend = clamp((matrix_tmelt + 2.5 - temp_p) / 5.0, 0.0, 1.0)
         if visc_blend < 1e-6
-            v_vis[:, :, particle] .= 0.0
+            @inbounds v_vis[:, :, particle] .= 0.0
             continue
         end
 
-        FinvT = pinv(F)'
+        FinvT = inv(F)'
         v_vis[:, :, particle] .= (tau * FinvT) * L_corr * visc_blend
     end
 
@@ -3360,6 +4944,8 @@ function commit_volumetric_plastic_relax!(F_reg, particle; active, commit_blend,
     J_p_particle_buf[particle] = clamp(J_p_new, 1e-6, max(J_tot, 1e-6))
     return nothing
 end
+
+
 
 function elastic_stress3d_trial_skip_liquid!(system, ys, hard, vis, dt, _alpha, _Fp, semi;
                                              solid_fraction_buf,
@@ -3418,15 +5004,30 @@ function elastic_stress3d_trial_skip_liquid!(system, ys, hard, vis, dt, _alpha, 
         spencer_tau_p = (2 * k_fiber_particle[particle] * (I4_p - 1.0)) .* (Fn_p * Fn_p')
 
         # Smooth blend of matrix solid fraction over a 20 K window centred on matrix_tmelt.
+        # blend = 1 → fully solid  (T ≤ matrix_tmelt - matrix_blend_half_K)
+        # blend = 0 → fully molten (T ≥ matrix_tmelt + matrix_blend_half_K)
+        # matrix_blend_half_K is a module-level const (= 10 K) shared with the
+        # accepted-step callback so the two blend windows are always consistent.
         matrix_blend = clamp((matrix_tmelt + matrix_blend_half_K - temp[particle]) /
                              (2 * matrix_blend_half_K), 0.0, 1.0)
 
+        # Compute full solid-state tau (elastic + return mapping) then scale by blend.
+        # While the particle is semi-solid (matrix_blend < 1), WCSPH carries the
+        # volumetric load. Keep J_ref = J_e throughout this regime so the elastic
+        # bulk pressure K·log(J_e/J_ref) = 0. Only freeze J_ref when fully solid
+        # (matrix_blend == 1), after which elastic bulk pressure builds up normally.
         J_ref_p = max(J_ref_particle_buf[particle], 1e-6)
-        if !use_volumetric_plasticity && matrix_blend < 1.0 - 1e-6
+        if matrix_blend < 1.0 - 1e-6
+            # In the mushy zone, WCSPH carries volumetric load: track J_ref = J_e so
+            # elastic bulk pressure stays zero until the particle is fully solid.
+            # NOTE: do NOT write back to J_ref_particle_buf here. Writing to a shared
+            # auxiliary buffer inside the RHS corrupts the finite-difference Jacobian:
+            # each column-perturbation call leaves a different J_e in J_ref_particle_buf,
+            # so the unperturbed Jacobian column is immediately wrong at the next call.
+            # J_ref_particle_buf is updated once per accepted step in the callback.
             J_ref_p = J_e
         end
-        bulk_log = matrix_bulk_log_J(F_reg, particle, Fp_local, matrix_blend, J_ref_p)
-        tau_solid = K * bulk_log * I + mu * dev_be + spencer_tau_p
+        tau_solid = K * log(max(J_e / J_ref_p, 1e-6)) * I + mu * dev_be + spencer_tau_p
 
         dev_tau = tau_solid - 1 / 3 * tr(tau_solid) * I
         yf = sqrt(1.5) * sqrt(sum(dev_tau .^ 2)) - (ys[particle] + hard[particle])
@@ -3457,8 +5058,7 @@ function elastic_stress3d_trial_skip_liquid!(system, ys, hard, vis, dt, _alpha, 
                 be = Fe * Fe'
                 be_bar = be / (J_e^(2 / 3))
                 dev_be = be_bar - 1 / 3 * tr(be_bar) * I
-                bulk_log = matrix_bulk_log_J(F_reg, particle, Fp_local, matrix_blend, J_ref_p)
-                tau_solid = K * bulk_log * I + mu * dev_be + spencer_tau_p
+                tau_solid = K * log(max(J_e / J_ref_p, 1e-6)) * I + mu * dev_be + spencer_tau_p
             end
         end
 
@@ -3489,11 +5089,12 @@ function elastic_stress3d_trial_skip_liquid!(system, ys, hard, vis, dt, _alpha, 
     return v_elas
 end
 
+
 function update_dual_phase_properties!(ys, hard, vis, temp, alpha,
                                        thermal_softening_particle_buf,
                                        liquid_fraction_particle_buf,
                                        solid_fraction_particle_buf;
-                                       vel_grad_buf=nothing)
+                                       vel_grad_buf=nothing, update_viscosity::Bool=true)
     gas_constant = 8.31446261815324
     t_prop_start = time_ns()
     @inbounds for i in eachindex(temp)
@@ -3530,6 +5131,8 @@ function update_dual_phase_properties!(ys, hard, vis, temp, alpha,
     end
     rhs_time_property_update_ns[] += time_ns() - t_prop_start
 
+    update_viscosity || return nothing
+
     t_visc_start = time_ns()
     @inbounds for i in eachindex(temp)
         temp_i = temp[i]
@@ -3555,7 +5158,7 @@ function update_dual_phase_properties!(ys, hard, vis, temp, alpha,
         if vel_grad_buf === nothing
             vis[i] = eta_zero_shear
         else
-            L = @view vel_grad_buf[:, :, i]
+            L = StaticArrays.SMatrix{3, 3}(@view vel_grad_buf[:, :, i])
             D = 0.5 * (L + L')
             shear_rate = sqrt(max(2.0 * sum(abs2, D), 0.0))
             # Previous Cross denominator retained here for comparison:
@@ -3571,7 +5174,16 @@ function update_dual_phase_properties!(ys, hard, vis, temp, alpha,
             vis[i] = eta_zero_shear / cross_denominator * concentration_factor
         end
         # vis[i] = viscosity_base_particle[i] * (0.2 + 0.8 * solid_factor) * orient_scale
-        vis[i] = clamp(vis[i], viscosity_min_clip, viscosity_max_clip)
+        vis_target = clamp(vis[i], viscosity_min_clip, viscosity_max_clip)
+        if viscosity_update_alpha >= 1.0 - 1.0e-12
+            vis[i] = vis_target
+        else
+            η_old = max(vis[i], viscosity_min_clip)
+            η_new = vis_target
+            log_blend = (1.0 - viscosity_update_alpha) * log(η_old) +
+                        viscosity_update_alpha * log(η_new)
+            vis[i] = clamp(exp(log_blend), viscosity_min_clip, viscosity_max_clip)
+        end
     end
     rhs_time_viscosity_update_ns[] += time_ns() - t_visc_start
     return nothing
@@ -3617,10 +5229,24 @@ const matrix_blend_half_K = 10.0   # K  (total blend window = 2 × 10 K = 20 K)
     return x * x * (3.0 - 2.0 * x)
 end
 
+@inline function clip_viscosity_update_on_rhs()
+    interval = viscosity_rhs_update_interval
+    interval <= 0 && return false
+    viscosity_rhs_call_count[] += 1
+    return viscosity_rhs_call_count[] % interval == 1
+end
+
+function clip_viscosity_update_on_step()
+    interval = viscosity_step_update_interval
+    viscosity_step_count[] += 1
+    return viscosity_step_count[] % interval == 1
+end
+
 function update_implicit_stress_cache!(semi_local, v_ode, t)
     cyl_sys   = semi_local.systems[1]
     floor_sys = semi_local.systems[2]
     mold_sys  = semi_local.systems[3]
+    v_cyl = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
 
     # ===== Properties + constitutive stress cache =====
     update_dual_phase_properties!(ys_particle_buf, hard_particle_buf, vis_particle_buf,
@@ -3628,14 +5254,13 @@ function update_implicit_stress_cache!(semi_local, v_ode, t)
                                   thermal_softening_particle_buf,
                                   liquid_fraction_particle_buf,
                                   solid_fraction_particle_buf;
-                                  vel_grad_buf=vel_grad_buf)
+                                  vel_grad_buf=vel_grad_buf,
+                                  update_viscosity=clip_viscosity_update_on_rhs())
     refresh_retraction_solid_phase_buffers!()
 
     # Fp / alpha / J_ref updates for liquid and solidifying particles happen only in
     # commit_plastic_history_and_heat! (accepted-step callback). No history-variable
     # writes here — the RHS must be a pure function of ODE state + committed buffers.
-
-    v_cyl = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
 
     # Unified stress calculation with smooth blending
     fill!(v_stress_viscous_buf, 0)
@@ -3662,7 +5287,7 @@ function update_implicit_stress_cache!(semi_local, v_ode, t)
                 v_stress_buf[i, j, particle] = stress_visc[i, j, particle]
             end
         end
-        TrixiParticles.STRESS_TENSOR_CACHE[] = (objectid(cyl_sys), v_stress_buf)
+        clip_set_stress_cache!(cyl_sys)
         return
     end
 
@@ -3762,7 +5387,7 @@ function update_implicit_stress_cache!(semi_local, v_ode, t)
     #     flush(stdout)
     # end
 
-    TrixiParticles.STRESS_TENSOR_CACHE[] = (objectid(cyl_sys), v_stress_buf)
+    clip_set_stress_cache!(cyl_sys)
 end
 
 # CFRP-style stress cache (stamping_cfrp_3d_2_implicit.jl): update_properties! + elastic trial.
@@ -3774,7 +5399,7 @@ function update_implicit_stress_cache_cfrp!(semi_local, v_ode, t)
     stress_elas = TrixiParticles.elastic_stress3d_trial!(
         cyl_sys, ys, hard, vis, trial_dt_state[], alpha_committed[], Fp_committed[], semi_local;
         v_elas_buf=v_stress_buf)
-    TrixiParticles.STRESS_TENSOR_CACHE[] = (objectid(cyl_sys), stress_elas)
+    clip_set_stress_cache!(cyl_sys)
     return nothing
 end
 
@@ -3807,7 +5432,7 @@ function kick_implicit_cfrp_retraction!(dv_ode, v_ode, u_ode, semi_local, t)
     v_cyl = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
     NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
 
-    if use_pseudo2d_projection
+    if hard_lock_y_kinematics()
         TrixiParticles.foreach_system(semi_local) do system
             v_sys = TrixiParticles.wrap_v(v_ode, system, semi_local)
             @inbounds for particle in TrixiParticles.each_integrated_particle(system)
@@ -3821,6 +5446,7 @@ function kick_implicit_cfrp_retraction!(dv_ode, v_ode, u_ode, semi_local, t)
     end
 
     try
+        clip_sync_tool_kinematics_gpu!(semi_local, t)
         TrixiParticles.foreach_system(semi_local) do system
             v = TrixiParticles.wrap_v(v_ode, system, semi_local)
             u = TrixiParticles.wrap_u(u_ode, system, semi_local)
@@ -3886,9 +5512,19 @@ function kick_implicit_cfrp_retraction!(dv_ode, v_ode, u_ode, semi_local, t)
             dv_cyl[NDIMS_CYL + 1, particle] -= contact_heat_flux[particle] /
                                                 (rho_cyl * cp_cyl * dx)
         end
+        if use_ambient_heat_loss
+            exposure = charge_boundary_exposure[particle]
+            if exposure > 0.0
+                T_i = cyl_sys.temp[particle]
+                flux_conv = h_ambient * (T_i - temp_ambient)
+                flux_rad = stefan_boltzmann * emissivity_charge * (T_i^4 - temp_ambient^4)
+                dT_dt_loss = exposure * (flux_conv + flux_rad) / (rho_cyl * cp_cyl * dx)
+                dv_cyl[NDIMS_CYL + 1, particle] -= dT_dt_loss
+            end
+        end
     end
 
-    if use_pseudo2d_projection
+    if hard_lock_y_kinematics()
         TrixiParticles.foreach_system(semi_local) do system
             dv_sys = TrixiParticles.wrap_v(dv_ode, system, semi_local)
             @inbounds for particle in TrixiParticles.each_integrated_particle(system)
@@ -4133,16 +5769,28 @@ end
 # ==========================================================================================
 const wcsph_J_blend = 0.02   # 2% density range for smooth quadratic onset
 const wcsph_latent_force_min = 0.30  # pressure-force scale at peak latent stiffness
-# PEEK melt bulk modulus. Physical value ~5 GPa (Zoller & Walsh PVT data, hot melt);
-# numerically reduced so WCSPH pressure waves do not collapse TRBDF2 dt during contact.
-const matrix_K_liq = 2e7
+# Hot-melt bulk modulus — Wang 2010 Tait K = B/C @ 180°C preheat (validation 07 WCSPH set).
+const matrix_K_liq = 721_327_590.0
 const wcsph_hot_soften_span = 35.0    # K above melt window to relax liquid bulk stiffness smoothly
-const wcsph_pressure_cap = 1e8        # Pa: 100 MPa, upper bound for compression-moulding pressures
+const wcsph_pressure_cap = 1.0e8        # Pa: 100 MPa hard upper bound (compression moulding)
 const wcsph_visc_pair_accel_cap = 5.0e4 # m/s², pairwise cap before global liquid accel limiter
-const enable_wcsph_liquid_viscosity = false
-const lag_wcsph_liquid_viscosity = true
+# Polymer-melt cohesion: fraction of bulk modulus applied as tensile (negative) pressure when
+# particles separate (J > 1).  0.0 = no tension (original water-like behaviour),
+# 0.1–0.5 = mild cohesion suitable for molten polymer that resists free-surface breakup.
+const wcsph_tension_fraction = env_float("TP_CLIP_WCSPH_TENSION_FRACTION", 0.0)
+
+@inline function wcsph_pressure_force_dims(cyl_sys)
+    return wcsph_full3d_pressure ? (1:TrixiParticles.ndims(cyl_sys)) : (1, 3)
+end
+
 @inline function wcsph_pressure_smooth(J_raw, K)
-    J_raw >= 1.0 && return 0.0                         # no tension
+    if J_raw >= 1.0
+        # Linear cohesive tension with a larger cap (0.5) to provide physically significant cohesion
+        wcsph_tension_fraction <= 0.0 && return 0.0
+        Δ = J_raw - 1.0
+        Δ_capped = min(Δ, 0.5)
+        return -wcsph_tension_fraction * K * Δ_capped
+    end
     Δ = 1.0 - J_raw
     if Δ <= wcsph_J_blend
         return K * Δ * Δ / (2 * wcsph_J_blend)         # quadratic: dp/dJ = 0 at J = 1
@@ -4184,7 +5832,29 @@ end
 # Only liquid-fraction-weighted contributions are included; the solid part is already
 # handled by the TLSPH elastic + reference-space bulk term.
 # ==========================================================================================
-function update_wcsph_current_nhs!(nhs, coords)
+function clip_sanitize_coords_for_wcsph!(coords, cyl_sys)
+    nd = TrixiParticles.ndims(cyl_sys)
+    init = TrixiParticles.initial_coordinates(cyl_sys)
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        for d in 1:nd
+            x = coords[d, particle]
+            if !isfinite(x)
+                coords[d, particle] = init[d, particle]
+            end
+        end
+        coords[1, particle] = clamp(coords[1, particle], -x_safety_bound, x_safety_bound)
+        coords[3, particle] = clamp(coords[3, particle], z_safety_min, z_safety_max)
+        if apply_y_plane_constraint
+            # coords[2, particle] = 0.0
+        end
+    end
+    return nothing
+end
+
+function update_wcsph_current_nhs!(nhs, coords; cyl_sys=nothing, sanitize::Bool=true)
+    if sanitize && cyl_sys !== nothing
+        clip_sanitize_coords_for_wcsph!(coords, cyl_sys)
+    end
     PointNeighbors.initialize!(nhs, coords, coords)
     return nhs
 end
@@ -4192,20 +5862,20 @@ end
 function compute_wcsph_current_density!(ρ_out, cyl_sys, coords, nhs)
     fill!(ρ_out, 0.0)
     h = smoothing_length
-    kern = smoothing_kernel
     h2_eps = eps(h * h)
 
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-        ρ_out[particle] += cyl_sys.mass[particle] * TrixiParticles.kernel(kern, 0.0, h)
+        ρ_out[particle] += cyl_sys.mass[particle] *
+            TrixiParticles.smoothing_kernel(cyl_sys, 0.0, particle)
     end
 
     PointNeighbors.foreach_point_neighbor(
         coords, coords, nhs;
-        parallelization_backend=TrixiParticles.PolyesterBackend(),
+        parallelization_backend=clip_parallelization_backend,
         points=TrixiParticles.each_integrated_particle(cyl_sys)
     ) do particle, neighbor, pos_diff, distance
         distance^2 < h2_eps && return
-        w = TrixiParticles.kernel(kern, distance, h)
+        w = TrixiParticles.smoothing_kernel(cyl_sys, distance, particle)
         @inbounds ρ_out[particle] += cyl_sys.mass[neighbor] * w
     end
 
@@ -4214,78 +5884,108 @@ end
 
 function apply_wcsph_liquid_pressure!(dv_ode, cyl_sys, semi_local)
     n_p = nparticles(cyl_sys)
+    nhs = clip_wcsph_nhs(semi_local)
     dv = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
-    kern = smoothing_kernel
     h = smoothing_length
     h2_eps = eps(h * h)
+    ρ0_buf = wcsph_rho0_buf
+    latent_w_buf = wcsph_latent_weight_buf
 
     if !wcsph_liquid_density_ref_initialized[]
         ref_coords = TrixiParticles.initial_coordinates(cyl_sys)
-        update_wcsph_current_nhs!(wcsph_current_nhs, ref_coords)
+        update_wcsph_current_nhs!(nhs, ref_coords; cyl_sys=cyl_sys, sanitize=false)
         compute_wcsph_current_density!(wcsph_liquid_density_ref_buf, cyl_sys,
-                                       ref_coords, wcsph_current_nhs)
+                                       ref_coords, nhs)
         wcsph_liquid_density_ref_initialized[] = true
     end
 
     # Pass 1: current-space SPH density sum (grid NHS at current coordinates).
     current_coords = cyl_sys.current_coordinates
-    update_wcsph_current_nhs!(wcsph_current_nhs, current_coords)
+    update_wcsph_current_nhs!(nhs, current_coords; cyl_sys=cyl_sys)
     ρ_curr = wcsph_liquid_density_curr_buf
-    compute_wcsph_current_density!(ρ_curr, cyl_sys, current_coords, wcsph_current_nhs)
+    compute_wcsph_current_density!(ρ_curr, cyl_sys, current_coords, nhs)
 
     # Pass 2: WC pressure from J = ρ_ref/ρ_curr (liquid-fraction weighted).
     p_wc = wcsph_pressure_buf
+    ρ_ref_buf = wcsph_liquid_density_ref_buf
+    mat_rho = cyl_sys.material_density
+    temp = cyl_sys.temp
     fill!(p_wc, 0.0)
     @inbounds for i in 1:n_p
         lf = liquid_fraction_particle_buf[i]
         lf < 1e-12 && continue
-        ρ_ref_i = max(wcsph_liquid_density_ref_buf[i], 1e-12 * cyl_sys.material_density[i])
+        ρ_ref_i = max(ρ_ref_buf[i], 1e-12 * mat_rho[i])
+        ρ0_buf[i] = ρ_ref_i
+        latent_w_buf[i] = wcsph_latent_window_weight(temp[i])
         ρc = max(ρ_curr[i], 1e-12 * ρ_ref_i)
         J = ρ_ref_i / ρc
-        K_liq = wcsph_liquid_bulk_modulus(cyl_sys.temp[i])
+        K_liq = wcsph_bulk_scale * wcsph_liquid_bulk_modulus(temp[i])
         p_raw = lf * wcsph_pressure_smooth(J, K_liq)
         p_wc[i] = min(p_raw, wcsph_pressure_cap * lf)
     end
 
     # Pass 3: WCSPH symmetric pressure force at current positions (grid NHS).
+    latent_force_min = wcsph_latent_force_min
     PointNeighbors.foreach_point_neighbor(
-        current_coords, current_coords, wcsph_current_nhs;
-        parallelization_backend=TrixiParticles.PolyesterBackend(),
+        current_coords, current_coords, nhs;
+        parallelization_backend=clip_parallelization_backend,
         points=TrixiParticles.each_integrated_particle(cyl_sys)
     ) do particle, neighbor, pos_diff, distance
         distance^2 < h2_eps && return
-        pi = p_wc[particle]
-        pj = p_wc[neighbor]
-        (pi <= 0.0 && pj <= 0.0) && return
+        pi = @inbounds p_wc[particle]
+        pj = @inbounds p_wc[neighbor]
+        (pi == 0.0 && pj == 0.0) && return
 
-        grad_W = TrixiParticles.kernel_grad(kern, pos_diff, distance, h)
-        ρ0i = max(wcsph_liquid_density_ref_buf[particle],
-                  1e-12 * cyl_sys.material_density[particle])
-        ρ0j = max(wcsph_liquid_density_ref_buf[neighbor],
-                  1e-12 * cyl_sys.material_density[neighbor])
-        mj = cyl_sys.mass[neighbor]
+        grad_W = TrixiParticles.smoothing_kernel_grad(cyl_sys, pos_diff, distance, particle)
+        ρ0i = @inbounds ρ0_buf[particle]
+        ρ0j = @inbounds ρ0_buf[neighbor]
+        mj = @inbounds cyl_sys.mass[neighbor]
 
         coeff = pi / (ρ0i * ρ0i) + pj / (ρ0j * ρ0j)
-        w_i = wcsph_latent_window_weight(cyl_sys.temp[particle])
-        w_j = wcsph_latent_window_weight(cyl_sys.temp[neighbor])
-        latent_scale = 1.0 - (1.0 - wcsph_latent_force_min) * max(w_i, w_j)
+        w_i = @inbounds latent_w_buf[particle]
+        w_j = @inbounds latent_w_buf[neighbor]
+        latent_scale = 1.0 - (1.0 - latent_force_min) * (w_i > w_j ? w_i : w_j)
         coeff *= latent_scale
 
-        @inbounds begin
-            dv[1, particle] -= mj * coeff * grad_W[1]
-            dv[3, particle] -= mj * coeff * grad_W[3]
+        pressure_dims = wcsph_pressure_force_dims(cyl_sys)
+        @inbounds for d in pressure_dims
+            dv[d, particle] -= mj * coeff * grad_W[d]
         end
     end
 
     scale = wcsph_ramp_scale[]
     if scale < 1.0 - 1.0e-12
+        pressure_dims = wcsph_pressure_force_dims(cyl_sys)
         @inbounds for i in 1:n_p
-            dv[1, i] *= scale
-            dv[3, i] *= scale
+            for d in pressure_dims
+                dv[d, i] *= scale
+            end
         end
     end
 
     return ρ_curr
+end
+
+function apply_wcsph_bulk_viscosity!(dv_ode, cyl_sys, semi_local)
+    ζ0 = wcsph_bulk_viscosity_pa_s
+    ζ0 <= 0.0 && return nothing
+    dv = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
+    nd = TrixiParticles.ndims(cyl_sys)
+    scale = wcsph_ramp_scale[]
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        solid_fraction_particle_buf[particle] >= solid_mechanics_solid_fraction_min && continue
+        lf = liquid_fraction_particle_buf[particle]
+        lf < 1e-12 && continue
+        L11 = vel_grad_buf[1, 1, particle]
+        L22 = vel_grad_buf[2, 2, particle]
+        L33 = vel_grad_buf[3, 3, particle]
+        div_v = L11 + L22 + L33
+        ζ = ζ0 * lf * scale
+        for d in 1:nd
+            dv[d, particle] -= ζ * div_v
+        end
+    end
+    return nothing
 end
 
 # ─── Eulerian (current-config) viscous force for liquid particles ──────────────
@@ -4302,44 +6002,54 @@ end
 # Particle pairs with both lf ≈ 0 contribute nothing (both τ_vis = 0).
 function apply_wcsph_liquid_viscosity!(dv_ode, v_ode, cyl_sys, semi_local, ρ_curr)
     n_p = nparticles(cyl_sys)
+    nhs = clip_wcsph_nhs(semi_local)
     dv = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
     v = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
-    kern = smoothing_kernel
     h = smoothing_length
     h2_eps = eps(h * h)
     current_coords = cyl_sys.current_coordinates
-    update_wcsph_current_nhs!(wcsph_current_nhs, current_coords)
+    update_wcsph_current_nhs!(nhs, current_coords; cyl_sys=cyl_sys)
+    nd = TrixiParticles.ndims(cyl_sys)
+    force_dims = wcsph_full3d_pressure ? (1:nd) : (1, 3)
 
-    # Step A: current-config velocity gradient L_curr (grid NHS).
+    lf_buf = liquid_fraction_particle_buf
+    rho_inv_buf = wcsph_rho0_buf
+    @inbounds for i in 1:n_p
+        rho_inv_buf[i] = 1.0 / max(ρ_curr[i], 1e-12)
+    end
+
     L_curr = wcsph_L_curr_buf
     fill!(L_curr, 0.0)
 
     PointNeighbors.foreach_point_neighbor(
-        current_coords, current_coords, wcsph_current_nhs;
-        parallelization_backend=TrixiParticles.PolyesterBackend(),
+        current_coords, current_coords, nhs;
+        parallelization_backend=clip_parallelization_backend,
         points=TrixiParticles.each_integrated_particle(cyl_sys)
     ) do particle, neighbor, pos_diff, distance
         distance^2 < h2_eps && return
-        lf_i = liquid_fraction_particle_buf[particle]
+        @inbounds lf_i = lf_buf[particle]
         lf_i < 1e-12 && return
 
-        grad_W = TrixiParticles.kernel_grad(kern, pos_diff, distance, h)
-        ρ_i = max(ρ_curr[particle], 1e-12)
-        mj = cyl_sys.mass[neighbor]
-        fac = mj / ρ_i
+        grad_W = TrixiParticles.smoothing_kernel_grad(cyl_sys, pos_diff, distance, particle)
+        fac = @inbounds cyl_sys.mass[neighbor] * rho_inv_buf[particle]
 
-        dvx = v[1, neighbor] - v[1, particle]
-        dvz = v[3, neighbor] - v[3, particle]
-
-        @inbounds begin
-            L_curr[1, 1, particle] += fac * dvx * grad_W[1]
-            L_curr[1, 2, particle] += fac * dvx * grad_W[3]
-            L_curr[2, 1, particle] += fac * dvz * grad_W[1]
-            L_curr[2, 2, particle] += fac * dvz * grad_W[3]
+        if wcsph_full3d_pressure
+            @inbounds for α in 1:nd, β in 1:nd
+                dα = v[α, neighbor] - v[α, particle]
+                L_curr[α, β, particle] += fac * dα * grad_W[β]
+            end
+        else
+            dvx = @inbounds v[1, neighbor] - v[1, particle]
+            dvz = @inbounds v[3, neighbor] - v[3, particle]
+            @inbounds begin
+                L_curr[1, 1, particle] += fac * dvx * grad_W[1]
+                L_curr[1, 2, particle] += fac * dvx * grad_W[3]
+                L_curr[2, 1, particle] += fac * dvz * grad_W[1]
+                L_curr[2, 2, particle] += fac * dvz * grad_W[3]
+            end
         end
     end
 
-    # Step B: τ_vis_i = 2η_i dev(sym(L_curr_i)) for liquid particles, with yield cap.
     tau_vis = wcsph_tau_vis_buf
     fill!(tau_vis, 0.0)
     @inbounds for i in 1:n_p
@@ -4347,76 +6057,104 @@ function apply_wcsph_liquid_viscosity!(dv_ode, v_ode, cyl_sys, semi_local, ρ_cu
         lf_i < 1e-12 && continue
         η = vis_particle_buf[i] * lf_i
 
-        L11 = L_curr[1, 1, i];  L13 = L_curr[1, 2, i]
-        L31 = L_curr[2, 1, i];  L33 = L_curr[2, 2, i]
-
-        div_v = L11 + L33
-        sym13 = 0.5 * (L13 + L31)
-
-        dev11 = L11 - div_v / 3.0
-        dev33 = L33 - div_v / 3.0
-
-        τ11 = 2 * η * dev11
-        τ13 = 2 * η * sym13
-        τ33 = 2 * η * dev33
-
-        τ_norm = sqrt(τ11 * τ11 + 2 * τ13 * τ13 + τ33 * τ33)
-        if τ_norm > matrix_yield_stress
-            scale = matrix_yield_stress / τ_norm
-            τ11 *= scale
-            τ13 *= scale
-            τ33 *= scale
+        if wcsph_full3d_pressure
+            L = StaticArrays.SMatrix{3, 3}(@view L_curr[:, :, i])
+            D = 0.5 * (L + L')
+            div_v = tr(D)
+            dev = D - div_v / 3.0 * StaticArrays.SMatrix{3, 3}(I)
+            tau = 2.0 * η * dev
+            τ_norm = sqrt(sum(abs2, tau))
+            if τ_norm > matrix_yield_stress
+                tau = tau * (matrix_yield_stress / τ_norm)
+            end
+            @inbounds for α in 1:nd, β in 1:nd
+                tau_vis[α, β, i] = tau[α, β]
+            end
+        else
+            L11 = L_curr[1, 1, i];  L13 = L_curr[1, 2, i]
+            L31 = L_curr[2, 1, i];  L33 = L_curr[2, 2, i]
+            div_v = L11 + L33
+            sym13 = 0.5 * (L13 + L31)
+            dev11 = L11 - div_v / 3.0
+            dev33 = L33 - div_v / 3.0
+            τ11 = 2 * η * dev11
+            τ13 = 2 * η * sym13
+            τ33 = 2 * η * dev33
+            τ_norm = sqrt(τ11 * τ11 + 2 * τ13 * τ13 + τ33 * τ33)
+            if τ_norm > matrix_yield_stress
+                scale = matrix_yield_stress / τ_norm
+                τ11 *= scale
+                τ13 *= scale
+                τ33 *= scale
+            end
+            tau_vis[1, 1, i] = τ11
+            tau_vis[1, 2, i] = τ13
+            tau_vis[2, 1, i] = τ13
+            tau_vis[2, 2, i] = τ33
         end
-
-        tau_vis[1, 1, i] = τ11
-        tau_vis[1, 2, i] = τ13
-        tau_vis[2, 1, i] = τ13
-        tau_vis[2, 2, i] = τ33
     end
 
-    # Step C: symmetric SPH divergence force (grid NHS; accumulate on particle only).
+    visc_accel_cap = wcsph_visc_pair_accel_cap
     PointNeighbors.foreach_point_neighbor(
-        current_coords, current_coords, wcsph_current_nhs;
-        parallelization_backend=TrixiParticles.PolyesterBackend(),
+        current_coords, current_coords, nhs;
+        parallelization_backend=clip_parallelization_backend,
         points=TrixiParticles.each_integrated_particle(cyl_sys)
     ) do particle, neighbor, pos_diff, distance
         distance^2 < h2_eps && return
-        lf_i = liquid_fraction_particle_buf[particle]
-        lf_j = liquid_fraction_particle_buf[neighbor]
+        @inbounds begin
+            lf_i = lf_buf[particle]
+            lf_j = lf_buf[neighbor]
+        end
         (lf_i < 1e-12 && lf_j < 1e-12) && return
 
-        grad_W = TrixiParticles.kernel_grad(kern, pos_diff, distance, h)
-        ρ_i = max(ρ_curr[particle], 1e-12)
-        ρ_j = max(ρ_curr[neighbor], 1e-12)
-        ρi2 = ρ_i * ρ_i
-        ρj2 = ρ_j * ρ_j
-        mj = cyl_sys.mass[neighbor]
-
-        cx = (tau_vis[1, 1, particle] / ρi2 + tau_vis[1, 1, neighbor] / ρj2) * grad_W[1] +
-             (tau_vis[1, 2, particle] / ρi2 + tau_vis[1, 2, neighbor] / ρj2) * grad_W[3]
-        cz = (tau_vis[2, 1, particle] / ρi2 + tau_vis[2, 1, neighbor] / ρj2) * grad_W[1] +
-             (tau_vis[2, 2, particle] / ρi2 + tau_vis[2, 2, neighbor] / ρj2) * grad_W[3]
-
-        ai_x = mj * cx
-        ai_z = mj * cz
-        ai_norm = sqrt(ai_x * ai_x + ai_z * ai_z)
-        if ai_norm > wcsph_visc_pair_accel_cap
-            ai_scale = wcsph_visc_pair_accel_cap / ai_norm
-            ai_x *= ai_scale
-            ai_z *= ai_scale
+        grad_W = TrixiParticles.smoothing_kernel_grad(cyl_sys, pos_diff, distance, particle)
+        @inbounds begin
+            ρi2_inv = rho_inv_buf[particle] * rho_inv_buf[particle]
+            ρj2_inv = rho_inv_buf[neighbor] * rho_inv_buf[neighbor]
+            mj = cyl_sys.mass[neighbor]
         end
 
-        @inbounds begin
-            dv[1, particle] += ai_x
-            dv[3, particle] += ai_z
+        ai_x = 0.0
+        ai_y = 0.0
+        ai_z = 0.0
+        @inbounds for α in force_dims
+            acc = 0.0
+            for β in force_dims
+                acc += (tau_vis[α, β, particle] * ρi2_inv +
+                        tau_vis[α, β, neighbor] * ρj2_inv) * grad_W[β]
+            end
+            if α == 1
+                ai_x = mj * acc
+            elseif α == 2
+                ai_y = mj * acc
+            else
+                ai_z = mj * acc
+            end
+        end
+        ai_norm = sqrt(ai_x * ai_x + ai_y * ai_y + ai_z * ai_z)
+        if ai_norm > visc_accel_cap
+            s = visc_accel_cap / ai_norm
+            ai_x *= s
+            ai_y *= s
+            ai_z *= s
+        end
+        @inbounds for α in force_dims
+            if α == 1
+                dv[1, particle] += ai_x
+            elseif α == 2
+                dv[2, particle] += ai_y
+            else
+                dv[3, particle] += ai_z
+            end
         end
     end
 
     scale = wcsph_ramp_scale[]
     if scale < 1.0 - 1.0e-12
         @inbounds for i in 1:n_p
-            dv[1, i] *= scale
-            dv[3, i] *= scale
+            for d in force_dims
+                dv[d, i] *= scale
+            end
         end
     end
 
@@ -4445,9 +6183,16 @@ function refresh_lagged_wcsph_liquid_viscosity!(cache, scratch_dv_ode, v_ode,
 end
 
 function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
+    clip_sync_trial_dt_state!()
     TrixiParticles.set_zero!(dv_ode)
     rhs_eval_count[] += 1
-    hold_tlsph_equilibration_now[] = hold_tlsph_tail_active(t)
+    if rhs_heartbeat_interval > 0 && rhs_eval_count[] % rhs_heartbeat_interval == 0
+        println(">>> RHS eval #", rhs_eval_count[], "  t=", round(t; digits=9),
+                "  trial_dt=", trial_dt_state[], " s")
+        flush(stdout)
+    end
+    hold_tlsph_equilibration_now[] = hold_tlsph_tail_active(t) ||
+        retraction_pre_lift_creep_active(t)
 
     if retraction_cfrp_style_active()
         return kick_implicit_cfrp_retraction!(dv_ode, v_ode, u_ode, semi_local, t)
@@ -4460,7 +6205,7 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
     # Pseudo-2D only: hard-zero v_y before force evaluation.
     # Thin-3D uses a spring-damper in compute_implicit_rhs! instead so that
     # AutoFiniteDiff sees ∂(dv_y)/∂v_y = -y_constraint_damp ≠ 0  (non-singular Jacobian).
-    if use_pseudo2d_projection
+    if hard_lock_y_kinematics()
         TrixiParticles.foreach_system(semi_local) do system
             v_sys = TrixiParticles.wrap_v(v_ode, system, semi_local)
             @inbounds for particle in TrixiParticles.each_integrated_particle(system)
@@ -4474,6 +6219,8 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
             v_cyl[1, particle] = soft_limit(v_cyl[1, particle], max_cylinder_speed)
             v_cyl[3, particle] = soft_limit(v_cyl[3, particle], max_cylinder_speed)
         end
+    end
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
         t_trial = v_cyl[NDIMS_CYL + 1, particle]
         if !isfinite(t_trial)
             t_trial = cyl_sys.temp[particle]
@@ -4488,34 +6235,45 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
     floor_sys = semi_local.systems[2]
     mold_sys  = semi_local.systems[3]
 
-    # force_stage_diag = t > diag_force_stage_start_t &&
-    #                    t > diag_force_stage_last_t[] + diag_force_stage_dt
-    force_stage_diag = false
-    force_stage_prev = nothing
-    # if force_stage_diag
-    #     diag_force_stage_last_t[] = t
-    #     println(stderr, "\n>>> FORCE-STAGE-DIAG t=", round(t; digits=9),
-    #             " trial_dt=", trial_dt_state[],
-    #             " n_particles=", nparticles(cyl_sys))
-    # end
+    force_stage_diag = force_stage_diag_enabled &&
+                       t > diag_force_stage_start_t &&
+                       t > diag_force_stage_last_t[] + diag_force_stage_dt
+    force_stage_prev = force_stage_diag ?
+                       copy(TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)) :
+                       nothing
+    if force_stage_diag
+        diag_force_stage_last_t[] = t
+        println(stderr, "\n>>> FORCE-STAGE-DIAG t=", round(t; digits=9),
+                " trial_dt=", trial_dt_state[],
+                " n_particles=", nparticles(cyl_sys))
+    end
 
     try
         t_pos_start = time_ns()
-        TrixiParticles.foreach_system(semi_local) do system
+        clip_sync_tool_kinematics_gpu!(semi_local, t)
+        # Charge positions depend on trial `u` and must update every RHS.
+        # Tool positions/kinematics depend only on `t` and can be cached across repeated RHS
+        # evaluations at the same `t` (Newton iterations, Jacobian fills).
+        do_tool_pos = !clip_tool_pos_quant_cache || (t != clip_tool_pos_updated_at_t[])
+        for (sys_idx, system) in enumerate(semi_local.systems)
             v = TrixiParticles.wrap_v(v_ode, system, semi_local)
             u = TrixiParticles.wrap_u(u_ode, system, semi_local)
-            TrixiParticles.update_positions!(system, v, u, v_ode, u_ode, semi_local, t)
+            if sys_idx == 1 || do_tool_pos
+                TrixiParticles.update_positions!(system, v, u, v_ode, u_ode, semi_local, t)
+            end
         end
+        do_tool_pos && (clip_tool_pos_updated_at_t[] = t)
 
         # Safety clamp for charge coordinates during nonlinear iterations.
         if apply_coordinate_safety_clamps()
+            coords_cyl = cyl_sys.current_coordinates
             @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-                cyl_sys.current_coordinates[1, particle] = clamp(cyl_sys.current_coordinates[1, particle],
-                                                                 -x_safety_bound, x_safety_bound)
-                cyl_sys.current_coordinates[3, particle] = clamp(cyl_sys.current_coordinates[3, particle],
-                                                                 z_safety_min, z_safety_max)
+                coords_cyl[1, particle] = clamp(coords_cyl[1, particle],
+                                                -x_safety_bound, x_safety_bound)
+                coords_cyl[3, particle] = clamp(coords_cyl[3, particle],
+                                                  z_safety_min, z_safety_max)
                 if use_pseudo2d_projection
-                    cyl_sys.current_coordinates[2, particle] = 0.0
+                    coords_cyl[2, particle] = 0.0
                 end
             end
         end
@@ -4531,18 +6289,34 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         end
         if retraction_started[] && !retraction_elastic_ramp_announced[]
             retraction_elastic_ramp_announced[] = true
-            println(">>> Retraction ramp at t=", round(t; digits=6),
-                    " s (contact/hold-release ", retraction_hold_release_s,
-                    " s; elastic σ ramp ", retraction_elastic_ramp_s,
-                    " s; kinematics ramp ", retraction_kinematics_release_s,
-                    " s; solid TLSPH only)")
+            if retraction_pre_lift_creep_s > 0.0
+                println(">>> Pre-lift physics ramp at t=", round(t; digits=6),
+                        " s (σ/contact over ",
+                        round(retraction_pre_lift_creep_s * retraction_pre_lift_elastic_frac; digits=4),
+                        " s; kin over ", round(retraction_pre_lift_creep_s; digits=4),
+                        " s; mold fixed; hold_creep ON)")
+            else
+                println(">>> Retraction at t=", round(t; digits=6),
+                        " s (contact ",
+                        retraction_mech_ramp_instant ? "instant-on" :
+                            "ramp " * string(retraction_hold_release_s) * " s",
+                        "; elastic σ ",
+                        retraction_elastic_ramp_instant ? "instant-on" :
+                            "ramp " * string(retraction_elastic_ramp_s) * " s",
+                        "; kinematics ramp ", retraction_kinematics_release_s,
+                        " s; mold lift kin-scaled; solid TLSPH only)")
+            end
             flush(stdout)
         end
         wcsph_ramp_scale[] = wcsph_mechanics_active() ?
                              charge_wcsph_ramp_scale_value(cyl_sys) : 0.0
 
         t_nhs_start = time_ns()
-        if t != nhs_updated_at_t[]
+        # Colored/sparse Jacobian: optional per-perturbation NHS refresh (TP_CLIP_JAC_NHS_REFRESH=1).
+        # Default freezes NHS at the trial state, matching dense AutoFiniteDiff.
+        if clip_in_jacobian_fill[] && clip_jac_nhs_refresh
+            TrixiParticles.update_nhs!(semi_local, u_ode)
+        elseif t != nhs_updated_at_t[] || (clip_ode_flat[] && CURRENT_JACOBIAN_STRATEGY[] == "matrix_free")
             TrixiParticles.update_nhs!(semi_local, u_ode)
             nhs_updated_at_t[] = t
         end
@@ -4551,11 +6325,15 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         TrixiParticles.TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM[] = objectid(cyl_sys)
 
         t_quant_start = time_ns()
-        for system in semi_local.systems
+        do_tool_quant = !clip_tool_pos_quant_cache || (t != clip_tool_quant_updated_at_t[])
+        for (sys_idx, system) in enumerate(semi_local.systems)
             v = TrixiParticles.wrap_v(v_ode, system, semi_local)
             u = TrixiParticles.wrap_u(u_ode, system, semi_local)
-            TrixiParticles.update_quantities!(system, v, u, v_ode, u_ode, semi_local, t)
+            if sys_idx == 1 || do_tool_quant
+                TrixiParticles.update_quantities!(system, v, u, v_ode, u_ode, semi_local, t)
+            end
         end
+        do_tool_quant && (clip_tool_quant_updated_at_t[] = t)
         rhs_time_quant_ns[] += time_ns() - t_quant_start
 
         apply_charge_plane_strain_F_fix!(cyl_sys)
@@ -4572,16 +6350,18 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
             worst_J_particle = 0
             J_min = enable_elastic_stress ? 2.0e-1 : 5.0e-2
             J_max = enable_elastic_stress ? 5.0 : 10.0
+            deform_cyl = cyl_sys.deformation_grad
+            coords_cyl = cyl_sys.current_coordinates
             @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-                F11 = cyl_sys.deformation_grad[1, 1, particle]
-                F12 = cyl_sys.deformation_grad[1, 2, particle]
-                F13 = cyl_sys.deformation_grad[1, 3, particle]
-                F21 = cyl_sys.deformation_grad[2, 1, particle]
-                F22 = cyl_sys.deformation_grad[2, 2, particle]
-                F23 = cyl_sys.deformation_grad[2, 3, particle]
-                F31 = cyl_sys.deformation_grad[3, 1, particle]
-                F32 = cyl_sys.deformation_grad[3, 2, particle]
-                F33 = cyl_sys.deformation_grad[3, 3, particle]
+                F11 = deform_cyl[1, 1, particle]
+                F12 = deform_cyl[1, 2, particle]
+                F13 = deform_cyl[1, 3, particle]
+                F21 = deform_cyl[2, 1, particle]
+                F22 = deform_cyl[2, 2, particle]
+                F23 = deform_cyl[2, 3, particle]
+                F31 = deform_cyl[3, 1, particle]
+                F32 = deform_cyl[3, 2, particle]
+                F33 = deform_cyl[3, 3, particle]
                 J = F11 * (F22 * F33 - F23 * F32) -
                     F12 * (F21 * F33 - F23 * F31) +
                     F13 * (F21 * F32 - F22 * F31)
@@ -4590,15 +6370,15 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
                     worst_J_particle = particle
                 end
                 if !isfinite(J) || J <= J_min || J >= J_max
-                    cyl_sys.deformation_grad[1, 1, particle] = 1.0
-                    cyl_sys.deformation_grad[1, 2, particle] = 0.0
-                    cyl_sys.deformation_grad[1, 3, particle] = 0.0
-                    cyl_sys.deformation_grad[2, 1, particle] = 0.0
-                    cyl_sys.deformation_grad[2, 2, particle] = 1.0
-                    cyl_sys.deformation_grad[2, 3, particle] = 0.0
-                    cyl_sys.deformation_grad[3, 1, particle] = 0.0
-                    cyl_sys.deformation_grad[3, 2, particle] = 0.0
-                    cyl_sys.deformation_grad[3, 3, particle] = 1.0
+                    deform_cyl[1, 1, particle] = 1.0
+                    deform_cyl[1, 2, particle] = 0.0
+                    deform_cyl[1, 3, particle] = 0.0
+                    deform_cyl[2, 1, particle] = 0.0
+                    deform_cyl[2, 2, particle] = 1.0
+                    deform_cyl[2, 3, particle] = 0.0
+                    deform_cyl[3, 1, particle] = 0.0
+                    deform_cyl[3, 2, particle] = 0.0
+                    deform_cyl[3, 3, particle] = 1.0
                     if enable_elastic_stress
                         Fp_committed[][1, 1, particle] = 1.0
                         Fp_committed[][1, 2, particle] = 0.0
@@ -4620,15 +6400,15 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
                     u_cyl[3, particle] = clamp(u_cyl[3, particle], z_safety_min,
                                                z_safety_max)
 
-                    cyl_sys.current_coordinates[1, particle] = clamp(cyl_sys.current_coordinates[1, particle],
-                                                                     -x_safety_bound,
-                                                                     x_safety_bound)
+                    coords_cyl[1, particle] = clamp(coords_cyl[1, particle],
+                                                    -x_safety_bound,
+                                                    x_safety_bound)
                     if use_pseudo2d_projection
-                        cyl_sys.current_coordinates[2, particle] = 0.0
+                        coords_cyl[2, particle] = 0.0
                     end
-                    cyl_sys.current_coordinates[3, particle] = clamp(cyl_sys.current_coordinates[3, particle],
-                                                                     z_safety_min,
-                                                                     z_safety_max)
+                    coords_cyl[3, particle] = clamp(coords_cyl[3, particle],
+                                                    z_safety_min,
+                                                    z_safety_max)
 
                     v_cyl[1, particle] = 0.0
                     v_cyl[2, particle] = 0.0
@@ -4696,60 +6476,191 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         rhs_time_stress_cache_ns[] += time_ns() - t_stress_cache_start
 
         update_retraction_contact_e_scale!(t)
-        t_system_interaction_start = time_ns()
-        system_interaction_ramped!(dv_ode, v_ode, u_ode, semi_local, floor_act, mold_act)
-        rhs_time_system_interaction_ns[] += time_ns() - t_system_interaction_start
-        if force_stage_diag
-            print_force_stage_delta!("system_interaction", force_stage_prev, dv_ode,
-                                     cyl_sys, semi_local, t)
-        end
-
-        t_source_terms_start = time_ns()
-        TrixiParticles.add_source_terms!(dv_ode, v_ode, u_ode, semi_local, t)
-        rhs_time_source_terms_ns[] += time_ns() - t_source_terms_start
-        if force_stage_diag
-            print_force_stage_delta!("source_terms", force_stage_prev, dv_ode,
-                                     cyl_sys, semi_local, t)
-        end
-
-        # WCSPH bulk for mushy/liquid particles (skipped when TP_CLIP_DISABLE_WCSPH=1 or
-        # TP_CLIP_RETRACTION_TLSPH_ONLY=1 during retraction-only runs).
-        if wcsph_mechanics_active()
-            t_wcsph_p_start = time_ns()
-            ρ_curr_liquid = apply_wcsph_liquid_pressure!(dv_ode, cyl_sys, semi_local)
-            rhs_time_wcsph_pressure_ns[] += time_ns() - t_wcsph_p_start
+        snapshot_charge_dv!(clip_contact_dv_pre_snap, dv_ode, cyl_sys, semi_local)
+        if clip_contact_freeze_restore_active(t)
+            clip_apply_cached_contact_increment!(dv_ode, cyl_sys, semi_local)
+        else
+            t_system_interaction_start = time_ns()
+            system_interaction_ramped!(dv_ode, v_ode, u_ode, semi_local, floor_act, mold_act)
+            rhs_time_system_interaction_ns[] += time_ns() - t_system_interaction_start
             if force_stage_diag
-                print_force_stage_delta!("wcsph_pressure", force_stage_prev, dv_ode,
+                print_force_stage_delta!("system_interaction", force_stage_prev, dv_ode,
                                          cyl_sys, semi_local, t)
             end
-            if enable_wcsph_liquid_viscosity && lag_wcsph_liquid_viscosity
-                t_wcsph_v_start = time_ns()
-                dv_cyl_lag = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
-                wcsph_scale = wcsph_ramp_scale[]
-                @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-                    dv_cyl_lag[1, particle] += wcsph_scale * wcsph_visc_lagged_dv_buf[1, particle]
-                    dv_cyl_lag[2, particle] += wcsph_scale * wcsph_visc_lagged_dv_buf[2, particle]
-                    dv_cyl_lag[3, particle] += wcsph_scale * wcsph_visc_lagged_dv_buf[3, particle]
+
+            t_source_terms_start = time_ns()
+            TrixiParticles.add_source_terms!(dv_ode, v_ode, u_ode, semi_local, t)
+            rhs_time_source_terms_ns[] += time_ns() - t_source_terms_start
+            if force_stage_diag
+                print_force_stage_delta!("source_terms", force_stage_prev, dv_ode,
+                                         cyl_sys, semi_local, t)
+            end
+
+            # WCSPH bulk for mushy/liquid particles (skipped when TP_CLIP_DISABLE_WCSPH=1 or
+            # TP_CLIP_RETRACTION_TLSPH_ONLY=1 during retraction-only runs).
+            if wcsph_mechanics_active()
+                t_wcsph_p_start = time_ns()
+                ρ_curr_liquid = apply_wcsph_liquid_pressure!(dv_ode, cyl_sys, semi_local)
+                rhs_time_wcsph_pressure_ns[] += time_ns() - t_wcsph_p_start
+                if force_stage_diag
+                    print_force_stage_delta!("wcsph_pressure", force_stage_prev, dv_ode,
+                                             cyl_sys, semi_local, t)
                 end
-                rhs_time_wcsph_viscosity_ns[] += time_ns() - t_wcsph_v_start
-            elseif enable_wcsph_liquid_viscosity
-                t_wcsph_v_start = time_ns()
-                apply_wcsph_liquid_viscosity!(dv_ode, v_ode, cyl_sys, semi_local, ρ_curr_liquid)
-                rhs_time_wcsph_viscosity_ns[] += time_ns() - t_wcsph_v_start
+                if wcsph_bulk_viscosity_pa_s > 0.0
+                    apply_wcsph_bulk_viscosity!(dv_ode, cyl_sys, semi_local)
+                end
+                if enable_wcsph_liquid_viscosity && lag_wcsph_liquid_viscosity
+                    t_wcsph_v_start = time_ns()
+                    dv_cyl_lag = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
+                    wcsph_scale = wcsph_ramp_scale[]
+                    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+                        dv_cyl_lag[1, particle] += wcsph_scale * wcsph_visc_lagged_dv_buf[1, particle]
+                        dv_cyl_lag[2, particle] += wcsph_scale * wcsph_visc_lagged_dv_buf[2, particle]
+                        dv_cyl_lag[3, particle] += wcsph_scale * wcsph_visc_lagged_dv_buf[3, particle]
+                    end
+                    rhs_time_wcsph_viscosity_ns[] += time_ns() - t_wcsph_v_start
+                elseif enable_wcsph_liquid_viscosity
+                    t_wcsph_v_start = time_ns()
+                    apply_wcsph_liquid_viscosity!(dv_ode, v_ode, cyl_sys, semi_local, ρ_curr_liquid)
+                    rhs_time_wcsph_viscosity_ns[] += time_ns() - t_wcsph_v_start
+                end
+                if force_stage_diag
+                    print_force_stage_delta!("wcsph_viscosity", force_stage_prev, dv_ode,
+                                             cyl_sys, semi_local, t)
+                end
             end
-            if force_stage_diag
-                print_force_stage_delta!("wcsph_viscosity", force_stage_prev, dv_ode,
-                                         cyl_sys, semi_local, t)
-            end
+            clip_capture_contact_increment!(dv_ode, clip_contact_dv_pre_snap, cyl_sys, semi_local, t)
         end
 
         blend_charge_dv_from_marker!(dv_ode, cyl_sys, semi_local,
                                      charge_dv_mech_marker_buf, mech_dv_scale)
 
-        # # ── ONE-SHOT STIFFNESS DIAGNOSTIC (disabled) ────────────────────────────────
-        # if t > diag_stiff_last_t[] + 1e-4
-        #     ...
-        # end
+        # ── STIFFNESS DIAGNOSTIC (TP_CLIP_STIFF_DIAG / TP_CLIP_STALL_DIAG) ─────────
+        if stiff_diag_enabled && t >= stiff_diag_start_t && t > diag_stiff_last_t[] + 1e-4
+            diag_stiff_last_t[] = t
+            n_diag = nparticles(cyl_sys)
+
+            max_sig_e = 0.0; pid_e = 0
+            max_sig_v = 0.0; pid_v = 0
+            max_dv_x  = 0.0; pid_dv = 0
+            max_p_wc  = 0.0; pid_p = 0
+            min_J_wc  = Inf
+            max_J_wc  = 0.0
+
+            dv_diag = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
+            NDIMS_D = TrixiParticles.ndims(cyl_sys)
+
+            @inbounds for p in 1:n_diag
+                sig_e = 0.0; sig_v = 0.0
+                for jj in 1:3, ii in 1:3
+                    de = v_stress_buf[ii, jj, p] - v_stress_viscous_buf[ii, jj, p]
+                    sig_e += de * de
+                    sig_v += v_stress_viscous_buf[ii, jj, p]^2
+                end
+                sig_e = sqrt(sig_e); sig_v = sqrt(sig_v)
+                if sig_e > max_sig_e; max_sig_e = sig_e; pid_e = p; end
+                if sig_v > max_sig_v; max_sig_v = sig_v; pid_v = p; end
+
+                dvp = sqrt(dv_diag[1, p]^2 + dv_diag[NDIMS_D, p]^2)
+                if dvp > max_dv_x; max_dv_x = dvp; pid_dv = p; end
+
+                if wcsph_pressure_buf[p] > max_p_wc
+                    max_p_wc = wcsph_pressure_buf[p]
+                    pid_p = p
+                end
+                if wcsph_liquid_density_ref_initialized[]
+                    ρ_ref_i = max(wcsph_liquid_density_ref_buf[p],
+                                  1e-12 * cyl_sys.material_density[p])
+                    ρc = max(wcsph_liquid_density_curr_buf[p], 1e-12 * ρ_ref_i)
+                    J_wc = ρ_ref_i / ρc
+                    min_J_wc = min(min_J_wc, J_wc)
+                    max_J_wc = max(max_J_wc, J_wc)
+                end
+            end
+
+            println(stderr, "\n>>> STIFF-DIAG  t=", round(t; digits=9),
+                    "  n_particles=", n_diag,
+                    "  WCSPH J∈[", isfinite(min_J_wc) ? round(min_J_wc; digits=4) : "n/a",
+                    ", ", isfinite(max_J_wc) ? round(max_J_wc; digits=4) : "n/a", "]",
+                    "  p_wc_max=", round(max_p_wc / 1e6; digits=1), " MPa")
+
+            if pid_e > 0
+                p = pid_e
+                F11 = cyl_sys.deformation_grad[1, 1, p]; F13 = cyl_sys.deformation_grad[1, 3, p]
+                F31 = cyl_sys.deformation_grad[3, 1, p]; F33 = cyl_sys.deformation_grad[3, 3, p]
+                J_p = F11 * F33 - F13 * F31
+                Fp_p = Fp_committed[]
+                Fpe11 = Fp_p[1, 1, p]; Fpe13 = Fp_p[1, 3, p]
+                Fpe31 = Fp_p[3, 1, p]; Fpe33 = Fp_p[3, 3, p]
+                det_Fp = Fpe11 * Fpe33 - Fpe13 * Fpe31
+                n_ref = StaticArrays.SVector(fiber_direction[1, p], fiber_direction[2, p],
+                                           fiber_direction[3, p])
+                F3 = StaticArrays.SMatrix{3, 3}(
+                    cyl_sys.deformation_grad[1, 1, p], cyl_sys.deformation_grad[2, 1, p],
+                    cyl_sys.deformation_grad[3, 1, p], cyl_sys.deformation_grad[1, 2, p],
+                    cyl_sys.deformation_grad[2, 2, p], cyl_sys.deformation_grad[3, 2, p],
+                    cyl_sys.deformation_grad[1, 3, p], cyl_sys.deformation_grad[2, 3, p],
+                    cyl_sys.deformation_grad[3, 3, p])
+                Fn_p = F3 * n_ref
+                I4_p = dot(Fn_p, Fn_p)
+                println(stderr, "  MAX ELASTIC  p=", p,
+                        "  |σ_e|=", round(max_sig_e / 1e6; digits=1), " MPa",
+                        "  T=", round(cyl_sys.temp[p]; digits=1), " K",
+                        "  lf=", round(liquid_fraction_particle_buf[p]; digits=3),
+                        "  sf=", round(solid_fraction_particle_buf[p]; digits=3),
+                        "  J=", round(J_p; digits=4),
+                        "  det(Fp)=", round(det_Fp; digits=4),
+                        "  I4=", round(I4_p; digits=4),
+                        "  k_fiber=", round(k_fiber_particle[p] / 1e9; digits=2), " GPa")
+            end
+
+            if pid_v > 0
+                p = pid_v
+                println(stderr, "  MAX VISCOUS  p=", p,
+                        "  |σ_v|=", round(max_sig_v / 1e6; digits=1), " MPa",
+                        "  T=", round(cyl_sys.temp[p]; digits=1), " K",
+                        "  lf=", round(liquid_fraction_particle_buf[p]; digits=3),
+                        "  vis=", round(vis_particle_buf[p]; digits=1), " Pa·s")
+            end
+
+            if pid_p > 0
+                p = pid_p
+                println(stderr, "  MAX WCSPH p  p=", p,
+                        "  p=", round(wcsph_pressure_buf[p] / 1e6; digits=1), " MPa",
+                        "  lf=", round(liquid_fraction_particle_buf[p]; digits=3),
+                        "  T=", round(cyl_sys.temp[p]; digits=1), " K")
+            end
+
+            if pid_dv > 0
+                p = pid_dv
+                println(stderr, "  MAX |dv|     p=", p,
+                        "  |dv|=", round(max_dv_x; digits=2), " m/s²",
+                        "  T=", round(cyl_sys.temp[p]; digits=1), " K",
+                        "  lf=", round(liquid_fraction_particle_buf[p]; digits=3),
+                        "  pos=(", round(cyl_sys.current_coordinates[1, p] * 1e3; digits=2),
+                        ", ", round(cyl_sys.current_coordinates[3, p] * 1e3; digits=2), ") mm")
+            end
+
+            sig_e_all = Vector{Tuple{Float64, Int}}(undef, n_diag)
+            @inbounds for pp in 1:n_diag
+                se = 0.0
+                for jj in 1:3, ii in 1:3
+                    de = v_stress_buf[ii, jj, pp] - v_stress_viscous_buf[ii, jj, pp]
+                    se += de * de
+                end
+                sig_e_all[pp] = (sqrt(se), pp)
+            end
+            sort!(sig_e_all; by=x -> x[1], rev=true)
+            println(stderr, "  TOP-5 elastic stress particles (MPa / T / lf):")
+            for (se, pp) in sig_e_all[1:min(5, n_diag)]
+                println(stderr, "    p=", pp,
+                        "  |σ_e|=", round(se / 1e6; digits=1),
+                        "  T=", round(cyl_sys.temp[pp]; digits=1),
+                        "  lf=", round(liquid_fraction_particle_buf[pp]; digits=3))
+            end
+            flush(stderr)
+        end
+        # ── END STIFFNESS DIAGNOSTIC ────────────────────────────────────────────────
 
         rhs_time_stress_interact_ns[] += time_ns() - t_stress_interact_start
     finally
@@ -4767,49 +6678,70 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         end
     else
         t_thermal_start = time_ns()
-        # Tool–charge HTC (floor + punch faces): always on; active when particle–tool gap ≤ ps.
-        t_contact_heat_start = time_ns()
-        contact_heat_flux = compute_contact_heat_flux!(contact_heat_flux_buf, cyl_sys,
-                                                       floor_sys, mold_sys, particle_spacing)
-        rhs_time_contact_heat_ns[] += time_ns() - t_contact_heat_start
+        if clip_thermal_freeze_restore!(dv_cyl, cyl_sys, t)
+            if force_stage_diag
+                print_force_stage_delta!("thermal_and_contact_heat", force_stage_prev, dv_ode,
+                                         cyl_sys, semi_local, t)
+            end
+            rhs_time_thermal_ns[] += time_ns() - t_thermal_start
+        else
+            # Tool–charge HTC (floor + punch faces): always on; active when particle–tool gap ≤ ps.
+            t_contact_heat_start = time_ns()
+            contact_heat_flux = compute_contact_heat_flux!(contact_heat_flux_buf, cyl_sys,
+                                                           floor_sys, mold_sys, particle_spacing)
+            rhs_time_contact_heat_ns[] += time_ns() - t_contact_heat_start
 
-        t_thermal_sph_start = time_ns()
-        TrixiParticles.thermal_rhs_sph3d!(cyl_sys, dv_cyl, v_cyl, 0.0,
-                                          particle_spacing, bound_coordinate_thermal, semi_local)
-        rhs_time_thermal_sph_ns[] += time_ns() - t_thermal_sph_start
-        if use_nakamura_kinetics && !retraction_solid_mechanics_only()
-            t_nak_rhs_start = time_ns()
-        end
-        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-            T_i    = cyl_sys.temp[particle]
-            cp_eff = effective_heat_capacity_particle(T_i, particle)
-            dv_cyl[NDIMS_CYL + 1, particle] *= cyl_sys.cp / cp_eff
-            # Nakamura latent heat off during solid retraction (α ≈ 1 already).
+            t_thermal_sph_start = time_ns()
+            TrixiParticles.thermal_rhs_sph3d!(cyl_sys, dv_cyl, v_cyl, 0.0,
+                                              particle_spacing, bound_coordinate_thermal, semi_local)
+            rhs_time_thermal_sph_ns[] += time_ns() - t_thermal_sph_start
             if use_nakamura_kinetics && !retraction_solid_mechanics_only()
-                α_i    = crystallinity_particle_buf[particle]
-                dα_dt  = nakamura_dalpha_dt(clamp(T_i, temp_min_clip, temp_max_clip), α_i)
-                L_i    = latent_heat_particle[particle]
-                cp_i   = cp_particle[particle]
-                dv_cyl[NDIMS_CYL + 1, particle] += L_i * dα_dt / cp_i
+                t_nak_rhs_start = time_ns()
             end
-            if contact_heat_flux[particle] != 0.0
-                rho_i = cyl_sys.material_density[particle]
-                dv_cyl[NDIMS_CYL + 1, particle] -= contact_heat_flux[particle] /
-                                                  (rho_i * cp_eff * particle_spacing)
+            @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+                T_i    = cyl_sys.temp[particle]
+                cp_eff = effective_heat_capacity_particle(T_i, particle)
+                dv_cyl[NDIMS_CYL + 1, particle] *= cyl_sys.cp / cp_eff
+                # Nakamura latent heat off during solid retraction (α ≈ 1 already).
+                if use_nakamura_kinetics && !retraction_solid_mechanics_only()
+                    α_i    = crystallinity_particle_buf[particle]
+                    dα_dt  = nakamura_dalpha_dt(clamp(T_i, temp_min_clip, temp_max_clip), α_i)
+                    L_i    = latent_heat_particle[particle]
+                    cp_i   = cp_particle[particle]
+                    dv_cyl[NDIMS_CYL + 1, particle] += L_i * dα_dt / cp_i
+                end
+                if contact_heat_flux[particle] != 0.0
+                    rho_i = cyl_sys.material_density[particle]
+                    dv_cyl[NDIMS_CYL + 1, particle] -= contact_heat_flux[particle] /
+                                                      (rho_i * cp_eff * particle_spacing)
+                end
+                if use_ambient_heat_loss
+                    exposure = charge_boundary_exposure[particle]
+                    if exposure > 0.0
+                        rho_i = cyl_sys.material_density[particle]
+                        flux_conv = h_ambient * (T_i - temp_ambient)
+                        flux_rad = stefan_boltzmann * emissivity_charge * (T_i^4 - temp_ambient^4)
+                        dT_dt_loss = exposure * (flux_conv + flux_rad) / (rho_i * cp_eff * particle_spacing)
+                        dv_cyl[NDIMS_CYL + 1, particle] -= dT_dt_loss
+                    end
+                end
             end
+            if use_nakamura_kinetics && !retraction_solid_mechanics_only()
+                rhs_time_nakamura_rhs_ns[] += time_ns() - t_nak_rhs_start
+            end
+            clip_thermal_freeze_capture!(dv_cyl, cyl_sys, t)
+            if force_stage_diag
+                print_force_stage_delta!("thermal_and_contact_heat", force_stage_prev, dv_ode,
+                                         cyl_sys, semi_local, t)
+            end
+            rhs_time_thermal_ns[] += time_ns() - t_thermal_start
         end
-        if use_nakamura_kinetics && !retraction_solid_mechanics_only()
-            rhs_time_nakamura_rhs_ns[] += time_ns() - t_nak_rhs_start
-        end
-        if force_stage_diag
-            print_force_stage_delta!("thermal_and_contact_heat", force_stage_prev, dv_ode,
-                                     cyl_sys, semi_local, t)
-        end
-        rhs_time_thermal_ns[] += time_ns() - t_thermal_start
         dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
     end
 
-    if tool_wall_coupling_active(t)
+    if tool_wall_coupling_active(t) && !imex_soft_terms
+        bh_sys = blankholder_neighbor_system[]
+        resting_buf = charge_resting_on_shelf_buf[]
         @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
             x_i = cyl_sys.current_coordinates[1, particle]
             z_i = cyl_sys.current_coordinates[3, particle]
@@ -4817,10 +6749,18 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
             gap_mold_drag = tool_surface_gap(mold_sys, x_i, z_i, particle_spacing; side=:upper)
             near_floor = gap_floor_drag <= contact_damp_dist
             near_mold = gap_mold_drag <= contact_damp_dist
+            near_blankholder = false
+            gap_bh_drag = Inf
+            if bh_sys !== nothing && resting_buf !== nothing && particle <= length(resting_buf) &&
+               resting_buf[particle]
+                gap_bh_drag = tool_surface_gap(bh_sys, x_i, z_i, particle_spacing; side=:upper)
+                near_blankholder = gap_bh_drag <= contact_damp_dist
+            end
 
             # Molten wall no-slip drag (off during solid retraction).
             lf_wall = liquid_fraction_particle_buf[particle]
-            if !retraction_solid_mechanics_only() && lf_wall > 1.0e-4 && (near_floor || near_mold)
+            if !retraction_solid_mechanics_only() && lf_wall > 1.0e-4 &&
+               (near_floor || near_mold || near_blankholder)
                 ρ_i = cyl_sys.material_density[particle]
                 η_i = vis_particle_buf[particle]
                 drag_rate = molten_wall_drag_factor * lf_wall * η_i /
@@ -4831,6 +6771,7 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
                     act = 1.0 - clamp(gap_floor_drag / max(contact_damp_dist, eps(Float64)), 0.0, 1.0)
                     act = act * act * (3.0 - 2.0 * act)
                     dv_cyl[1, particle] -= act * drag_rate * v_cyl[1, particle]
+                    dv_cyl[2, particle] -= act * drag_rate * v_cyl[2, particle]
                     dv_cyl[3, particle] -= act * drag_rate * v_cyl[3, particle]
                 end
 
@@ -4839,12 +6780,21 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
                     act = act * act * (3.0 - 2.0 * act)
                     v_wall_z = mold_z_velocity_at_time(t)
                     dv_cyl[1, particle] -= act * drag_rate * v_cyl[1, particle]
+                    dv_cyl[2, particle] -= act * drag_rate * v_cyl[2, particle]
                     dv_cyl[3, particle] -= act * drag_rate * (v_cyl[3, particle] - v_wall_z)
+                end
+
+                if near_blankholder
+                    act = 1.0 - clamp(gap_bh_drag / max(contact_damp_dist, eps(Float64)), 0.0, 1.0)
+                    act = act * act * (3.0 - 2.0 * act)
+                    dv_cyl[1, particle] -= act * drag_rate * v_cyl[1, particle]
+                    dv_cyl[2, particle] -= act * drag_rate * v_cyl[2, particle]
+                    dv_cyl[3, particle] -= act * drag_rate * v_cyl[3, particle]
                 end
             end
 
             # Coulomb friction at tool–part contact (solid-fraction weighted).
-            if near_floor || near_mold
+            if near_floor || near_mold || near_blankholder
                 sf = solid_fraction_particle_buf[particle]
                 if sf > 1.0e-4
                     mu_eff   = mu_friction * sf
@@ -4872,6 +6822,9 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         # forcing TRBDF2 into nanosecond dt around the melt transition.
         if solid_fraction_particle_buf[particle] < solid_mechanics_solid_fraction_min
             dv_cyl[1, particle] = soft_limit(dv_cyl[1, particle], max_liquid_accel)
+            if wcsph_full3d_pressure || !apply_y_plane_constraint
+                dv_cyl[2, particle] = soft_limit(dv_cyl[2, particle], max_liquid_accel)
+            end
             dv_cyl[3, particle] = soft_limit(dv_cyl[3, particle], max_liquid_accel)
         end
     end
@@ -4879,19 +6832,20 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         print_force_stage_delta!("friction_and_accel_caps", force_stage_prev, dv_ode,
                                  cyl_sys, semi_local, t)
     end
-    if use_pseudo2d_projection
-        # Hard zero: pseudo-2D constraint.
+    if hard_lock_y_kinematics()
+        # Hard zero v_y/du_y/dv_y: pseudo-2D collapses to y=0; thin-3D retraction keeps layer planes.
         TrixiParticles.foreach_system(semi_local) do system
             dv_sys = TrixiParticles.wrap_v(dv_ode, system, semi_local)
             @inbounds for particle in TrixiParticles.each_integrated_particle(system)
                 dv_sys[2, particle] = 0.0
             end
         end
-    elseif charge_layers_y > 1
+    elseif apply_y_plane_constraint && geometry_mode == :thin3d
         # Thin-3D: stiff spring-damper keeps each particle at its initial y-plane.
         # dv_y += -γ·v_y - k·dy  where dy = current_y - initial_y (displacement, not absolute coord).
         # Gives TRBDF2 a non-zero Jacobian column → Newton converges cleanly.
         # TRBDF2's L-stability damps y-motion to zero within 1–2 steps.
+        y_damp, y_spring = thin3d_y_constraint_coeffs()
         TrixiParticles.foreach_system(semi_local) do system
             v_sys  = TrixiParticles.wrap_v(v_ode,   system, semi_local)
             u_sys  = TrixiParticles.wrap_u(u_ode,   system, semi_local)
@@ -4899,8 +6853,24 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
             y0 = TrixiParticles.initial_coordinates(system)  # [dim, particle], reference positions
             @inbounds for particle in TrixiParticles.each_integrated_particle(system)
                 dy = u_sys[2, particle] - y0[2, particle]  # displacement from initial y-plane
-                dv_sys[2, particle] += -y_constraint_damp   * v_sys[2, particle] -
-                                        y_constraint_spring * dy
+                dv_sys[2, particle] += -y_damp * v_sys[2, particle] - y_spring * dy
+            end
+        end
+        # Spring runs after xz caps and is unbounded — clamp y for explicit stability.
+        apply_retraction_charge_accel_caps!(dv_cyl, cyl_sys, t; cap_y=true)
+    end
+    if apply_resting_shelf_z_constraint
+        resting_buf = charge_resting_on_shelf_buf[]
+        if resting_buf !== nothing
+            z_damp, z_spring = resting_shelf_z_constraint_coeffs()
+            v_cyl_z = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
+            u_cyl_z = TrixiParticles.wrap_u(u_ode, cyl_sys, semi_local)
+            z0 = TrixiParticles.initial_coordinates(cyl_sys)
+            @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+                particle > length(resting_buf) && continue
+                resting_buf[particle] || continue
+                dz = u_cyl_z[3, particle] - z0[3, particle]
+                dv_cyl[3, particle] += -z_damp * v_cyl_z[3, particle] - z_spring * dz
             end
         end
     end
@@ -4916,14 +6886,15 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         kin_scale = retraction_kinematics_scale(t)
         @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
             dv_cyl[1, particle] *= kin_scale
-            if use_pseudo2d_projection
+            if hard_lock_y_kinematics() || (apply_y_plane_constraint && geometry_mode == :thin3d)
                 dv_cyl[2, particle] *= kin_scale
             end
             dv_cyl[3, particle] *= kin_scale
         end
     end
 
-    if hold_tlsph_tail_active(t) && hold_kinematics_mode == :frozen
+    if (hold_tlsph_tail_active(t) && hold_kinematics_mode == :frozen) ||
+       hold_kinematics_frozen(t)
         dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
         @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
             dv_cyl[1, particle] = 0.0
@@ -4961,10 +6932,8 @@ function drift_implicit_visible!(du_ode, v_ode, u_ode, semi_local, t)
         end
     end
 
-    # Pseudo-2D only: hard-zero du_y so y-displacement can never accumulate.
-    # Thin-3D: drift is left physical (du_y = v_y); the spring term in dv_y pulls u_y back
-    # toward 0 so particles stay near their initial y-planes without a hard override.
-    if use_pseudo2d_projection
+    # Hard-zero du_y when y motion is locked (pseudo-2D or thin-3D retraction lock).
+    if hard_lock_y_kinematics()
         TrixiParticles.foreach_system(semi_local) do system
             du_sys = TrixiParticles.wrap_u(du_ode, system, semi_local)
             @inbounds for particle in TrixiParticles.each_integrated_particle(system)
@@ -4978,21 +6947,26 @@ end
 
 if hold_checkpoint_restore !== nothing
     restore_hold_checkpoint_state!(hold_checkpoint_restore, semi)
+    if uniform_fiber_orientation !== nothing
+        apply_uniform_fiber_orientation!(fiber_direction, uniform_fiber_orientation)
+        println(">>> Overrode checkpoint fibre directions with uniform orientation ",
+                "[", uniform_fiber_orientation[1], ", ", uniform_fiber_orientation[2], ", ",
+                uniform_fiber_orientation[3], "] (Spencer re-align at retraction prep)")
+        flush(stdout)
+    end
     if retraction_tlsph_only
         refresh_retraction_solid_phase_buffers!()
         wcsph_ramp_scale[] = 0.0
     end
 end
 
-v0_ode = if hold_checkpoint_restore !== nothing
-    Vector{Float64}(hold_checkpoint_restore["v_ode"])
-else
-    Vector{Float64}(ode_base.u0.x[1])
-end
-u0_ode = if hold_checkpoint_restore !== nothing
-    Vector{Float64}(hold_checkpoint_restore["u_ode"])
-else
-    Vector{Float64}(ode_base.u0.x[2])
+v0_ode, u0_ode = clip_ode_initial_state(ode_base, hold_checkpoint_restore)
+if hold_checkpoint_restore !== nothing && uniform_charge_temp_k !== nothing
+    cyl_sys = semi.systems[1]
+    apply_uniform_charge_temperature!(cyl_sys, semi, v0_ode, uniform_charge_temp_k)
+    println(">>> Overrode checkpoint charge temperature with uniform T=",
+            round(uniform_charge_temp_k; digits=2), " K (checkpoint file unchanged)")
+    flush(stdout)
 end
 
 # Retraction-only: arm ramps before the first Newton step.  If retraction_started flips
@@ -5001,19 +6975,27 @@ end
 if sim_phase == "retraction" && hold_checkpoint_restore !== nothing
     cyl_sys = semi.systems[1]
     t_ret = hold_checkpoint_restore["t"]
-    retraction_started[] = true
-    retraction_start_time[] = t_ret
+    arm_retraction_phase!(t_ret)
     capture_retraction_reference_span!(cyl_sys)
     prepare_charge_state_for_retraction!(cyl_sys, semi, v0_ode, u0_ode,
                                          Fp_committed[], J_ref_particle_buf, J_p_particle_buf,
                                          vel_grad_buf, charge_dv_mech_marker_buf)
     retraction_state_prepared[] = true
+    if retraction_pre_lift_creep_s > 0.0
+        retraction_pre_lift_creep_announced[] = true
+        println(">>> Pre-lift closed-die creep: ", round(retraction_pre_lift_creep_s; digits=4),
+                " s (σ/contact/kin ramp 0→1; hold_creep; mold fixed until t=",
+                round(t_ret + retraction_pre_lift_creep_s; digits=6), " s;",
+                " post-lift σ/contact/kin stay at 1)")
+    end
     if retraction_cfrp_style
         println(">>> Retraction armed (CFRP-style) at checkpoint t=", round(t_ret; digits=6),
                 " s — full system_interaction!, no σ/contact/kin ramps")
     else
         println(">>> Retraction armed at checkpoint t=", round(t_ret; digits=6),
-                " s (contact/elastic/kinematics ramps active from t0; no step-1 discontinuity)")
+                retraction_pre_lift_creep_s > 0.0 ?
+                    " s (pre-lift creep then kin-scaled lift; mechanics continuous at lift)" :
+                    " s (contact/elastic/kinematics ramps active from t0; no step-1 discontinuity)")
     end
     hold_end_spencer_align &&
         println(">>> Hold-end Spencer alignment: ON (I4=1 at checkpoint F)")
@@ -5024,8 +7006,7 @@ if sim_phase == "retraction" && hold_checkpoint_restore !== nothing
     flush(stdout)
 end
 
-ode = DynamicalODEProblem(kick_implicit_visible!, drift_implicit_visible!,
-                          v0_ode, u0_ode, tspan, semi)
+ode = clip_build_ode_problem(v0_ode, u0_ode, tspan, semi)
 
 t_start, t_end = tspan
 
@@ -5063,7 +7044,7 @@ flush(mold_force_io)
 retraction_diag_io = if retraction_diag_enabled
     io = open(retraction_diag_log_path, "w")
     println(io, "step,t,dt,kick_max_dv,max_speed,max_abs_vz,span_x_mm,span_z_mm,",
-            "max_x_gap_mm,span_ratio,J_min,J_max,J_min_particle,min_mold_gap_mm,",
+            "span_ratio,J_min,J_max,J_min_particle,min_mold_gap_mm,",
             "min_floor_gap_mm,hold_rel,elas_scale,kin_scale,mech_dv_scale,floor_act,",
             "mold_act,nonfinite_n")
     flush(io)
@@ -5075,15 +7056,32 @@ else
     nothing
 end
 
+const clip_last_synced_integrator_dt = Ref(-1.0)
+
+# Sync trial_dt_state when the integrator changes Δt (init, rejects, controller) — not every callback poll.
+clip_trial_dt_sync_callback = DiscreteCallback(
+    function(u, t, integrator)
+        integrator.dt != clip_last_synced_integrator_dt[]
+    end,
+    function(integrator)
+        clip_last_synced_integrator_dt[] = integrator.dt
+        clip_sync_trial_dt_from_integrator!(integrator)
+        return nothing
+    end;
+    save_positions=(false, false))
+
 accepted_step_callback = DiscreteCallback(
     (u, t, integrator) -> integrator.iter > 0 && mod(integrator.iter, 1) == 0,
     function(integrator)
+            clip_sync_trial_dt_from_integrator!(integrator)
+            enforce_explicit_compression_dt!(integrator)
             enforce_explicit_retraction_dt!(integrator)
 
             cyl_sys = integrator.p.systems[1]
             floor_sys = integrator.p.systems[2]
             mold_sys = integrator.p.systems[3]
-            v_wrap_state = TrixiParticles.wrap_v(integrator.u.x[1], cyl_sys, integrator.p)
+            v_ode_state, u_ode_state = clip_integrator_vu(integrator)
+            v_wrap_state = TrixiParticles.wrap_v(v_ode_state, cyl_sys, integrator.p)
 
             if retraction_diag_enabled && retraction_started[] &&
                !retraction_diag_instability_announced[]
@@ -5109,6 +7107,13 @@ accepted_step_callback = DiscreteCallback(
                 freeze_charge_mechanical_state!(v_wrap_state, cyl_sys)
             end
 
+    # IMEX split: apply wall drag + Coulomb friction explicitly on accepted steps
+    # so the implicit Newton/JVP system only sees stiff contact + TLSPH mechanics.
+    if imex_soft_terms && tool_wall_coupling_active(integrator.t)
+        apply_imex_wall_drag_and_friction!(cyl_sys, floor_sys, mold_sys, integrator.p,
+                                           v_wrap_state, integrator.t, integrator.dt)
+    end
+
             if hold_tlsph_tail_active(integrator.t) && !hold_tlsph_tail_announced[]
                 hold_tlsph_tail_announced[] = true
                 println(">>> TLSPH equilibration tail: WCSPH off, full TLSPH+contact, ",
@@ -5122,7 +7127,7 @@ accepted_step_callback = DiscreteCallback(
             rhs_time_callback_vel_grad_ns[] += time_ns() - t_vel_grad_start
 
             if !charge_hold_thermal_only(integrator.t) && !retraction_solid_mechanics_only() &&
-               !hold_tlsph_tail_active(integrator.t)
+               !hold_tlsph_tail_active(integrator.t) && !retraction_pre_lift_creep_active(integrator.t)
                 t_orient_start = time_ns()
                 update_flow_orientation_kinetics!(orientation_tensor_state[],
                                                   orientation_scalar_particle,
@@ -5137,7 +7142,7 @@ accepted_step_callback = DiscreteCallback(
                 rhs_time_callback_orientation_ns[] += time_ns() - t_orient_start
             end
 
-            u_wrap = TrixiParticles.wrap_u(integrator.u.x[2], cyl_sys, integrator.p)
+            u_wrap = TrixiParticles.wrap_u(u_ode_state, cyl_sys, integrator.p)
             if enable_emergency_repair_clamp
                 repaired_particles = 0
                 @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
@@ -5223,7 +7228,7 @@ accepted_step_callback = DiscreteCallback(
                 advance_F_from_vel_grad!(cyl_sys, vel_grad_buf, integrator.dt)
                 enable_elastic_stress &&
                     commit_plastic_history_cfrp!(cyl_sys, integrator.p, integrator.dt,
-                                                 integrator.u.x[1])
+                                                 v_ode_state)
             elseif enable_elastic_stress && integrator.t >= t_warmup_end
                 # ------------------------------------------------------------------
                 # Nakamura crystallization ODE: advance α_c by one accepted step dt.
@@ -5231,7 +7236,8 @@ accepted_step_callback = DiscreteCallback(
                 # fraction buffers are refreshed from the new crystallinity.
                 # ------------------------------------------------------------------
                 if use_nakamura_kinetics && !retraction_solid_mechanics_only() &&
-                   !hold_tlsph_tail_active(integrator.t)
+                   !hold_tlsph_tail_active(integrator.t) &&
+                   !retraction_pre_lift_creep_active(integrator.t)
                     t_nak_acc_start = time_ns()
                     step_nakamura_crystallinity!(crystallinity_particle_buf,
                                                  cyl_sys.temp,
@@ -5245,7 +7251,9 @@ accepted_step_callback = DiscreteCallback(
                                               cyl_sys.temp, alpha_committed[],
                                               thermal_softening_particle_buf,
                                               liquid_fraction_particle_buf,
-                                              solid_fraction_particle_buf)
+                                              solid_fraction_particle_buf;
+                                              vel_grad_buf=vel_grad_buf,
+                                              update_viscosity=clip_viscosity_update_on_step())
                 refresh_retraction_solid_phase_buffers!()
 
                 hold_active = hold_plastic_relax_active(integrator.t)
@@ -5267,7 +7275,7 @@ accepted_step_callback = DiscreteCallback(
                 end
                 rhs_time_plastic_commit_ns[] += time_ns() - t_plastic_start
 
-                v_wrap = TrixiParticles.wrap_v(integrator.u.x[1], cyl_sys, integrator.p)
+                v_wrap = TrixiParticles.wrap_v(v_ode_state, cyl_sys, integrator.p)
                 NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
                 @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
                     v_wrap[NDIMS_CYL + 1, particle] = cyl_sys.temp[particle]
@@ -5278,7 +7286,7 @@ accepted_step_callback = DiscreteCallback(
                 # F + plastic commit handled in CFRP-style branch above.
             elseif charge_hold_thermal_only(integrator.t)
                 # F frozen during solidification hold.
-            elseif retraction_started[]
+            elseif retraction_started[] && !hold_kinematics_frozen(integrator.t)
                 kin = retraction_kinematics_scale(integrator.t)
                 if kin > 1.0e-10
                     advance_F_from_vel_grad!(cyl_sys, vel_grad_buf, integrator.dt * kin)
@@ -5291,7 +7299,7 @@ accepted_step_callback = DiscreteCallback(
                lag_wcsph_liquid_viscosity
                 refresh_lagged_wcsph_liquid_viscosity!(wcsph_visc_lagged_dv_buf,
                     wcsph_visc_scratch_dv_ode,
-                    integrator.u.x[1],
+                    v_ode_state,
                     cyl_sys,
                     integrator.p)
             end
@@ -5366,7 +7374,7 @@ accepted_step_callback = DiscreteCallback(
                 if hold_tlsph_checkpoint_ready(integrator.t)
                     if !retraction_state_prepared[]
                         prepare_charge_state_for_retraction!(cyl_sys, integrator.p,
-                            integrator.u.x[1], integrator.u.x[2],
+                            v_ode_state, u_ode_state,
                             Fp_committed[], J_ref_particle_buf, J_p_particle_buf, vel_grad_buf,
                             charge_dv_mech_marker_buf)
                         retraction_state_prepared[] = true
@@ -5390,12 +7398,11 @@ accepted_step_callback = DiscreteCallback(
                         terminate!(integrator)
                         return
                     end
-                    retraction_started[] = true
-                    retraction_start_time[] = integrator.t
+                    arm_retraction_phase!(integrator.t)
                     capture_retraction_reference_span!(cyl_sys)
                     if !retraction_state_prepared[]
                         prepare_charge_state_for_retraction!(cyl_sys, integrator.p,
-                            integrator.u.x[1], integrator.u.x[2],
+                            v_ode_state, u_ode_state,
                             Fp_committed[], J_ref_particle_buf, J_p_particle_buf, vel_grad_buf,
                             charge_dv_mech_marker_buf)
                         retraction_state_prepared[] = true
@@ -5408,14 +7415,30 @@ accepted_step_callback = DiscreteCallback(
                                     "; Spencer fibre ref aligned, I4=1 at hold F)" : ")")
                         flush(stdout)
                     end
-                    println(">>> Starting mold retraction at t=",
-                            round(integrator.t; digits=6),
-                            " s (mold ramp=", retraction_ramp_s,
-                            " s; contact ramp ", retraction_hold_release_s,
-                            " s; elastic ramp ", retraction_elastic_ramp_s,
-                            " s; kinematics ramp ", retraction_kinematics_release_s,
-                            " s)")
-                    flush(stdout)
+                    if retraction_pre_lift_creep_s > 0.0 && !retraction_pre_lift_creep_announced[]
+                        retraction_pre_lift_creep_announced[] = true
+                        println(">>> Pre-lift closed-die creep: ",
+                                round(retraction_pre_lift_creep_s; digits=4),
+                                " s (hold_creep; mold fixed until t=",
+                                round(retraction_lift_start_time[]; digits=6),
+                                " s; post-lift σ/contact/kin stay at 1)")
+                        flush(stdout)
+                    end
+                    if retraction_pre_lift_creep_s <= 0.0
+                        println(">>> Starting mold retraction at t=",
+                                round(integrator.t; digits=6),
+                                " s (contact ",
+                                retraction_mech_ramp_instant ? "instant-on" :
+                                    "ramp " * string(retraction_hold_release_s) * " s",
+                                "; elastic σ ",
+                                retraction_elastic_ramp_instant ? "instant-on" :
+                                    "ramp " * string(retraction_elastic_ramp_s) * " s",
+                                "; mold lift kin-scaled; velocity ramp ",
+                                retraction_ramp_s,
+                                " s; kinematics ramp ", retraction_kinematics_release_s,
+                                " s)")
+                        flush(stdout)
+                    end
                 end
             end
 
@@ -5445,8 +7468,20 @@ accepted_step_callback = DiscreteCallback(
                 flush(stdout)
             end
 
+            if retraction_started[] && !retraction_lift_started_announced[] &&
+               !retraction_pre_lift_creep_active(integrator.t) &&
+               retraction_pre_lift_creep_s > 0.0
+                retraction_lift_started_announced[] = true
+                println(">>> Starting mold lift at t=", round(integrator.t; digits=6),
+                        " s (kin-scaled velocity ramp ", retraction_ramp_s,
+                        " s; σ/contact/kin already at 1 from pre-lift)")
+                flush(stdout)
+            end
+
             if retraction_started[] && !mold_retraction_complete[]
-                retract_elapsed = integrator.t - retraction_start_time[]
+                lift_t0 = retraction_pre_lift_creep_s > 0.0 ?
+                    retraction_lift_start_time[] : retraction_start_time[]
+                retract_elapsed = integrator.t - lift_t0
                 if retract_elapsed >= retraction_duration_max
                     complete_mold_retraction!(integrator)
                 end
@@ -5484,6 +7519,13 @@ accepted_step_callback = DiscreteCallback(
                 if formulation_profile_step_count[] % formulation_profile_interval == 0
                     print_formulation_timing_report!(integrator;
                         label="every $(formulation_profile_interval) steps")
+                end
+                if formulation_profile_time_dt > 0.0
+                    while integrator.t + 1.0e-14 >= formulation_profile_next_t[]
+                        print_formulation_timing_report!(integrator;
+                            label="every $(formulation_profile_time_dt) s")
+                        formulation_profile_next_t[] += formulation_profile_time_dt
+                    end
                 end
             end
 
@@ -5560,25 +7602,29 @@ accepted_step_callback = DiscreteCallback(
                 retraction_fail_fast_stall_counter[] = 0
             end
 
-            # if integrator.dt < 1e-7
-            #     stats = integrator.stats
-            #     dnf       = stats.nf       - diag_prev_nf[]
-            #     dnjacs    = stats.njacs    - diag_prev_njacs[]
-            #     dnsolve   = stats.nsolve   - diag_prev_nsolve[]
-            #     dnnonlin  = stats.nnonliniter - diag_prev_nnonliniter[]
-            #     dnreject  = stats.nreject  - diag_prev_nreject[]
-            #     println(">>> SOLVER-DIAG t=", round(integrator.t; digits=8),
-            #             " dt=", integrator.dt,
-            #             " Δnf=", dnf, " Δnjac=", dnjacs,
-            #             " Δnsolve=", dnsolve,
-            #             " Δnnonlin=", dnnonlin,
-            #             " Δnreject=", dnreject)
-            #     diag_prev_nf[]          = stats.nf
-            #     diag_prev_njacs[]       = stats.njacs
-            #     diag_prev_nsolve[]      = stats.nsolve
-            #     diag_prev_nnonliniter[] = stats.nnonliniter
-            #     diag_prev_nreject[]     = stats.nreject
-            # end
+            if solver_diag_enabled && integrator.dt < solver_diag_dt_threshold
+                stats = integrator.stats
+                dnf       = stats.nf       - diag_prev_nf[]
+                dnjacs    = stats.njacs    - diag_prev_njacs[]
+                dnsolve   = stats.nsolve   - diag_prev_nsolve[]
+                dnnonlin  = stats.nnonliniter - diag_prev_nnonliniter[]
+                dnreject  = stats.nreject  - diag_prev_nreject[]
+                println(">>> SOLVER-DIAG t=", round(integrator.t; digits=8),
+                        " dt=", integrator.dt,
+                        " Δnf=", dnf, " Δnjac=", dnjacs,
+                        " Δnsolve=", dnsolve,
+                        " Δnnonlin=", dnnonlin,
+                        " Δnreject=", dnreject)
+                flush(stdout)
+                if formulation_profile_enabled
+                    print_formulation_timing_report!(integrator; label="solver-diag dt-collapse")
+                end
+                diag_prev_nf[]          = stats.nf
+                diag_prev_njacs[]       = stats.njacs
+                diag_prev_nsolve[]      = stats.nsolve
+                diag_prev_nnonliniter[] = stats.nnonliniter
+                diag_prev_nreject[]     = stats.nreject
+            end
         end)
 
 const retraction_save_final = sim_phase == "retraction" &&
@@ -5599,36 +7645,121 @@ end
 info_callback = InfoCallback(interval=retraction_info_interval)
 
 callbacks = if sim_phase == "retraction"
-    CallbackSet(accepted_step_callback, vtu_save_callback, info_callback)
+    CallbackSet(clip_trial_dt_sync_callback, accepted_step_callback, vtu_save_callback,
+                info_callback)
 else
-    CallbackSet(accepted_step_callback,
+    CallbackSet(clip_trial_dt_sync_callback, accepted_step_callback,
                 # PeriodicCallback(print_timing_snapshot, 2.0e-2,
                 #                  save_positions=(false, false)),
                 vtu_save_callback,
                 info_callback)
 end
 
-retraction_abstol = sim_phase == "retraction" ?
-    env_float("TP_CLIP_RETRACTION_ABSTOL", retraction_cfrp_style ? 1.0e-5 : 1.0e-3) : 1.0e-3
-retraction_reltol = sim_phase == "retraction" ?
-    env_float("TP_CLIP_RETRACTION_RELTOL", retraction_cfrp_style ? 1.0e-3 : 1.0e-3) : 1.0e-3
-retraction_dtmax = sim_phase == "retraction" ?
-    env_float("TP_CLIP_RETRACTION_DTMAX", retraction_cfrp_style ? 1.0e-4 : 1.0e-3) : 1.0e-3
+default_abstol = 1.0e-3
+default_reltol = 1.0e-3
+default_dtmax  = 1.0e-3
 
-sol = Logging.with_logger(Logging.SimpleLogger(stderr, Logging.Warn)) do
-    if retraction_use_explicit
-        explicit_alg, explicit_scheme_name = clip_retraction_explicit_algorithm()
+phase_abstol = sim_phase == "retraction" ?
+    env_float("TP_CLIP_RETRACTION_ABSTOL", retraction_cfrp_style ? 1.0e-5 : default_abstol) :
+    default_abstol
+phase_reltol = sim_phase == "retraction" ?
+    env_float("TP_CLIP_RETRACTION_RELTOL", default_reltol) :
+    default_reltol
+phase_dtmax = if sim_phase == "retraction"
+    env_float("TP_CLIP_RETRACTION_DTMAX", retraction_cfrp_style ? 1.0e-4 : default_dtmax)
+elseif sim_phase == "hold"
+    charge_hold_phase_dtmax
+else
+    default_dtmax
+end
+
+# Global overrides (useful for debugging stiff starts / hold runs)
+retraction_abstol = env_float("TP_CLIP_ABSTOL", phase_abstol)
+retraction_reltol = env_float("TP_CLIP_RELTOL", phase_reltol)
+retraction_dtmax  = env_float("TP_CLIP_DTMAX",  phase_dtmax)
+
+# Optional: benchmark TRBDF2 from a saved hold checkpoint (compression stall diagnosis).
+#   TP_CLIP_PROFILE_FROM_CHECKPOINT=1 TP_CLIP_FORMULATION_PROFILE=1 julia ... implicit.jl
+if env_int("TP_CLIP_PROFILE_FROM_CHECKPOINT", 0) != 0
+    profile_steps = max(1, env_int("TP_CLIP_PROFILE_STEPS", 5))
+    ck_prof = load_hold_checkpoint(checkpoint_path)
+    restore_hold_checkpoint_state!(ck_prof, semi)
+    t_prof0 = ck_prof["t"]
+    t_prof1 = t_prof0 + env_float("TP_CLIP_PROFILE_DT_SIM", 1.0e-6)
+    v_prof, u_prof = clip_ode_state_from_checkpoint(ck_prof)
+    ode_prof = clip_build_ode_problem(v_prof, u_prof, (t_prof0, t_prof1), semi)
+    n_ode_dof_prof = length(v_prof) + length(u_prof)
+    integrator_mode_prof = clip_integrator_mode()
+    jacobian_strategy_prof = clip_jacobian_strategy()
+    use_matrix_free_prof = jacobian_strategy_prof == "matrix_free"
+    jacobian_mode_prof = clip_jacobian_mode()
+    jacobian_autodiff_prof = use_matrix_free_prof ? nothing :
+        clip_jacobian_autodiff(jacobian_mode_prof)
+    linsolve_default_prof = use_matrix_free_prof ? "gmres" : "dense"
+    linsolve_prof = clip_linsolve_solver(n_ode_dof_prof;
+                                         default_mode=linsolve_default_prof,
+                                         matrix_free=use_matrix_free_prof,
+                                         jacobian_strategy=jacobian_strategy_prof)
+    alg_prof = clip_build_implicit_algorithm(integrator_mode_prof;
+                                           linsolve_solver=linsolve_prof,
+                                           use_matrix_free=use_matrix_free_prof,
+                                           jacobian_autodiff=jacobian_autodiff_prof,
+                                           nlsolve=nlsolve_prof)
+    nlsolve_prof = NLNewton(κ=1e-1, max_iter=20, fast_convergence_cutoff=0.9, always_new=false)
+    println("\n>>> PROFILE FROM CHECKPOINT t0=", round(t_prof0; digits=6),
+            " s, n_dof=", n_ode_dof_prof,
+            ", profile_steps<=", profile_steps,
+            ", integrator=", integrator_mode_prof,
+            ", jacobian_strategy=", jacobian_strategy_prof,
+            use_matrix_free_prof ? "" : ", jacobian_mode=" * jacobian_mode_prof, ")")
+    flush(stdout)
+    t_rhs0 = time_ns()
+    sol_prof = clip_gpu_allowscalar() do
+        solve(ode_prof, alg_prof;
+              save_everystep=false,
+              abstol=1.0e-3, reltol=1.0e-3,
+              dtmax=1.0e-3,
+              maxiters=profile_steps,
+              callback=CallbackSet(accepted_step_callback, info_callback))
+    end
+    rhs_wall_s = (time_ns() - t_rhs0) / 1.0e9
+    st = sol_prof.destats
+    t_end_prof = sol_prof.t isa AbstractVector ? last(sol_prof.t) : sol_prof.t
+    println(">>> PROFILE DONE: wall=", round(rhs_wall_s; digits=3), " s",
+            " t_end=", round(t_end_prof; digits=9),
+            " retcode=", sol_prof.retcode)
+    println(">>> PROFILE STATS (cumulative): nf=", st.nf,
+            " njacs=", st.njacs, " nsolve=", st.nsolve,
+            " nnonliniter=", st.nnonliniter, " nreject=", st.nreject)
+    if rhs_eval_count[] > 0
+        print_formulation_timing_report_final!(t_end_prof; label="checkpoint profile")
+    end
+    close(mold_force_io)
+    retraction_diag_io !== nothing && close(retraction_diag_io)
+    exit(0)
+end
+
+sol = clip_gpu_allowscalar() do
+    Logging.with_logger(Logging.SimpleLogger(stderr, Logging.Warn)) do
+    if clip_use_explicit_solver()
+        explicit_alg, explicit_scheme_name = clip_explicit_euler_algorithm()
+        explicit_dt = compression_use_explicit ? compression_explicit_dt :
+            retraction_explicit_dt_springback
+        explicit_phase = compression_use_explicit ? "compression" : "retraction"
+        explicit_ignore_unstable = compression_use_explicit ?
+            compression_explicit_ignore_unstable : retraction_explicit_ignore_unstable
         println("\n>>> Entering ODE solve (tspan=", tspan,
-                ", retraction solver=explicit ", explicit_scheme_name,
-                ", dt=", retraction_explicit_dt_springback,
-                ", freeze T=", retraction_explicit_freeze_t, ")")
+                ", ", explicit_phase, " solver=explicit ", explicit_scheme_name,
+                ", dt=", explicit_dt,
+                compression_use_explicit ? "" :
+                    ", freeze T=$(retraction_explicit_freeze_t)", ")")
         flush(stdout)
-        if retraction_explicit_ignore_unstable
+        if explicit_ignore_unstable
             solve(ode, explicit_alg;
                   callback=callbacks,
                   save_everystep=false,
                   adaptive=false,
-                  dt=retraction_explicit_dt_springback,
+                  dt=explicit_dt,
                   unstable_check=(dt, u, p, t) -> false,
                   maxiters=10_000_000)
         else
@@ -5636,42 +7767,107 @@ sol = Logging.with_logger(Logging.SimpleLogger(stderr, Logging.Warn)) do
                   callback=callbacks,
                   save_everystep=false,
                   adaptive=false,
-                  dt=retraction_explicit_dt_springback,
+                  dt=explicit_dt,
                   maxiters=10_000_000)
         end
     else
-        jacobian_mode = if retraction_cfrp_style
+        integrator_mode = clip_integrator_mode()
+        jacobian_strategy = clip_jacobian_strategy()
+        use_matrix_free = jacobian_strategy == "matrix_free"
+        use_custom_jac = clip_uses_custom_jacobian(jacobian_strategy)
+        jacobian_mode = if use_matrix_free
+            "matrix_free_jvp"
+        elseif jacobian_strategy == "sparse"
+            "sparse_finite"
+        elseif jacobian_strategy == "colored"
+            "colored_finite"
+        elseif retraction_cfrp_style
             haskey(ENV, "TP_CLIP_JACOBIAN_MODE") ? clip_jacobian_mode() : "finite"
         else
             clip_jacobian_mode()
         end
-        jacobian_autodiff = retraction_cfrp_style && !haskey(ENV, "TP_CLIP_JACOBIAN_MODE") ?
-            AutoFiniteDiff() : clip_jacobian_autodiff(jacobian_mode)
+        jacobian_autodiff = (use_matrix_free || use_custom_jac) ? nothing :
+            (retraction_cfrp_style && !haskey(ENV, "TP_CLIP_JACOBIAN_MODE") ?
+                AutoFiniteDiff() : clip_jacobian_autodiff(clip_jacobian_mode()))
         n_ode_dof = length(v0_ode) + length(u0_ode)
-        # CFRP uses GMRES at 3D scale; pseudo-2D retraction (n_dof≈147) stays dense LU.
-        linsolve_default = (retraction_cfrp_style && n_ode_dof >= 500) ? "gmres" : "dense"
-        linsolve_solver = clip_linsolve_solver(n_ode_dof; default_mode=linsolve_default)
+        linsolve_default = use_matrix_free ? "gmres" :
+            ((retraction_cfrp_style && n_ode_dof >= 500) ? "gmres" : "dense")
+        linsolve_solver = clip_linsolve_solver(n_ode_dof;
+                                               default_mode=linsolve_default,
+                                               matrix_free=use_matrix_free,
+                                               jacobian_strategy=jacobian_strategy)
         linsolve_name = lowercase(get(ENV, "TP_CLIP_LINSOLVE", linsolve_default))
+        if jacobian_strategy == "sparse" && linsolve_name in ("dense", "rfluf", "lu")
+            println(">>> WARNING: TP_CLIP_LINSOLVE=", linsolve_name,
+                    " is incompatible with sparse Jacobian (W is SparseMatrixCSC); ",
+                    "forcing sparse UMFPACK factorization.")
+            flush(stdout)
+            linsolve_solver = LinearSolve.UMFPACKFactorization()
+            linsolve_name = "sparse"
+        elseif jacobian_strategy == "colored" && linsolve_name == "sparse"
+            println(">>> WARNING: TP_CLIP_LINSOLVE=sparse is incompatible with colored dense ",
+                    "Jacobian; forcing dense LU (RFLU).")
+            flush(stdout)
+            linsolve_solver = RFLUFactorization()
+            linsolve_name = "dense"
+        end
+        nlsolve = retraction_cfrp_style ? NLNewton() :
+            NLNewton(κ=env_float("TP_CLIP_NEWTON_KAPPA", 0.1),
+                     max_iter=env_int("TP_CLIP_NEWTON_MAX_ITER", 20),
+                     fast_convergence_cutoff=0.9, always_new=false)
+        implicit_alg = clip_build_implicit_algorithm(integrator_mode;
+                                                     linsolve_solver=linsolve_solver,
+                                                     use_matrix_free=use_matrix_free,
+                                                     jacobian_autodiff=jacobian_autodiff,
+                                                     nlsolve=nlsolve)
         println("\n>>> Entering ODE solve (tspan=", tspan,
-                ", implicit solver=TRBDF2, jacobian=", jacobian_mode,
+                ", implicit solver=", integrator_mode,
+                ", jacobian_strategy=", jacobian_strategy,
+                ", jacobian=", jacobian_mode,
                 ", linsolve=", linsolve_name, ", n_dof=", n_ode_dof,
+                env_int("TP_CLIP_ADAPTIVE", 1) == 0 ?
+                    ", adaptive=false, fixed_dt=$(env_float("TP_CLIP_FIXED_DT",
+                        env_float("TP_CLIP_DT0", 1.0e-6)))" :
+                    ", dt0=$(env_float("TP_CLIP_DT0", 1.0e-6)), dtmin=$(env_float("TP_CLIP_DTMIN", 1.0e-12)), dtmax=$(retraction_dtmax)",
                 retraction_cfrp_style ? ", style=CFRP" : "", ")")
         flush(stdout)
-        nlsolve = retraction_cfrp_style ? NLNewton() :
-            NLNewton(κ=1e-1, max_iter=20, fast_convergence_cutoff=0.9, always_new=false)
-        solve(ode, TRBDF2(linsolve=linsolve_solver, autodiff=jacobian_autodiff,
-                          nlsolve=nlsolve);
-              callback=callbacks,
-              save_everystep=false,
-              abstol=retraction_abstol,
-              reltol=retraction_reltol,
-              dtmax=retraction_dtmax,
-              maxiters=10_000_000)
+        # Guard against OrdinaryDiffEq auto-initial-dt producing NaN when the initial RHS
+        # has NaNs in a Newton trial (e.g. stiff contact/packing transients). A finite dt0
+        # keeps the integrator well-posed; adaptivity will quickly adjust it.
+        dt0 = env_float("TP_CLIP_DT0", 1.0e-6)
+        dtmin0 = env_float("TP_CLIP_DTMIN", 1.0e-12)
+        clip_last_synced_integrator_dt[] = -1.0
+        clip_integrator_dt[] = dt0
+        trial_dt_state[] = dt0
+        use_adaptive = env_int("TP_CLIP_ADAPTIVE", 1) != 0
+        if use_adaptive
+            force_dtmin = env_int("TP_CLIP_FORCE_DTMIN", 0) != 0
+            solve(ode, implicit_alg;
+                  callback=callbacks,
+                  save_everystep=false,
+                  abstol=retraction_abstol,
+                  reltol=retraction_reltol,
+                  dt=dt0,
+                  dtmin=dtmin0,
+                  dtmax=retraction_dtmax,
+                  force_dtmin=force_dtmin,
+                  maxiters=10_000_000)
+        else
+            fixed_dt = env_float("TP_CLIP_FIXED_DT", dt0)
+            solve(ode, implicit_alg;
+                  callback=callbacks,
+                  save_everystep=false,
+                  adaptive=false,
+                  dt=fixed_dt,
+                  maxiters=10_000_000)
+        end
+    end
     end
 end
 
 if formulation_profile_enabled && rhs_eval_count[] > 0
-    print_formulation_timing_report_final!(sol.t; label="final partial window")
+    # `sol.t` is a vector of saved times; report the last time reached.
+    print_formulation_timing_report_final!(sol.t[end]; label="final partial window")
 end
 if formulation_profile_enabled && formulation_profile_io[] !== nothing
     close(formulation_profile_io[])

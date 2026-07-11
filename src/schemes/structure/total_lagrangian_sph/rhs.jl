@@ -231,7 +231,10 @@ end
     # when cache is nothing (pk1_restored path) or belongs to a different system.
     _cached       = STRESS_TENSOR_CACHE[]
     _use_cache    = _cached !== nothing && _cached[1] == objectid(system)
-    _cache_stress = _use_cache ? _cached[2] : nothing
+    
+    # Strictly type assert the cache to bypass CUDA InvalidIRError caused by capturing `Any`
+    _cache_stress = _use_cache ? (_cached[2]::typeof(system.correction_matrix)) : system.correction_matrix
+    
     _tensile_cache = tensile_stress_cache_tlsph(tensile_stress, system, _use_cache,
                                                 _cache_stress)
 

@@ -66,7 +66,17 @@ function trixi2vtk(dvdu_ode, vu_ode, semi, t; iter=nothing, output_directory="ou
     # Update quantities that are stored in the systems. These quantities (e.g. pressure)
     # still have the values from the last stage of the previous step if not updated here.
     @trixi_timeit timer() "update systems" begin
-        v_ode, u_ode = vu_ode.x
+        if hasproperty(vu_ode, :x)
+            v_ode, u_ode = vu_ode.x
+        else
+            if isdefined(Main, :clip_ode_nv)
+                nv = Main.clip_ode_nv[]
+                v_ode, u_ode = @view(vu_ode[1:nv]), @view(vu_ode[nv+1:end])
+            else
+                nv = length(vu_ode) ÷ 2
+                v_ode, u_ode = @view(vu_ode[1:nv]), @view(vu_ode[nv+1:end])
+            end
+        end
         # Don't create sub-timers here to avoid cluttering the timer output
         @notimeit timer() update_systems_and_nhs(v_ode, u_ode, semi, t)
     end
@@ -95,7 +105,17 @@ function trixi2vtk(system_, dvdu_ode_, vu_ode_, semi_, t, periodic_box;
         return
     end
 
-    v_ode_, u_ode_ = vu_ode_.x
+    if hasproperty(vu_ode_, :x)
+        v_ode_, u_ode_ = vu_ode_.x
+    else
+        if isdefined(Main, :clip_ode_nv)
+            nv = Main.clip_ode_nv[]
+            v_ode_, u_ode_ = @view(vu_ode_[1:nv]), @view(vu_ode_[nv+1:end])
+        else
+            nv = length(vu_ode_) ÷ 2
+            v_ode_, u_ode_ = @view(vu_ode_[1:nv]), @view(vu_ode_[nv+1:end])
+        end
+    end
 
     # Transfer to CPU if data is on the GPU. Do nothing if already on CPU.
     v_ode, u_ode, system, semi = transfer2cpu(v_ode_, u_ode_, system_, semi_)
@@ -140,7 +160,17 @@ function trixi2vtk(system_, dvdu_ode_, vu_ode_, semi_, t, periodic_box;
 
         # Extract custom quantities for this system
         if !isempty(custom_quantities)
-            dv_ode_, du_ode_ = dvdu_ode_.x
+            if hasproperty(dvdu_ode_, :x)
+                dv_ode_, du_ode_ = dvdu_ode_.x
+            else
+                if isdefined(Main, :clip_ode_nv)
+                    nv = Main.clip_ode_nv[]
+                    dv_ode_, du_ode_ = @view(dvdu_ode_[1:nv]), @view(dvdu_ode_[nv+1:end])
+                else
+                    nv = length(dvdu_ode_) ÷ 2
+                    dv_ode_, du_ode_ = @view(dvdu_ode_[1:nv]), @view(dvdu_ode_[nv+1:end])
+                end
+            end
             dv_ode, du_ode = transfer2cpu(dv_ode_, du_ode_)
 
             for (key, quantity) in custom_quantities

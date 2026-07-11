@@ -66,18 +66,23 @@ end
     return SVector(ntuple(@inline(dim->@inbounds A[dim, i]), NDIMS))
 end
 
-# Return `A[:, :, i]` as an `SMatrix`.
 @inline function extract_smatrix(A, system, particle)
-    @boundscheck checkbounds(A, ndims(system), ndims(system), particle)
+    extract_smatrix(A, Val(ndims(system)), particle)
+end
 
-    # Extract the matrix elements for this particle as a tuple to pass to SMatrix
-    return SMatrix{ndims(system),
-                   ndims(system)}(ntuple(@inline(i->@inbounds A[mod(i - 1,
-                                                                    ndims(system)) + 1,
-                                                                div(i - 1,
-                                                                    ndims(system)) + 1,
-                                                                particle]),
-                                         Val(ndims(system)^2)))
+@inline function extract_smatrix(A, ::Val{2}, particle)
+    return SMatrix{2, 2}(
+        @inbounds(A[1, 1, particle]), @inbounds(A[2, 1, particle]),
+        @inbounds(A[1, 2, particle]), @inbounds(A[2, 2, particle])
+    )
+end
+
+@inline function extract_smatrix(A, ::Val{3}, particle)
+    return SMatrix{3, 3}(
+        @inbounds(A[1, 1, particle]), @inbounds(A[2, 1, particle]), @inbounds(A[3, 1, particle]),
+        @inbounds(A[1, 2, particle]), @inbounds(A[2, 2, particle]), @inbounds(A[3, 2, particle]),
+        @inbounds(A[1, 3, particle]), @inbounds(A[2, 3, particle]), @inbounds(A[3, 3, particle])
+    )
 end
 
 # Specifically get the current coordinates of a particle for all system types.

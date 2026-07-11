@@ -34,11 +34,26 @@ end
     F_a = deformation_gradient(system, particle)
     F_b = deformation_gradient(system, neighbor)
 
-    inv_current_distance = 1 / current_distance
+    # The Ganzenmüller hourglass penalty is a numerical regularizer.
+    # When particles get very close (e.g. sharp-corner contact), `current_distance → 0`
+    # can create unrealistically large penalty accelerations and trigger solver dt-collapse.
+    #
+    # Regularize the singular terms in a smooth, resolution-aware way:
+    # - Guard the 1/current_distance factor with a floor proportional to initial spacing.
+    # - Soft-limit the scalar stretch/compression measure `delta_sum` to avoid unbounded
+    #   correction forces from transient Newton-trial configurations.
+    current_distance <= eps(current_distance) && return zero(initial_pos_diff)
+    d_floor = 0.2 * initial_distance
+    d_safe  = max(current_distance, d_floor)
+    inv_current_distance = 1 / d_safe
 
     # Use the symmetry of epsilon to simplify computations
     eps_sum = (F_a + F_b) * initial_pos_diff - 2 * current_pos_diff
     delta_sum = dot(eps_sum, current_pos_diff) * inv_current_distance
+
+    # Soft-limit delta_sum (units of length) to keep penalty bounded in extreme compression.
+    δ_lim = 0.5 * initial_distance
+    delta_sum = δ_lim * tanh(delta_sum / max(δ_lim, eps(δ_lim)))
 
     E = young_modulus(system, particle)
 

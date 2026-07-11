@@ -205,8 +205,71 @@ end
 
     NDIMS      = ndims(system)
     n_particles = nparticles(system)
+
+    if isdefined(Main, :CUDA) && dv isa Main.CUDA.CuArray
+        mass_host = Array(mass)
+        material_density_host = Array(material_density)
+        temp_host = Array(temp)
+        current_coordinates_host = Array(current_coordinates)
+        initial_coords_host = Array(initial_coordinates(system))
+        dv_host = Array(dv)
+
+        rho = material_density_host[1]
+        dT = zeros(eltype(temp_host), n_particles)
+
+        dx = particle_spacing
+        @inbounds for i in 1:n_particles
+            if current_coordinates_host[bound_coordinate[1], i] < bound_coordinate[2]
+                dT[i] += ext_heat / (rho * cp * dx)
+            end
+        end
+
+        W_sum = zeros(eltype(temp_host), n_particles)
+        @inbounds for particle in 1:n_particles
+            for neighbor in 1:n_particles
+                rx0 = initial_coords_host[1, particle] - initial_coords_host[1, neighbor]
+                ry0 = initial_coords_host[2, particle] - initial_coords_host[2, neighbor]
+                rz0 = initial_coords_host[3, particle] - initial_coords_host[3, neighbor]
+                r_scalar = sqrt(rx0 * rx0 + ry0 * ry0 + rz0 * rz0)
+                vol_nb = mass_host[neighbor] / rho
+                W_sum[particle] += vol_nb * smoothing_kernel(system, r_scalar, particle)
+            end
+        end
+        clamp!(W_sum, 0.1, Inf)
+
+        _eps = 1e-3
+        h2 = smoothing_length^2
+        h2_eps = eps(h2)
+        k_fac = k / (rho * cp)
+        @inbounds for particle in 1:n_particles
+            for neighbor in 1:n_particles
+                rx = current_coordinates_host[1, particle] - current_coordinates_host[1, neighbor]
+                ry = current_coordinates_host[2, particle] - current_coordinates_host[2, neighbor]
+                rz = current_coordinates_host[3, particle] - current_coordinates_host[3, neighbor]
+                r2 = rx * rx + ry * ry + rz * rz
+                r2 < h2_eps && continue
+                r_dist = sqrt(r2)
+                r_vec = SVector(rx, ry, rz)
+                grad_kernel = smoothing_kernel_grad(system, r_vec, r_dist, particle)
+                val = rx * grad_kernel[1] + ry * grad_kernel[2] + rz * grad_kernel[3]
+                val = min(val, zero(val))
+                volume = mass_host[neighbor] / rho
+                flux = volume * k_fac * (temp_host[particle] - temp_host[neighbor]) *
+                       val / (r2 + _eps * h2)
+                dT[particle] += flux / W_sum[particle]
+            end
+        end
+
+        @inbounds for particle in each_integrated_particle(system)
+            dv_host[NDIMS + 1, particle] += dT[particle]
+        end
+        copyto!(dv, Main.CUDA.CuArray(dv_host))
+        return dv
+    end
+
     rho        = material_density[1]
-    dT         = zeros(eltype(system), n_particles)
+    dT         = similar(mass, n_particles)
+    fill!(dT, zero(eltype(system)))
 
     # Boundary heat flux source term
     dx = particle_spacing
@@ -219,43 +282,50 @@ end
     initial_coords = initial_coordinates(system)
 
     # Shepard normalization for truncated-kernel consistency near boundaries
-    W_sum = zeros(eltype(system), n_particles)
+    W_sum = similar(mass, n_particles)
+    fill!(W_sum, zero(eltype(system)))
     foreach_point_neighbor(system, system, initial_coords, initial_coords,
                            semi) do particle, neighbor, r_nb, _
-        vol_nb   = mass[neighbor] / rho
+        vol_nb   = @inbounds mass[neighbor] / rho
         r_scalar = sqrt(TrixiParticles.dot(r_nb, r_nb))
-        W_sum[particle] += vol_nb * smoothing_kernel(system, r_scalar, particle)
+        @inbounds W_sum[particle] += vol_nb * smoothing_kernel(system, r_scalar, particle)
     end
     clamp!(W_sum, 0.1, Inf)
 
     # SPH thermal conduction: dT/dt += (k / rho*cp) * Laplacian(T)
+    _eps = 1e-3
+    h2   = smoothing_length^2
+    h2_eps = eps(h2)
+    k_fac = k / (rho * cp)
     foreach_point_neighbor(system, system, initial_coords, initial_coords,
                            semi) do particle, neighbor, r_nb, _
-        volume = mass[neighbor] / rho
+        volume = @inbounds mass[neighbor] / rho
 
-        @views r_vec = current_coordinates[:, particle] .- current_coordinates[:, neighbor]
-        r_vec = convert.(eltype(system), r_vec)
-
-        r2 = TrixiParticles.dot(r_vec, r_vec)
-        r2 < eps(smoothing_length^2) && return
+        @inbounds begin
+            rx = current_coordinates[1, particle] - current_coordinates[1, neighbor]
+            ry = current_coordinates[2, particle] - current_coordinates[2, neighbor]
+            rz = current_coordinates[3, particle] - current_coordinates[3, neighbor]
+        end
+        r2 = rx * rx + ry * ry + rz * rz
+        r2 < h2_eps && return
         r_dist = sqrt(r2)
+        r_vec = SVector(rx, ry, rz)
 
         grad_kernel = smoothing_kernel_grad(system, r_vec, r_dist, particle)
-        _eps = 1e-3
-        h2   = smoothing_length^2
 
-        val = TrixiParticles.dot(r_vec, grad_kernel)
+        val = rx * grad_kernel[1] + ry * grad_kernel[2] + rz * grad_kernel[3]
         # val should be ≤ 0 for a radial kernel; clamp positive roundoff to zero
         val = min(val, zero(val))
 
-        flux = volume * k / (rho * cp) *
-               (temp[particle] - temp[neighbor]) * val / (r2 + _eps * h2)
-        dT[particle] += flux / W_sum[particle]
+        @inbounds begin
+            flux = volume * k_fac * (temp[particle] - temp[neighbor]) * val / (r2 + _eps * h2)
+            dT[particle] += flux / W_sum[particle]
+        end
     end
 
     # Write dT/dt into the temperature row of dv
     for particle in each_integrated_particle(system)
-        dv[NDIMS + 1, particle] += dT[particle]
+        @inbounds dv[NDIMS + 1, particle] += dT[particle]
     end
 
     return dv
