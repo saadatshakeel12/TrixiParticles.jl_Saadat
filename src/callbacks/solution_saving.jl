@@ -97,11 +97,38 @@ function SolutionSavingCallback(; interval::Integer=0, dt=0.0,
         output_directory *= string("_", Dates.format(now(), "YY-mm-ddTHHMMSS"))
     end
 
+    initial_iter = -1
+    restore_active = (get(ENV, "TP_CLIP_RESTORE_CHECKPOINT", "0") == "1") || 
+                     (get(ENV, "TP_CLIP_SIM_PHASE", "") == "retraction")
+    if restore_active
+        max_idx = -1
+        if isdir(output_directory)
+            for f in readdir(output_directory)
+                if startswith(f, prefix) && endswith(f, ".vtu")
+                    idx_underscore = findlast('_', f)
+                    if idx_underscore !== nothing
+                        idx_dot = findlast('.', f)
+                        if idx_dot !== nothing && idx_dot > idx_underscore + 1
+                            idx_str = f[idx_underscore+1:idx_dot-1]
+                            val = tryparse(Int, idx_str)
+                            if val !== nothing
+                                max_idx = max(max_idx, val)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if max_idx >= 0
+            initial_iter = max_idx
+        end
+    end
+
     solution_callback = SolutionSavingCallback(interval, Float64.(save_times),
                                                save_initial_solution, save_final_solution,
                                                verbose, output_directory, prefix,
                                                max_coordinates, custom_quantities,
-                                               -1, Ref("UnknownVersion"))
+                                               initial_iter, Ref("UnknownVersion"))
 
     if length(save_times) > 0
         return PresetTimeCallback(save_times, solution_callback)

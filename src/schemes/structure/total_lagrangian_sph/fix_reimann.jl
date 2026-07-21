@@ -23,6 +23,15 @@ const contact_total_accel_cap = Ref(1.0e4)
 const contact_accel_cap_solid = Ref(1.0e4)
 const contact_accel_cap_molten = Ref(8.0e4)
 const melt_contact_softness = Ref(0.15)
+# Deep tool–charge overlap (δ = ps − distance): apply a stricter |a| cap so stacked
+# soft-contact neighbors from ~1·ps penetration cannot dump huge contact kicks.
+# δ_deep = contact_deep_overlap_frac * ps; |a|_cap = contact_deep_accel_cap (0 = off).
+const contact_deep_overlap_frac = Ref(0.5)
+const contact_deep_accel_cap = Ref(5.0e3)
+# Rate-dependent contact dashpot (fraction of critical): c_n = ζ · 2√(k_n m / A).
+# Deep-overlap uses contact_dashpot_zeta_deep when δ > δ_deep (0 = inherit ζ).
+const contact_dashpot_zeta = Ref(0.05)
+const contact_dashpot_zeta_deep = Ref(0.0)
 # Charge liquid-fraction buffer (Ref to driver-owned vector).
 const contact_liquid_fraction_buf = Ref{Union{Nothing, Vector{Float64}}}(nothing)
 # Fixed blankholder system + resting-shelf mask (driver sets after packing).
@@ -48,9 +57,47 @@ end
 
 @inline function contact_accel_cap_for_particle(lf::Float64)
     lf = clamp(lf, 0.0, 1.0)
-    return contact_accel_cap_solid[] + lf * (contact_accel_cap_molten[] - contact_accel_cap_solid[])
+    a_s = contact_accel_cap_solid[]
+    a_m = contact_accel_cap_molten[]
+    # molten cap ≤ 0 means "disabled" — do not interpolate toward 0 (that uncapped lf≈1).
+    a_m <= 0.0 && return a_s
+    return a_s + lf * (a_m - a_s)
 end
 
+@inline function contact_pair_overlap(distance::Float64, ps::Float64)
+    distance < eps(ps) && return ps
+    return max(0.0, ps - distance)
+end
+
+# Resolve |a| cap after summing tool-pair contact on one charge particle.
+@inline function resolve_contact_accel_cap(lf::Float64, δ_max::Float64, ps::Float64,
+                                           use_melt_contact::Bool)
+    cap = Inf
+    if use_melt_contact
+        c = contact_accel_cap_for_particle(lf)
+        c > 0.0 && (cap = min(cap, c))
+    else
+        c = contact_total_accel_cap[]
+        c > 0.0 && (cap = min(cap, c))
+    end
+    deep_cap = contact_deep_accel_cap[]
+    if deep_cap > 0.0 && δ_max > contact_deep_overlap_frac[] * ps
+        cap = min(cap, deep_cap)
+    end
+    return cap
+end
+
+@inline function apply_resolved_contact_accel_cap(ax::Float64, ay::Float64, az::Float64,
+                                                  cap::Float64)
+    !isfinite(cap) && return ax, ay, az
+    cap <= 0.0 && return ax, ay, az
+    a_mag = sqrt(ax * ax + ay * ay + az * az)
+    a_mag <= cap && return ax, ay, az
+    s = cap / a_mag
+    return ax * s, ay * s, az * s
+end
+
+# retraction_contact_e_scale=1.0 means inherit compression/hold stiffness at restart.
 @inline function active_contact_e_scale()
     retraction_contact_e_scale[] < 1.0 - 1.0e-12 &&
         return retraction_contact_e_scale[]
@@ -83,13 +130,22 @@ end
     δ_sat = max(contact_overlap_sat_frac[] * ps, δ_tol + eps(ps))
 
     k_n = active_contact_e_scale() * E / ps * melt_k_scale
-    c_n = 0.05 * 2.0 * sqrt(k_n * m_i / A_eff)
+    δ_deep = contact_deep_overlap_frac[] * ps
+    ζ = contact_dashpot_zeta[]
+    ζ_deep = contact_dashpot_zeta_deep[]
+    if ζ_deep > 0.0 && δ > δ_deep
+        ζ = ζ_deep
+    end
+    ζ = max(ζ, 0.0)
+    c_n = ζ * 2.0 * sqrt(max(k_n * m_i / A_eff, 0.0))
 
     # Smooth penalty: linear near δ_tol, saturates at δ_sat (corners / deep overlap).
     δ_excess = max(δ - δ_tol, 0.0)
     δ_pen = δ_sat * tanh(δ_excess / δ_sat)
     t_stab = k_n * δ_pen
-    t_damp = (δ > 0.0 && v_rel < 0.0) ? c_n * (-v_rel) : zero(v_rel)
+    # Viscous dashpot while overlapping: oppose relative normal velocity (approach and
+    # rebound). Previously only approaching (v_rel<0) at ζ=0.05 — too weak for demold.
+    t_damp = (δ > 0.0 && c_n > 0.0) ? c_n * (-v_rel) : zero(v_rel)
     t_corr = t_stab + t_damp
 
     # Riemann acoustic term disabled (see prior comment in git history).
@@ -127,9 +183,11 @@ function _clip_interact_Reimann_override!(dv, v_particle_system, u_particle_syst
     on_charge = particle_system === charge_sys
     lf_buf = contact_liquid_fraction_buf[]
     use_melt_contact = on_charge && lf_buf !== nothing
-    cap_total = on_charge && (use_melt_contact ?
-        (contact_accel_cap_molten[] > 0.0 || contact_accel_cap_solid[] > 0.0) :
-        contact_total_accel_cap[] > 0.0)
+    # Always allow capping on the charge when any cap is configured (incl. deep-overlap).
+    cap_total = on_charge && (contact_deep_accel_cap[] > 0.0 ||
+        (use_melt_contact ?
+            (contact_accel_cap_molten[] > 0.0 || contact_accel_cap_solid[] > 0.0) :
+            contact_total_accel_cap[] > 0.0))
 
     if isdefined(Main, :CUDA) && dv isa Main.CUDA.CuArray
         dv_host = Array(dv)
@@ -164,6 +222,7 @@ function _clip_interact_Reimann_override!(dv, v_particle_system, u_particle_syst
             ax = 0.0
             ay = 0.0
             az = 0.0
+            δ_max = 0.0
 
             for neighbor in 1:n_q
                 dx = xi1 - neighbor_coords_host[1, neighbor]
@@ -173,6 +232,7 @@ function _clip_interact_Reimann_override!(dv, v_particle_system, u_particle_syst
                 d2 > radius2 && continue
 
                 distance = sqrt(d2)
+                δ_max = max(δ_max, contact_pair_overlap(distance, ps))
 
                 vjx = v_neighbor_host[1, neighbor]
                 vjy = v_neighbor_host[2, neighbor]
@@ -189,16 +249,8 @@ function _clip_interact_Reimann_override!(dv, v_particle_system, u_particle_syst
             end
 
             if cap_total
-                a_mag = sqrt(ax * ax + ay * ay + az * az)
-                cap = use_melt_contact ?
-                    contact_accel_cap_for_particle(lf) :
-                    contact_total_accel_cap[]
-                if a_mag > cap && cap > 0.0
-                    s = cap / a_mag
-                    ax *= s
-                    ay *= s
-                    az *= s
-                end
+                cap = resolve_contact_accel_cap(lf, δ_max, ps, use_melt_contact)
+                ax, ay, az = apply_resolved_contact_accel_cap(ax, ay, az, cap)
             end
 
             dv_host[1, particle] += ax
@@ -234,6 +286,7 @@ function _clip_interact_Reimann_override!(dv, v_particle_system, u_particle_syst
         ax = 0.0
         ay = 0.0
         az = 0.0
+        δ_max = 0.0
 
         for neighbor in 1:n_q
             dx = xi1 - neighbor_coords[1, neighbor]
@@ -243,6 +296,7 @@ function _clip_interact_Reimann_override!(dv, v_particle_system, u_particle_syst
             d2 > radius2 && continue
 
             distance = sqrt(d2)
+            δ_max = max(δ_max, contact_pair_overlap(distance, ps))
 
             v_j = TrixiParticles.current_velocity(v_neighbor_system,
                                                   neighbor_system, neighbor)
@@ -259,16 +313,8 @@ function _clip_interact_Reimann_override!(dv, v_particle_system, u_particle_syst
         end
 
         if cap_total
-            a_mag = sqrt(ax * ax + ay * ay + az * az)
-            cap = use_melt_contact ?
-                contact_accel_cap_for_particle(lf) :
-                contact_total_accel_cap[]
-            if a_mag > cap && cap > 0.0
-                s = cap / a_mag
-                ax *= s
-                ay *= s
-                az *= s
-            end
+            cap = resolve_contact_accel_cap(lf, δ_max, ps, use_melt_contact)
+            ax, ay, az = apply_resolved_contact_accel_cap(ax, ay, az, cap)
         end
 
         dv[1, particle] += ax
@@ -289,5 +335,49 @@ end
                                                      v_neighbor_system, u_neighbor_system,
                                                      particle_system, neighbor_system,
                                                      semi; integrate_tlsph=integrate_tlsph)
+    end
+
+    function initialize_save_cb!(solution_callback::SolutionSavingCallback, u, t, integrator)
+        restore_active = (get(ENV, "TP_CLIP_RESTORE_CHECKPOINT", "0") == "1") || 
+                         (get(ENV, "TP_CLIP_SIM_PHASE", "") == "retraction")
+        
+        if restore_active
+            max_idx = -1
+            out_dir = solution_callback.output_directory
+            prefix = solution_callback.prefix
+            if isdir(out_dir)
+                for f in readdir(out_dir)
+                    if startswith(f, prefix) && endswith(f, ".vtu")
+                        idx_underscore = findlast('_', f)
+                        if idx_underscore !== nothing
+                            idx_dot = findlast('.', f)
+                            if idx_dot !== nothing && idx_dot > idx_underscore + 1
+                                idx_str = f[idx_underscore+1:idx_dot-1]
+                                val = tryparse(Int, idx_str)
+                                if val !== nothing
+                                    max_idx = max(max_idx, val)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if max_idx >= 0
+                solution_callback.latest_saved_iter = max_idx
+                println(">>> Restored VTU output sequence starting from index ", max_idx + 1)
+                flush(stdout)
+            else
+                solution_callback.latest_saved_iter = -1
+            end
+        else
+            solution_callback.latest_saved_iter = -1
+        end
+
+        solution_callback.git_hash[] = compute_git_hash()
+        write_meta_data(solution_callback, integrator)
+
+        if solution_callback.save_initial_solution
+            solution_callback(integrator; from_initialize=true)
+        end
     end
 end
