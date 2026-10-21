@@ -64,10 +64,24 @@ include("preprocessing/preprocessing.jl")
 include("io/io.jl")
 include("visualization/recipes_plots.jl")
 
-# Module-level stress tensor cache: set by callback, read by interact_structure_structure! in RHS.
-# Stores (system_objectid, array) so the cache is only used for the specific system that wrote it.
-# This prevents floor/mold self-interaction from accidentally reading the cylinder's stress.
-const STRESS_TENSOR_CACHE = Ref{Union{Nothing, Tuple{UInt64, AbstractArray{Float64, 3}}}}(nothing)
+# Module-level stress tensor cache: set by callback, read by structure interactions.
+# The legacy `(system_objectid, array)` form remains supported. CPU drivers with
+# several independently integrated structures may instead install a dictionary.
+const StressTensorArray = AbstractArray{Float64, 3}
+const StressTensorCache = Union{Nothing,
+                                Tuple{UInt64, StressTensorArray},
+                                Dict{UInt64, StressTensorArray}}
+const STRESS_TENSOR_CACHE = Ref{StressTensorCache}(nothing)
+
+@inline function stress_tensor_cache_for(system)
+    cached = STRESS_TENSOR_CACHE[]
+    cached === nothing && return nothing
+    system_id = objectid(system)
+    if cached isa Tuple
+        return cached[1] == system_id ? cached[2] : nothing
+    end
+    return get(cached, system_id, nothing)
+end
 
 export Semidiscretization, semidiscretize, restart_with!
 export InitialCondition
@@ -94,6 +108,11 @@ export ArtificialViscosityMonaghan, ViscosityAdami, ViscosityMorris, ViscosityAd
        ViscosityMorrisSGS
 export DensityDiffusionMolteniColagrossi, DensityDiffusionFerrari, DensityDiffusionAntuono
 export tensile_instability_control
+export OrganosheetPlyModel, assign_organosheet_ply_ids, same_organosheet_ply,
+       organosheet_fiber_energy, organosheet_fiber_pk1,
+       organosheet_shear_angle, organosheet_shear_torque,
+       organosheet_trellis_energy, organosheet_trellis_pk1,
+       organosheet_kirchhoff_stress, coulomb_tangential_velocity_increment
 export BoundaryModelMonaghanKajtar, BoundaryModelDummyParticles, AdamiPressureExtrapolation,
        PressureMirroring, PressureZeroing, BoundaryModelCharacteristicsLastiwka,
        BoundaryModelMirroringTafuni, BoundaryModelDynamicalPressureZhang,

@@ -1332,7 +1332,7 @@ sim_phase == "retraction" && retraction_cfrp_style &&
             "GMRES/TRBDF2; no σ/contact/kin ramps)")
 sim_phase == "retraction" && retraction_tlsph_only && !retraction_cfrp_style &&
     println("Retraction: TLSPH elastoplastic + charge conduction + tool–charge HTC; ",
-            "WCSPH, Nakamura, molten drag, and flow-orientation kinetics are OFF")
+            "WCSPH, Nakamura, and molten drag are OFF; flow-orientation kinetics stay ON")
 compression_use_explicit && begin
     _, explicit_scheme_name = clip_explicit_euler_algorithm()
     println("Compression integrator: explicit ", explicit_scheme_name,
@@ -2576,7 +2576,7 @@ t_ramp_mold = env_float("TP_CLIP_MOLD_RAMP_S", 1.0e-3)
 # and causes the charge to shrink. Physical viscosity (η = 8e4 Pa·s) handles dissipation.
 velocity_damping_base = 0.0      # 1/s
 velocity_damping_contact = 0.0   # 1/s
-molten_wall_drag_factor = env_float("TP_CLIP_MOLTEN_WALL_DRAG_FACTOR", 0.05)
+molten_wall_drag_factor = env_float("TP_CLIP_MOLTEN_WALL_DRAG_FACTOR", 0.0005)
 molten_wall_drag_max_rate = env_float("TP_CLIP_MOLTEN_WALL_DRAG_MAX_RATE", 1.0e5) # 1/s
 
 # Target stroke: drive the punch from its start position (z_punch_bot) down until
@@ -4230,8 +4230,8 @@ const local_regime_threshold = 0.5 * material_polymer.tmelt
 # Δt ~ 1e-7 s under contact because the penalty residual becomes extremely stiff.
 E_boundary = 0.01 * material_polymer.E
 
-# Molten compression: Reimann k_n = (E_scale * E)/ps with E_scale ≈ K_melt/E (~1 MPa per 1% ps overlap).
-const compression_contact_e_scale_default = matrix_K_melt / material_polymer.E
+# Molten compression: Reimann k_n = (E_scale * E)/ps. Default E_scale=0.1.
+const compression_contact_e_scale_default = 0.1
 compression_contact_e_scale[] = env_float("TP_CLIP_COMPRESSION_CONTACT_E_SCALE",
                                         compression_contact_e_scale_default)
 contact_penalty_alpha[] = env_float("TP_CLIP_CONTACT_PENALTY_ALPHA", 0.25)
@@ -8207,8 +8207,9 @@ accepted_step_callback = DiscreteCallback(
             refresh_velocity_gradient_cache!(cyl_sys, v_wrap_state, integrator.p, vel_grad_buf)
             rhs_time_callback_vel_grad_ns[] += time_ns() - t_vel_grad_start
 
-            if !charge_hold_thermal_only(integrator.t) && !retraction_solid_mechanics_only() &&
-               !hold_tlsph_tail_active(integrator.t) && !retraction_pre_lift_creep_active(integrator.t)
+            # Orientation stays on in retraction (Jeffery/RSC): fiber alignment can still
+            # evolve under demold shear. WCSPH / Nakamura / molten drag remain off.
+            if !charge_hold_thermal_only(integrator.t) && !hold_tlsph_tail_active(integrator.t)
                 t_orient_start = time_ns()
                 update_flow_orientation_kinetics!(orientation_tensor_state[],
                                                   orientation_scalar_particle,

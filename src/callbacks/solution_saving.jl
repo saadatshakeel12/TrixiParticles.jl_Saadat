@@ -97,6 +97,9 @@ function SolutionSavingCallback(; interval::Integer=0, dt=0.0,
         output_directory *= string("_", Dates.format(now(), "YY-mm-ddTHHMMSS"))
     end
 
+    # Shared with event snapshots (`save_vtu_snapshot!`) so PeriodicCallback
+    # and punch-up/eject saves never overwrite the same `_NNNNNN.vtu`.
+    reset_vtu_save_iter!(-1)
     initial_iter = -1
     restore_active = (get(ENV, "TP_CLIP_RESTORE_CHECKPOINT", "0") == "1") || 
                      (get(ENV, "TP_CLIP_SIM_PHASE", "") == "retraction")
@@ -131,7 +134,8 @@ function SolutionSavingCallback(; interval::Integer=0, dt=0.0,
                                                initial_iter, Ref("UnknownVersion"))
 
     if length(save_times) > 0
-        return PresetTimeCallback(save_times, solution_callback)
+        return PresetTimeCallback(save_times, solution_callback;
+                                    initialize=initialize_save_cb!)
     elseif dt > 0
         # Add a `tstop` every `dt`, and save the final solution
         return PeriodicCallback(solution_callback, dt,
@@ -153,9 +157,18 @@ function initialize_save_cb!(cb, u, t, integrator)
     initialize_save_cb!(cb.affect!, u, t, integrator)
 end
 
+# Monotonic VTU index used by both SolutionSavingCallback and driver event saves.
+const vtu_save_iter_ref = Ref(-1)
+reset_vtu_save_iter!(start::Int=-1) = (vtu_save_iter_ref[] = start; nothing)
+function take_vtu_save_iter!()
+    vtu_save_iter_ref[] += 1
+    return vtu_save_iter_ref[]
+end
+
 function initialize_save_cb!(solution_callback::SolutionSavingCallback, u, t, integrator)
     # Reset `latest_saved_iter`
     solution_callback.latest_saved_iter = -1
+    reset_vtu_save_iter!(-1)
     solution_callback.git_hash[] = compute_git_hash()
 
     write_meta_data(solution_callback, integrator)
@@ -198,8 +211,8 @@ function (solution_callback::SolutionSavingCallback)(integrator; from_initialize
             end
         end
         semi = integrator.p
-        solution_callback.latest_saved_iter += 1
-        iter = solution_callback.latest_saved_iter
+        iter = take_vtu_save_iter!()
+        solution_callback.latest_saved_iter = iter
 
         if verbose
             println("Writing solution to $output_directory at t = $(integrator.t)")

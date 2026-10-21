@@ -229,11 +229,14 @@ end
     # the built-in pk1_rho2.  The cached array is corrected PK1 stress (3×3×n); dividing
     # by rho² brings it to the same units as system.pk1_rho2.  Falls back to pk1_rho2
     # when cache is nothing (pk1_restored path) or belongs to a different system.
-    _cached       = STRESS_TENSOR_CACHE[]
-    _use_cache    = _cached !== nothing && _cached[1] == objectid(system)
-    
-    # Strictly type assert the cache to bypass CUDA InvalidIRError caused by capturing `Any`
-    _cache_stress = _use_cache ? (_cached[2]::typeof(system.correction_matrix)) : system.correction_matrix
+    _cache_entry = stress_tensor_cache_for(system)
+    _use_cache = _cache_entry !== nothing
+
+    # Type-assert to AbstractArray{Float64,3} (not `Any`) so CUDA IR stays valid, while
+    # still accepting ply-local SubArray views into a packed 3×3×N stress buffer.
+    _cache_stress = _use_cache ?
+                    (_cache_entry::AbstractArray{eltype(system), 3}) :
+                    system.correction_matrix
     
     _tensile_cache = tensile_stress_cache_tlsph(tensile_stress, system, _use_cache,
                                                 _cache_stress)

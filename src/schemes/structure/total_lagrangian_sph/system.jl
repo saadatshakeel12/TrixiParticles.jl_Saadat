@@ -233,6 +233,8 @@ end
 function initialize_self_interaction_nhs(system::TotalLagrangianSPHSystem,
                                          neighborhood_search, parallelization_backend)
     periodic_box = extract_periodic_box(neighborhood_search)
+    updated_lagrange = haskey(ENV, "TP_CLIP_UPDATED_LAGRANGE") &&
+                       ENV["TP_CLIP_UPDATED_LAGRANGE"] in ("1", "true")
 
     if system.self_interaction_nhs === :default
         if parallelization_backend isa KernelAbstractions.GPU
@@ -261,10 +263,12 @@ function initialize_self_interaction_nhs(system::TotalLagrangianSPHSystem,
                                parallelization_backend=PolyesterBackend())
 
     # Self-interaction only requires neighbors in the initial configuration,
-    # so the self-interaction NHS will never be updated.
+    # so the self-interaction NHS will never be updated unless updated_lagrange is enabled.
     # For the `PrecomputedNeighborhoodSearch`, "freezing" strips all data structures
     # that are only required for updating (and not necessarily GPU-compatible)
-    self_interaction_nhs = PointNeighbors.freeze_neighborhood_search(self_interaction_nhs)
+    if !updated_lagrange
+        self_interaction_nhs = PointNeighbors.freeze_neighborhood_search(self_interaction_nhs)
+    end
 
     @info "To create the self-interaction neighborhood search of a " *
           "`TotalLagrangianSPHSystem`, a deep copy of the system is created inside " *
@@ -484,7 +488,10 @@ function update_quantities!(system::TotalLagrangianSPHSystem, v, u, v_ode, u_ode
     # In the implicit custom-stress path we still need F for the constitutive law,
     # but pk1_rho2 is overridden by STRESS_TENSOR_CACHE in the RHS, so building the
     # default PK1 tensor would be redundant work.
-    if TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM[] === objectid(system)
+    deformation_only = TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM[]
+    system_id = objectid(system)
+    if deformation_only === system_id ||
+       (deformation_only isa AbstractSet && system_id in deformation_only)
         @trixi_timeit timer() "deformation gradient" calc_deformation_grad!(system.deformation_grad,
                                                                               system, v, dt,
                                                                               false, semi;

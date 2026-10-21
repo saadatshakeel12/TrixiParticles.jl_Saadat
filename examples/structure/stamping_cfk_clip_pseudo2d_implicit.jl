@@ -35,8 +35,10 @@ using SparseArrays
 using Logging
 using Serialization
 using Printf
+using Random
 
 include("../../src/schemes/structure/total_lagrangian_sph/fix_reimann.jl")
+include(joinpath(@__DIR__, "clip_charge_plies.jl"))
 
 function env_float(name, default)
     value = get(ENV, name, string(default))
@@ -194,6 +196,9 @@ function clip_build_charge_neighborhood_search(search_radius, coords)
         search_radius=search_radius)
 end
 
+const clip_updated_lagrange = env_int("TP_CLIP_UPDATED_LAGRANGE", 0) != 0
+const clip_updated_lagrange_interval = env_float("TP_CLIP_UPDATED_LAGRANGE_INTERVAL_S", 0.05)
+
 function clip_precomputed_nhs_template(; max_neighbors::Integer, n_tool::Integer=0)
     max_ppc = clip_nhs_max_points_per_cell(n_tool)
     inner = GridNeighborhoodSearch{3}(;
@@ -203,9 +208,13 @@ function clip_precomputed_nhs_template(; max_neighbors::Integer, n_tool::Integer
         update_neighborhood_search=inner, max_neighbors=max_neighbors)
 end
 
+function clip_charge_nhs_template(; max_neighbors::Integer, n_tool::Integer=0)
+    return clip_precomputed_nhs_template(; max_neighbors=max_neighbors, n_tool=n_tool)
+end
+
 function clip_build_wcsph_neighborhood_search(search_radius, semi)
     PointNeighbors.copy_neighborhood_search(
-        TrixiParticles.get_neighborhood_search(semi.systems[1], semi.systems[2], semi),
+        TrixiParticles.get_neighborhood_search(semi.systems[1], clip_floor_system(semi), semi),
         search_radius,
         nparticles(semi.systems[1]))
 end
@@ -215,7 +224,7 @@ end
 # FullGridCellList cannot be re-initialized on device coordinates.
 @inline function clip_wcsph_nhs(semi)
     clip_use_gpu && return TrixiParticles.get_neighborhood_search(semi.systems[1],
-                                                                  semi.systems[2],
+                                                                  clip_floor_system(semi),
                                                                   semi)
     return wcsph_current_nhs
 end
@@ -313,14 +322,27 @@ end
 
 # Implicit time integrator (OrdinaryDiffEq).
 #   implicit_euler — 1 implicit stage; default for clip (pairs with matrix_free JVP)
-#   trbdf2         — 2-stage L-stable (legacy default behaviour)
+#   reduced_implicit_euler — same as implicit_euler, Newton on [u,T] only
+#   trbdf2         — 2-stage L-stable (legacy default behaviour; full [v,T,u])
+#   reduced_trbdf2 — same TRBDF2 tableau, Newton on [u,T] only
 #   rodas5         — stiff Rosenbrock (fallback for difficult transients)
 function clip_integrator_mode()
     mode = lowercase(get(ENV, "TP_CLIP_INTEGRATOR", "trbdf2"))
-    mode in ("trbdf2", "implicit_euler", "rodas5", "explicit") ||
-        error("TP_CLIP_INTEGRATOR must be trbdf2, implicit_euler, rodas5, or explicit (got $(mode))")
+    mode in ("trbdf2", "reduced_trbdf2", "implicit_euler", "reduced_implicit_euler",
+             "rodas5", "explicit") ||
+        error("TP_CLIP_INTEGRATOR must be trbdf2, reduced_trbdf2, implicit_euler, " *
+              "reduced_implicit_euler, rodas5, or explicit (got $(mode))")
     return mode
 end
+
+@inline clip_reduced_implicit_euler_active() =
+    lowercase(get(ENV, "TP_CLIP_INTEGRATOR", "trbdf2")) == "reduced_implicit_euler"
+
+@inline clip_reduced_trbdf2_active() =
+    lowercase(get(ENV, "TP_CLIP_INTEGRATOR", "trbdf2")) == "reduced_trbdf2"
+
+@inline clip_reduced_ode_active() =
+    clip_reduced_implicit_euler_active() || clip_reduced_trbdf2_active()
 
 # Jacobian assembly for implicit Newton solves.
 #   matrix_free — directional J·v via 2 RHS evals + GMRES (no dense 882×882 build)
@@ -347,6 +369,35 @@ end
 const clip_ode_flat = Ref(false)
 const clip_ode_nv = Ref(0)
 const clip_ode_nu = Ref(0)
+const clip_ode_reduced = Ref(false)
+const clip_reduced_prev_t = Ref(0.0)
+const clip_reduced_prev_u = Ref(Float64[])
+const clip_reduced_prev_v = Ref(Float64[])
+const clip_reduced_mech_v_idx = Ref(Int[])
+const clip_reduced_temp_v_idx = Ref(Int[])
+const clip_reduced_temp_ranges = Ref(UnitRange{Int}[])
+const clip_reduced_v_work = Ref(Float64[])
+const clip_reduced_dv_work = Ref(Float64[])
+const clip_reduced_accepted_v = Ref(Float64[])
+const clip_reduced_accepted_t = Ref(-Inf)
+# Reduced TRBDF2 only (stock TRBDF2 / both implicit-Euler paths ignore these).
+# OrdinaryDiffEq TRBDF2 tableau: γ=2-√2, d=γ/2, ω=√2/4.
+const CLIP_TRBDF2_γ = 2 - sqrt(2)
+const CLIP_TRBDF2_d = 1 - sqrt(2) / 2
+const CLIP_TRBDF2_ω = sqrt(2) / 4
+const clip_reduced_trbdf2_an = Ref(Float64[])
+const clip_reduced_trbdf2_aγ = Ref(Float64[])
+const clip_reduced_trbdf2_vγ = Ref(Float64[])
+const clip_reduced_trbdf2_fγ = Ref(Float64[])
+const clip_reduced_trbdf2_an_t = Ref(-Inf)
+const clip_reduced_trbdf2_an_h = Ref(NaN)
+# Step size inferred from the trapezoid node (Δt = γ h). Do not classify stages from
+# clip_integrator_dt: after an accepted step the PI controller may raise dt before the
+# next RHS, so a stale clip_integrator_dt mislabels trapezoid as BDF2.
+const clip_reduced_trbdf2_h_step = Ref(NaN)
+const clip_reduced_trbdf2_has_γ = Ref(false)
+const clip_reduced_trbdf2_freeze_stage_cache = Ref(false)
+const clip_reduced_trbdf2_fsalfirst = Ref{Union{Nothing, Vector{Float64}}}(nothing)
 const CURRENT_JACOBIAN_STRATEGY = Ref("dense")
 const clip_jvp_work = Ref{Union{Nothing, NamedTuple{(:y_plus, :y_minus, :fp, :fm),
                                                     NTuple{4, Vector{Float64}}}}}(nothing)
@@ -393,9 +444,52 @@ const clip_contact_same_t_cache = env_int("TP_CLIP_CONTACT_SAME_T_CACHE", 0) != 
 const clip_contact_jac_cache_valid = Ref(false)
 const clip_contact_same_t_updated_at = Ref(-Inf)
 
+# Reuse finite-difference Jacobian *entries* across OrdinaryDiffEq jac requests.
+# ODE already has NLNewton(always_new=false), but stiff contact / adaptive Δt often
+# still requests a fresh J every accepted step. When enabled, skip the colored FD
+# fill and copy the last nzval cache for up to TP_CLIP_JAC_REUSE_STEPS requests
+# (W = γΔt scaling is still rebuilt by OrdinaryDiffEq from the reused J).
+const clip_jac_reuse_entries = env_int("TP_CLIP_JAC_REUSE_ENTRIES", 0) != 0
+const clip_jac_reuse_max_steps = max(0, env_int("TP_CLIP_JAC_REUSE_STEPS", 10))
+const clip_jac_cached_nzval = Ref{Union{Nothing, Vector{Float64}}}(nothing)
+const clip_jac_reuse_age = Ref(0)
+const clip_jac_reuse_hits = Ref(0)
+const clip_jac_reuse_fills = Ref(0)
+
 function clip_reset_jacobian_coloring!()
     clip_jac_coloring_n[] = 0
     clip_jac_sparsity_pattern[] = nothing
+    clip_jac_cached_nzval[] = nothing
+    clip_jac_reuse_age[] = 0
+    clip_jac_reuse_hits[] = 0
+    clip_jac_reuse_fills[] = 0
+    return nothing
+end
+
+function clip_maybe_reuse_sparse_jac_entries!(J)::Bool
+    clip_jac_reuse_entries || return false
+    clip_jac_reuse_max_steps <= 0 && return false
+    cache = clip_jac_cached_nzval[]
+    cache === nothing && return false
+    length(cache) != length(J.nzval) && return false
+    clip_jac_reuse_age[] >= clip_jac_reuse_max_steps && return false
+    copyto!(J.nzval, cache)
+    clip_jac_reuse_age[] += 1
+    clip_jac_reuse_hits[] += 1
+    if clip_jac_fill_print
+        println(">>> Reusing Sparse Jacobian entries (age=", clip_jac_reuse_age[],
+                "/", clip_jac_reuse_max_steps, "; fills=", clip_jac_reuse_fills[],
+                ", hits=", clip_jac_reuse_hits[], ")")
+        flush(stdout)
+    end
+    return true
+end
+
+function clip_store_sparse_jac_entries!(J)
+    clip_jac_reuse_entries || return nothing
+    clip_jac_cached_nzval[] = copy(J.nzval)
+    clip_jac_reuse_age[] = 0
+    clip_jac_reuse_fills[] += 1
     return nothing
 end
 
@@ -474,6 +568,11 @@ end
 
 function clip_sparse_jacobian!(J, y, p, t)
     clip_sync_trial_dt_state!()
+    if clip_maybe_reuse_sparse_jac_entries!(J)
+        println(">>> Factorizing / solving Newton linear system (UMFPACK; J reused)...")
+        flush(stdout)
+        return nothing
+    end
     nv = clip_ode_nv[]
     nu = clip_ode_nu[]
     fill!(J.nzval, 0.0)
@@ -487,7 +586,8 @@ function clip_sparse_jacobian!(J, y, p, t)
         end
     end
     clip_colored_jacobian_fill!(y, p, t, nv, nu, set_column_sparse!)
-    println(">>> Factorizing / solving Newton linear system (UMFPACK)...")
+    clip_store_sparse_jac_entries!(J)
+    println(">>> Factorizing / solving Newton linear system (UMFPACK; J refreshed)...")
     flush(stdout)
     return nothing
 end
@@ -591,6 +691,223 @@ function clip_combined_rhs!(dy, y, semi_local, t, nv::Int, nu::Int)
     return nothing
 end
 
+# Reduced implicit Euler state q=[u,T]. Mechanical velocity is eliminated exactly:
+# v_{n+1}=(u_{n+1}-u_n)/h and
+# u_{n+1}=u_n+h*v_n+h^2*a(u_{n+1},v_{n+1},T_{n+1}).
+# Therefore the pseudo-ODE RHS below gives the same ImplicitEuler nonlinear residual
+# as the full first-order [v,T,u] system while Newton only sees 3u+1T unknowns.
+function clip_reduced_rhs!(dq, q, semi_local, t)
+    nu = length(clip_reduced_prev_u[])
+    nt = length(clip_reduced_temp_v_idx[])
+    length(q) == nu + nt ||
+        error("Reduced implicit Euler state size mismatch: $(length(q)) != $(nu + nt)")
+
+    u = @view q[1:nu]
+    T = @view q[nu+1:nu+nt]
+    du = @view dq[1:nu]
+    dT = @view dq[nu+1:nu+nt]
+    prev_u = clip_reduced_prev_u[]
+    prev_v = clip_reduced_prev_v[]
+    v = clip_reduced_v_work[]
+    dv = clip_reduced_dv_work[]
+    mech_v_idx = clip_reduced_mech_v_idx[]
+    temp_v_idx = clip_reduced_temp_v_idx[]
+
+    # For ImplicitEuler the only stage is t_{n+1}. Using t-t_n also tracks rejected
+    # step-size changes, unlike a callback-updated dt cache.
+    h_stage = t - clip_reduced_prev_t[]
+    at_accepted_time = !(isfinite(h_stage) && h_stage > 0.0)
+    h = h_stage
+    if at_accepted_time
+        h = max(abs(trial_dt_state[]), eps(Float64))
+    end
+    clip_integrator_dt[] = h
+    trial_dt_state[] = h
+
+    copyto!(v, prev_v)
+    if !at_accepted_time
+        @inbounds for i in eachindex(u)
+            v[mech_v_idx[i]] = (u[i] - prev_u[i]) / h
+        end
+    end
+    @inbounds for i in eachindex(T)
+        v[temp_v_idx[i]] = T[i]
+    end
+
+    kick_implicit_visible!(dv, v, u, semi_local, t)
+    @inbounds for i in eachindex(u)
+        vi = mech_v_idx[i]
+        du[i] = prev_v[vi] + h * dv[vi]
+    end
+    @inbounds for i in eachindex(T)
+        dT[i] = dv[temp_v_idx[i]]
+    end
+    return nothing
+end
+
+function clip_reduced_current_rhs!(dq, q, semi_local, t)
+    if clip_reduced_trbdf2_active()
+        clip_reduced_trbdf2_rhs!(dq, q, semi_local, t)
+    else
+        clip_reduced_rhs!(dq, q, semi_local, t)
+    end
+    return nothing
+end
+
+function clip_reduced_trbdf2_ensure_an!(semi_local, t_n, h)
+    an = clip_reduced_trbdf2_an[]
+    (clip_reduced_trbdf2_an_t[] == t_n && clip_reduced_trbdf2_an_h[] == h) && return an
+    prev_u = clip_reduced_prev_u[]
+    prev_v = clip_reduced_prev_v[]
+    v = clip_reduced_v_work[]
+    dv = clip_reduced_dv_work[]
+    mech_v_idx = clip_reduced_mech_v_idx[]
+    copyto!(v, prev_v)
+    kick_implicit_visible!(dv, v, prev_u, semi_local, t_n)
+    @inbounds for i in eachindex(an)
+        an[i] = dv[mech_v_idx[i]]
+    end
+    clip_reduced_trbdf2_an_t[] = t_n
+    clip_reduced_trbdf2_an_h[] = h
+    return an
+end
+
+# Reduced TRBDF2 state q=[u,T]. Stock OrdinaryDiffEq TRBDF2 is unchanged; this
+# pseudo-RHS makes its two ESDIRK stages equivalent to TRBDF2 on [v,T,u] after
+# eliminating mechanical velocity. Stage-2/3 u-residuals compensate whatever
+# value is currently in integrator.fsalfirst (dt-dependent FSAL).
+function clip_reduced_trbdf2_rhs!(dq, q, semi_local, t)
+    nu = length(clip_reduced_prev_u[])
+    nt = length(clip_reduced_temp_v_idx[])
+    length(q) == nu + nt ||
+        error("Reduced TRBDF2 state size mismatch: $(length(q)) != $(nu + nt)")
+
+    u = @view q[1:nu]
+    T = @view q[nu+1:nu+nt]
+    du = @view dq[1:nu]
+    dT = @view dq[nu+1:nu+nt]
+    prev_u = clip_reduced_prev_u[]
+    prev_v = clip_reduced_prev_v[]
+    v = clip_reduced_v_work[]
+    dv = clip_reduced_dv_work[]
+    mech_v_idx = clip_reduced_mech_v_idx[]
+    temp_v_idx = clip_reduced_temp_v_idx[]
+    t_n = clip_reduced_prev_t[]
+    Δt = t - t_n
+    dtab = CLIP_TRBDF2_d
+    ωtab = CLIP_TRBDF2_ω
+    γtab = CLIP_TRBDF2_γ
+
+    at_accepted_time = !(isfinite(Δt) && Δt > 0.0)
+    h_cached = clip_reduced_trbdf2_h_step[]
+    h = if at_accepted_time
+        max(abs(clip_integrator_dt[]), abs(trial_dt_state[]),
+            isfinite(h_cached) ? abs(h_cached) : 0.0, eps(Float64))
+    elseif !clip_reduced_trbdf2_has_γ[]
+        # First implicit node of this step is always trapezoid: t_n + γ h.
+        Δt / γtab
+    elseif isfinite(h_cached) && h_cached > 0.0
+        h_cached
+    else
+        Δt
+    end
+    if !at_accepted_time && !clip_reduced_trbdf2_has_γ[]
+        clip_reduced_trbdf2_h_step[] = h
+    end
+    clip_integrator_dt[] = h
+    trial_dt_state[] = h
+    dh = dtab * h
+
+    copyto!(v, prev_v)
+    if at_accepted_time
+        @inbounds for i in eachindex(T)
+            v[temp_v_idx[i]] = T[i]
+        end
+        kick_implicit_visible!(dv, v, u, semi_local, t)
+        @inbounds for i in eachindex(u)
+            vi = mech_v_idx[i]
+            du[i] = prev_v[vi] + dh * dv[vi]
+        end
+        @inbounds for i in eachindex(T)
+            dT[i] = dv[temp_v_idx[i]]
+        end
+        return nothing
+    end
+
+    # Jacobian fills at the trapezoid node reuse this residual after has_γ is set.
+    # Classify those by Δt vs this step's h, not by the possibly stale integrator dt.
+    stage_γ = !clip_reduced_trbdf2_has_γ[] || (Δt / h) < (γtab + 1.0) / 2.0
+    if stage_γ
+        an = clip_reduced_trbdf2_ensure_an!(semi_local, t_n, h)
+        @inbounds for i in eachindex(u)
+            v[mech_v_idx[i]] = (u[i] - prev_u[i]) / dh - prev_v[mech_v_idx[i]]
+        end
+        @inbounds for i in eachindex(T)
+            v[temp_v_idx[i]] = T[i]
+        end
+        kick_implicit_visible!(dv, v, u, semi_local, t)
+        fs = clip_reduced_trbdf2_fsalfirst[]
+        @inbounds for i in eachindex(u)
+            vi = mech_v_idx[i]
+            fn_i = if fs !== nothing && length(fs) >= i
+                fs[i]
+            else
+                prev_v[vi] + dh * an[i]
+            end
+            du[i] = 2.0 * prev_v[vi] + dh * (an[i] + dv[vi]) - fn_i
+        end
+        @inbounds for i in eachindex(T)
+            dT[i] = dv[temp_v_idx[i]]
+        end
+        if !clip_reduced_trbdf2_freeze_stage_cache[]
+            vγ = clip_reduced_trbdf2_vγ[]
+            aγ = clip_reduced_trbdf2_aγ[]
+            fγ = clip_reduced_trbdf2_fγ[]
+            @inbounds for i in eachindex(u)
+                vi = mech_v_idx[i]
+                vγ[i] = v[vi]
+                aγ[i] = dv[vi]
+                fγ[i] = du[i]
+            end
+            clip_reduced_trbdf2_has_γ[] = true
+        end
+        return nothing
+    end
+
+    clip_reduced_trbdf2_has_γ[] ||
+        error("Reduced TRBDF2 BDF2 stage evaluated before trapezoid stage cache")
+    an = clip_reduced_trbdf2_ensure_an!(semi_local, t_n, h)
+    vγ = clip_reduced_trbdf2_vγ[]
+    aγ = clip_reduced_trbdf2_aγ[]
+    fγ = clip_reduced_trbdf2_fγ[]
+    ωh = ωtab * h
+    @inbounds for i in eachindex(u)
+        vi = mech_v_idx[i]
+        v[vi] = (u[i] - prev_u[i] - ωh * prev_v[vi] - ωh * vγ[i]) / dh
+    end
+    @inbounds for i in eachindex(T)
+        v[temp_v_idx[i]] = T[i]
+    end
+    kick_implicit_visible!(dv, v, u, semi_local, t)
+    fs = clip_reduced_trbdf2_fsalfirst[]
+    ω_over_d = ωtab / dtab
+    @inbounds for i in eachindex(u)
+        vi = mech_v_idx[i]
+        fn_i = if fs !== nothing && length(fs) >= i
+            fs[i]
+        else
+            prev_v[vi] + dh * an[i]
+        end
+        Δu = (ωtab + dtab) * h * prev_v[vi] + ωh * vγ[i] +
+             ωtab * dtab * h * h * (an[i] + aγ[i]) + dh * dh * dv[vi]
+        du[i] = Δu / dh - ω_over_d * (fn_i + fγ[i])
+    end
+    @inbounds for i in eachindex(T)
+        dT[i] = dv[temp_v_idx[i]]
+    end
+    return nothing
+end
+
 function clip_combined_jvp!(Jv, y, vdir, semi_local, t, nv::Int, nu::Int)
     w = clip_ensure_jvp_work!(length(y))
     ε = clip_jvp_epsilon(y, vdir)
@@ -603,6 +920,40 @@ function clip_combined_jvp!(Jv, y, vdir, semi_local, t, nv::Int, nu::Int)
 end
 
 function clip_integrator_vu(integrator)
+    if clip_ode_reduced[]
+        q = integrator.u
+        nu = length(clip_reduced_prev_u[])
+        u = @view q[1:nu]
+        if clip_reduced_accepted_t[] != integrator.t
+            v = clip_reduced_accepted_v[]
+            copyto!(v, clip_reduced_prev_v[])
+            h = integrator.t - clip_reduced_prev_t[]
+            if isfinite(h) && h > 0.0
+                if clip_reduced_trbdf2_active() && clip_reduced_trbdf2_has_γ[]
+                    dtab = CLIP_TRBDF2_d
+                    ωtab = CLIP_TRBDF2_ω
+                    dh = dtab * h
+                    ωh = ωtab * h
+                    vγ = clip_reduced_trbdf2_vγ[]
+                    @inbounds for i in eachindex(u)
+                        vi = clip_reduced_mech_v_idx[][i]
+                        v[vi] = (u[i] - clip_reduced_prev_u[][i] -
+                                 ωh * clip_reduced_prev_v[][vi] - ωh * vγ[i]) / dh
+                    end
+                else
+                    @inbounds for i in eachindex(u)
+                        v[clip_reduced_mech_v_idx[][i]] =
+                            (u[i] - clip_reduced_prev_u[][i]) / h
+                    end
+                end
+            end
+            @inbounds for i in eachindex(clip_reduced_temp_v_idx[])
+                v[clip_reduced_temp_v_idx[][i]] = q[nu + i]
+            end
+            clip_reduced_accepted_t[] = integrator.t
+        end
+        return clip_reduced_accepted_v[], u
+    end
     if clip_ode_flat[]
         nv = clip_ode_nv[]
         nu = clip_ode_nu[]
@@ -613,12 +964,37 @@ function clip_integrator_vu(integrator)
 end
 
 function clip_integrator_vu_partition(integrator)
+    if clip_ode_reduced[]
+        v, u = clip_integrator_vu(integrator)
+        return ArrayPartition(v, u)
+    end
     if clip_ode_flat[]
         nv = clip_ode_nv[]
         u = integrator.u
         return ArrayPartition(@view(u[1:nv]), @view(u[nv+1:end]))
     end
     return integrator.u
+end
+
+function clip_commit_reduced_accepted_state!(integrator, v_ode_state, u_ode_state)
+    clip_ode_reduced[] || return nothing
+    nu = length(clip_reduced_prev_u[])
+    q = integrator.u
+    # Accepted-step callbacks may clamp velocities or update temperature. Persist those
+    # changes before the next reduced Newton solve.
+    @inbounds for i in eachindex(clip_reduced_temp_v_idx[])
+        q[nu + i] = v_ode_state[clip_reduced_temp_v_idx[][i]]
+    end
+    copyto!(clip_reduced_prev_u[], u_ode_state)
+    copyto!(clip_reduced_prev_v[], v_ode_state)
+    clip_reduced_prev_t[] = integrator.t
+    clip_reduced_accepted_t[] = -Inf
+    clip_reduced_trbdf2_has_γ[] = false
+    clip_reduced_trbdf2_an_h[] = NaN
+    if clip_reduced_trbdf2_active()
+        clip_reduced_trbdf2_refresh_fsalfirst!(integrator)
+    end
+    return nothing
 end
 
 # Positions for SPH-locality Jacobian sparsity (current ODE state, not reference mesh).
@@ -745,10 +1121,187 @@ function clip_build_sparse_jacobian_prototype(semi, v0_ode, u0_ode; D_max=0.006,
     return sparse(I_rows, J_cols, ones(length(I_rows)), n_total, n_total)
 end
 
+function clip_initialize_reduced_state!(semi, v0_ode, u0_ode, t0)
+    nu = length(u0_ode)
+    mech_v_idx = zeros(Int, nu)
+    temp_v_idx = Int[]
+    temp_ranges = UnitRange{Int}[]
+    temp_offset = 0
+
+    for (idx, system) in enumerate(semi.systems)
+        n = TrixiParticles.n_integrated_particles(system)
+        rv = semi.ranges_v[idx]
+        ru = semi.ranges_u[idx]
+        if n == 0 || isempty(rv) || isempty(ru)
+            push!(temp_ranges, (temp_offset + 1):temp_offset)
+            continue
+        end
+        nd = TrixiParticles.ndims(system)
+        vs = TrixiParticles.v_nvariables(system)
+        us = TrixiParticles.u_nvariables(system)
+        us == nd || error("Reduced implicit Euler requires u_nvariables == ndims")
+        vs >= nd + 1 ||
+            error("Reduced implicit Euler requires a temperature row in the v block")
+        first_temp = temp_offset + 1
+        @inbounds for particle in 1:n
+            for d in 1:nd
+                ui = first(ru) + d - 1 + us * (particle - 1)
+                vi = first(rv) + d - 1 + vs * (particle - 1)
+                mech_v_idx[ui] = vi
+            end
+            push!(temp_v_idx, first(rv) + nd + vs * (particle - 1))
+            temp_offset += 1
+        end
+        push!(temp_ranges, first_temp:temp_offset)
+    end
+    any(iszero, mech_v_idx) &&
+        error("Reduced implicit Euler could not map every displacement DOF to velocity")
+
+    clip_ode_reduced[] = true
+    clip_ode_flat[] = false
+    clip_ode_nv[] = length(v0_ode)
+    clip_ode_nu[] = nu
+    clip_reduced_prev_t[] = Float64(t0)
+    clip_reduced_prev_u[] = Vector{Float64}(u0_ode)
+    clip_reduced_prev_v[] = Vector{Float64}(v0_ode)
+    clip_reduced_mech_v_idx[] = mech_v_idx
+    clip_reduced_temp_v_idx[] = temp_v_idx
+    clip_reduced_temp_ranges[] = temp_ranges
+    clip_reduced_v_work[] = similar(clip_reduced_prev_v[])
+    clip_reduced_dv_work[] = similar(clip_reduced_prev_v[])
+    clip_reduced_accepted_v[] = similar(clip_reduced_prev_v[])
+    clip_reduced_accepted_t[] = -Inf
+    clip_reduced_trbdf2_an[] = zeros(nu)
+    clip_reduced_trbdf2_aγ[] = zeros(nu)
+    clip_reduced_trbdf2_vγ[] = zeros(nu)
+    clip_reduced_trbdf2_fγ[] = zeros(nu)
+    clip_reduced_trbdf2_an_t[] = -Inf
+    clip_reduced_trbdf2_an_h[] = NaN
+    clip_reduced_trbdf2_h_step[] = NaN
+    clip_reduced_trbdf2_has_γ[] = false
+    clip_reduced_trbdf2_freeze_stage_cache[] = false
+    clip_reduced_trbdf2_fsalfirst[] = nothing
+
+    q0 = Vector{Float64}(undef, nu + length(temp_v_idx))
+    copyto!(@view(q0[1:nu]), u0_ode)
+    @inbounds for i in eachindex(temp_v_idx)
+        q0[nu + i] = v0_ode[temp_v_idx[i]]
+    end
+    return q0
+end
+
+function clip_build_reduced_sparse_jacobian_prototype(semi, u0_ode)
+    nu = length(u0_ode)
+    nt = length(clip_reduced_temp_v_idx[])
+    nq = nu + nt
+    I_rows = Int[]
+    J_cols = Int[]
+    coords_state = clip_jacobian_pattern_coords(semi, u0_ode)
+    temp_ranges = clip_reduced_temp_ranges[]
+
+    println(">>> Reduced Jacobian sparsity: local [u,T] neighbor graph.")
+    flush(stdout)
+    for (A_idx, sys_A) in enumerate(semi.systems)
+        ru_A = semi.ranges_u[A_idx]
+        n_A = TrixiParticles.n_integrated_particles(sys_A)
+        (n_A == 0 || isempty(ru_A)) && continue
+        us_A = TrixiParticles.u_nvariables(sys_A)
+        h_A = TrixiParticles.initial_smoothing_length(sys_A)
+        tr_A = temp_ranges[A_idx]
+
+        for i in 1:n_A
+            pos_i = coords_state[A_idx][:, i]
+            rows = [first(ru_A) + d - 1 + us_A * (i - 1) for d in 1:us_A]
+            push!(rows, nu + first(tr_A) + i - 1)
+
+            for (B_idx, sys_B) in enumerate(semi.systems)
+                ru_B = semi.ranges_u[B_idx]
+                n_B = TrixiParticles.n_integrated_particles(sys_B)
+                (n_B == 0 || isempty(ru_B)) && continue
+                us_B = TrixiParticles.u_nvariables(sys_B)
+                h_B = TrixiParticles.initial_smoothing_length(sys_B)
+                tr_B = temp_ranges[B_idx]
+                h_contact = max(h_A, h_B)
+                for j in 1:n_B
+                    pos_j = coords_state[B_idx][:, j]
+                    if (A_idx == B_idx && i == j) ||
+                       norm(pos_i - pos_j) <= clip_jac_radius_mult * h_contact
+                        cols = [first(ru_B) + d - 1 + us_B * (j - 1)
+                                for d in 1:us_B]
+                        push!(cols, nu + first(tr_B) + j - 1)
+                        for r in rows, c in cols
+                            push!(I_rows, r)
+                            push!(J_cols, c)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return sparse(I_rows, J_cols, ones(length(I_rows)), nq, nq)
+end
+
+function clip_reduced_sparse_jacobian!(J, q, p, t)
+    if clip_maybe_reuse_sparse_jac_entries!(J)
+        println(">>> Factorizing / solving reduced Newton system (UMFPACK; J reused)...")
+        flush(stdout)
+        return nothing
+    end
+    fill!(J.nzval, 0.0)
+    groups = clip_jac_groups[]
+    f0 = similar(q)
+    fpert = similar(q)
+    qpert = copy(q)
+    clip_in_jacobian_fill[] = true
+    clip_thermal_jac_cache_valid[] = false
+    clip_contact_jac_cache_valid[] = false
+    try
+        clip_reduced_current_rhs!(f0, q, p, t)
+        epsilon = 1.0e-7
+        clip_reduced_trbdf2_freeze_stage_cache[] = true
+        for cols in groups
+            @inbounds for col in cols
+                qpert[col] += epsilon
+            end
+            clip_reduced_current_rhs!(fpert, qpert, p, t)
+            @inbounds for col in cols
+                qpert[col] = q[col]
+                for ptr in J.colptr[col]:(J.colptr[col + 1] - 1)
+                    row = J.rowval[ptr]
+                    J.nzval[ptr] = (fpert[row] - f0[row]) / epsilon
+                end
+            end
+        end
+    finally
+        clip_reduced_trbdf2_freeze_stage_cache[] = false
+        clip_in_jacobian_fill[] = false
+    end
+    clip_store_sparse_jac_entries!(J)
+    println(">>> Factorizing / solving reduced Newton system (UMFPACK; J refreshed)...")
+    flush(stdout)
+    return nothing
+end
+
 function clip_build_ode_problem(v0_ode, u0_ode, tspan, semi_local;
                                 jacobian_strategy::String=clip_jacobian_strategy())
     CURRENT_JACOBIAN_STRATEGY[] = jacobian_strategy
-    if jacobian_strategy == "matrix_free"
+    if clip_reduced_ode_active()
+        jacobian_strategy == "sparse" ||
+            error("reduced_implicit_euler / reduced_trbdf2 currently require TP_CLIP_JACOBIAN_STRATEGY=sparse")
+        q0 = clip_initialize_reduced_state!(semi_local, v0_ode, u0_ode, first(tspan))
+        clip_reset_jacobian_coloring!()
+        jac_sparsity = clip_build_reduced_sparse_jacobian_prototype(semi_local, u0_ode)
+        n_colors = clip_precompute_jacobian_coloring!(jac_sparsity)
+        println("✓ Reduced sparse Jacobian size $(size(jac_sparsity)), ",
+                "$(nnz(jac_sparsity)) nonzeros, ", n_colors, " color groups ",
+                "(full state $(length(v0_ode) + length(u0_ode)) → reduced $(length(q0)) DOF).")
+        flush(stdout)
+        f = ODEFunction(clip_reduced_current_rhs!;
+                        jac=clip_reduced_sparse_jacobian!,
+                        jac_prototype=jac_sparsity)
+        return ODEProblem(f, q0, tspan, semi_local)
+    elseif jacobian_strategy == "matrix_free"
+        clip_ode_reduced[] = false
         nv = length(v0_ode)
         nu = length(u0_ode)
         clip_ode_flat[] = true
@@ -760,6 +1313,7 @@ function clip_build_ode_problem(v0_ode, u0_ode, tspan, semi_local;
         f = ODEFunction(rhs_local; jvp=jvp_local)
         return ODEProblem(f, y0, tspan, semi_local)
     elseif jacobian_strategy == "sparse"
+        clip_ode_reduced[] = false
         nv = length(v0_ode)
         nu = length(u0_ode)
         clip_ode_flat[] = true
@@ -778,6 +1332,7 @@ function clip_build_ode_problem(v0_ode, u0_ode, tspan, semi_local;
         f = ODEFunction(rhs_local; jac=clip_sparse_jacobian!, jac_prototype=jac_sparsity)
         return ODEProblem(f, y0, tspan, semi_local)
     elseif jacobian_strategy == "colored"
+        clip_ode_reduced[] = false
         nv = length(v0_ode)
         nu = length(u0_ode)
         n_total = nv + nu
@@ -802,6 +1357,7 @@ function clip_build_ode_problem(v0_ode, u0_ode, tspan, semi_local;
         f = ODEFunction(rhs_local; jac=clip_colored_dense_jacobian!, jac_prototype=jac_prototype)
         return ODEProblem(f, y0, tspan, semi_local)
     end
+    clip_ode_reduced[] = false
     clip_ode_flat[] = false
     return DynamicalODEProblem(kick_implicit_visible!, drift_implicit_visible!,
                                v0_ode, u0_ode, tspan, semi_local)
@@ -814,7 +1370,7 @@ function clip_build_implicit_algorithm(integrator_mode::String;
                                        nlsolve=nothing)
     autodiff_arg = (use_matrix_free || jacobian_autodiff === nothing) ? false : jacobian_autodiff
     nlsolve_kw = nlsolve === nothing ? () : (; nlsolve)
-    if integrator_mode == "implicit_euler"
+    if integrator_mode in ("implicit_euler", "reduced_implicit_euler")
         return ImplicitEuler(; linsolve=linsolve_solver, autodiff=autodiff_arg, nlsolve_kw...)
     elseif integrator_mode == "rodas5"
         # Rosenbrock methods do not use Newton's method; OrdinaryDiffEq Rodas5 does not accept `nlsolve`.
@@ -830,10 +1386,24 @@ end
 #   full       — compression + hold + retraction (default)
 #   hold       — compression + hold, save checkpoint, stop before retraction
 #   retraction — load checkpoint, run retraction only
-const CHECKPOINT_VERSION = 2
+const separate_charge_plies = env_int("TP_CLIP_SEPARATE_CHARGE_PLIES", 0) != 0
+# Legacy packed-charge files remain v2 byte-for-byte. A future multi-charge
+# checkpoint must identify the per-ply layout explicitly as v3.
+const CHECKPOINT_VERSION = separate_charge_plies ? 3 : 2
 const sim_phase = lowercase(get(ENV, "TP_CLIP_SIM_PHASE", "hold"))
 sim_phase in ("full", "hold", "retraction") ||
     error("TP_CLIP_SIM_PHASE must be full, hold, or retraction (got $(sim_phase))")
+# SPH flyaways stay in the checkpoint/ODE layout but are frozen and skipped in
+# tool contact, peel gaps, span, and J-floor. Default ON for retraction.
+const ignore_charge_flyaways = env_int("TP_CLIP_IGNORE_FLYAWAWAYS",
+    sim_phase == "retraction" ? 1 : 0) != 0
+const charge_flyaway_count = Ref(0)
+if separate_charge_plies && sim_phase != "hold"
+    error("TP_CLIP_SEPARATE_CHARGE_PLIES=1 is currently restricted to ongoing " *
+          "CPU compression+hold integration work. TP_CLIP_SIM_PHASE=$(sim_phase) is " *
+          "explicitly unsupported; separate-ply checkpoint restore and retraction " *
+          "have not been converted.")
+end
 # Geometry: pseudo2d (1 y-layer), thin3d (few y-layers, plane constraints), full3d (resolved y).
 function clip_geometry_mode()
     mode = if haskey(ENV, "TP_CLIP_GEOMETRY")
@@ -855,23 +1425,61 @@ const ps_mm_nominal = env_float("TP_CLIP_PS_MM", 1.8)
     return string(round(Int, round(Float64(ps_mm) * 10)))
 end
 const ps_run_tag = ps_mm_run_tag(ps_mm_nominal)
+# Bulk → out/bulk, sheet → out/sheet (launchers set TP_CLIP_OUT_DIR). Default remains out/.
+const clip_out_dir = get(ENV, "TP_CLIP_OUT_DIR", "out")
 const save_checkpoint_at_hold = env_int("TP_CLIP_SAVE_CHECKPOINT", 1) != 0
 const checkpoint_path = get(ENV, "TP_CLIP_CHECKPOINT",
-                            joinpath("out",
+                            joinpath(clip_out_dir,
                                      "molding_cfk_" * geometry_name_tag * "_hold_checkpoint_" *
                                      ps_run_tag * ".dat"))
+# Permanent pre-eject snapshot (in-die cool done). Reuse this to skip creep/lift/cool.
+const retraction_preeject_checkpoint_path = get(ENV, "TP_CLIP_PREEJECT_CHECKPOINT",
+    replace(checkpoint_path, r"\.dat$" => "_preeject.dat"))
+retraction_from_preeject = Ref(false)
+# Optional in-die cool snapshot (no eject). Empty = do not write.
+const retraction_cool_end_checkpoint_path = strip(get(ENV, "TP_CLIP_COOL_END_CHECKPOINT", ""))
+# Checkpoint A: closed-die cool to target, punch still down.
+const retraction_closed30_checkpoint_path = strip(get(ENV, "TP_CLIP_CLOSED30_CHECKPOINT", ""))
+# Checkpoint B: constrained settle at target T, punch still down, shape OK.
+const retraction_closed30_settle_checkpoint_path =
+    strip(get(ENV, "TP_CLIP_CLOSED30_SETTLE_CHECKPOINT", ""))
+const retraction_closed30_settle_s =
+    max(env_float("TP_CLIP_RETRACTION_CLOSED30_SETTLE_S", 0.0), 0.0)
+retraction_closed30_ckpt_saved = Ref(false)
+retraction_closed30_settle_start_t = Ref(Inf)
 # TLSPH equilibration after solidification, before checkpoint (WCSPH off during tail).
 # Stress relaxation at hold temperature while the die stays closed (thermoplastic creep /
 # contact redistribution). Default 0.15 s — increase if checkpoint still shows tool overlap.
 const hold_tlsph_tail_s = env_float("TP_CLIP_HOLD_TLSPH_TAIL_S", 0.0)
+# Stress relaxation rate stopping condition during closed-die hold:
+# Stops hold when ||dσ/dt|| drops below threshold [Pa/s] (e.g. 1.0e5 = 0.1 MPa/s).
+const hold_stress_rate_threshold = env_float("TP_CLIP_HOLD_STRESS_RATE_THRESHOLD", NaN)
+const hold_tlsph_tail_min_s = env_float("TP_CLIP_HOLD_TLSPH_TAIL_MIN_S", 0.0002)
+const hold_tlsph_tail_ramp_s = env_float("TP_CLIP_HOLD_TLSPH_TAIL_RAMP_S", 0.0001)
+const hold_stress_rate_current = Ref(Inf)
+const hold_stress_rate_converged = Ref(false)
+const hold_prev_stress_mean = Ref(NaN)
+const hold_prev_stress_t = Ref(NaN)
 # Hold end: Spencer fibre reference n_ref ← F⁻¹·ê so I4=|F·n_ref|²=1 at formed F (stress-free fibres at demold).
 const hold_end_spencer_align = env_int("TP_CLIP_HOLD_END_SPENCER_ALIGN", 1) != 0
 # Strategy E: volumetric plasticity J_p with isochoric F_p. det(F) = J_e_vol * J_p; bulk uses J_e_vol vs 1.
 const use_volumetric_plasticity = env_int("TP_CLIP_VOLUMETRIC_PLASTICITY", 1) != 0
 const hold_end_fp_reset = env_int("TP_CLIP_HOLD_END_FP_RESET", use_volumetric_plasticity ? 0 : 1) != 0
 # Floor det(F) at hold-end / retraction start so crushed J (≪1) does not inject GPa bulk stress.
-const hold_end_J_floor = sim_phase in ("retraction", "hold", "full") ?
+# Default ON for compress/hold/full/retraction (0.15). Set TP_CLIP_HOLD_END_J_FLOOR=0 to disable.
+const hold_end_J_floor = sim_phase in ("retraction", "hold", "full", "compression") ?
     env_float("TP_CLIP_HOLD_END_J_FLOOR", 0.15) : 0.0
+# Mid-compression: after each accepted step with t < t_compress, raise/reset det(F)
+# so J_min stays ≥ floor (inversions det≤0 → I). Default ON (0.15).
+# Set TP_CLIP_COMPRESS_J_FLOOR=0 to disable. Applied only in the accepted-step callback
+# (not inside RHS) so Newton FD Jacobians stay clean.
+const compress_J_floor = env_float("TP_CLIP_COMPRESS_J_FLOOR", 0.15)
+# Retraction: same floor on every accepted step (default = hold-end floor). Prevents
+# pre-lift creep from re-crushing det(F) after hold-end prep. Set
+# TP_CLIP_RETRACTION_J_FLOOR=0 to disable continuous flooring (hold-end prep still runs).
+const retraction_J_floor = sim_phase == "retraction" ?
+    env_float("TP_CLIP_RETRACTION_J_FLOOR", hold_end_J_floor > 0.0 ? hold_end_J_floor : 0.15) :
+    0.0
 const hold_end_fp_repair = env_int("TP_CLIP_HOLD_END_FP_REPAIR", 1) != 0
 const checkpoint_finalize_on_save = sim_phase in ("hold", "full") &&
     env_int("TP_CLIP_CHECKPOINT_FINALIZE_ON_SAVE", 1) != 0
@@ -888,7 +1496,199 @@ const retraction_springback_equil_max_speed = env_float("TP_CLIP_RETRACTION_SPRI
 const retraction_springback_equil_span_rate_mm_s =
     env_float("TP_CLIP_RETRACTION_SPRINGBACK_EQUIL_SPAN_RATE_MM_S", 0.02)
 const retraction_springback_equil_patience =
-    max(1, env_int("TP_CLIP_RETRACTION_SPRINGBACK_EQUIL_PATIENCE", 8))
+    max(1, env_int("TP_CLIP_RETRACTION_SPRINGBACK_EQUIL_PATIENCE", 3))
+# Free cool after eject: keep springback dwell until mean charge T ≤ this °C (NaN = off).
+# Requires TP_CLIP_RETRACTION_EXPLICIT_FREEZE_T=0 and TP_CLIP_USE_AMBIENT_HEAT_LOSS=1.
+# Mechanical equilibration alone will not end the run while cool-until is active.
+const retraction_cool_until_temp_C = env_float("TP_CLIP_RETRACTION_COOL_UNTIL_TEMP_C", NaN)
+const retraction_cool_until_active = isfinite(retraction_cool_until_temp_C)
+# After eject: freeze charge mechanics (thermal-only RHS) during free cool.
+# At cool target, briefly release mechanics (POST_COOL_SPRINGBACK_S) for residual springback.
+const retraction_freeze_mech_after_eject = sim_phase == "retraction" &&
+    env_int("TP_CLIP_RETRACTION_FREEZE_MECH_AFTER_EJECT", 0) != 0
+# Freeze charge mechanics/F during the rigid +z eject translation, then release after.
+const retraction_freeze_mech_during_eject = sim_phase == "retraction" &&
+    env_int("TP_CLIP_RETRACTION_FREEZE_MECH_DURING_EJECT", 1) != 0
+const retraction_post_cool_springback_s = env_float("TP_CLIP_RETRACTION_POST_COOL_SPRINGBACK_S", 0.25)
+# Floor on boundary exposure during post-eject free cool (accelerates ambient cooling;
+# physical exposure is sparse on the sheet). 0 = use true exposure only.
+const retraction_free_cool_exposure_floor = clamp(
+    env_float("TP_CLIP_FREE_COOL_EXPOSURE_FLOOR", 0.0), 0.0, 1.0)
+# Complete demold: after punch clears, rigidly eject the workpiece out of the cavity
+# (Song/FARO warpage is measured on a free demolded part, not while nested in the die).
+# Default ON for retraction/full. Set TP_CLIP_RETRACTION_EJECT=0 to keep in-cavity springback.
+const retraction_eject_enable = (sim_phase == "retraction" || sim_phase == "full") &&
+    env_int("TP_CLIP_RETRACTION_EJECT", 1) != 0
+# Punch lifts first; workpiece stays in the die and cools (convection ON, plastic OFF)
+# until mean T ≤ COOL_UNTIL, then the eject stroke runs. Creep→lift unchanged.
+# Closed-die cool (COOL_BEFORE_LIFT): hold_creep plastic ON until punch lift by default.
+# Set TP_CLIP_RETRACTION_CLOSED_DIE_COOL_PLASTIC=0 for elastic+CTE QS cool (no plastic commit).
+const retraction_closed_die_cool_plastic =
+    env_int("TP_CLIP_RETRACTION_CLOSED_DIE_COOL_PLASTIC", 1) != 0
+const retraction_eject_after_cool = retraction_eject_enable &&
+    retraction_cool_until_active &&
+    env_int("TP_CLIP_RETRACTION_EJECT_AFTER_COOL", 0) != 0
+# Eject temperature can be warmer than the final free-cool target. This lets
+# the part leave the floor/die after CTE restoration, then cool freely.
+const retraction_eject_at_temp_C =
+    env_float("TP_CLIP_RETRACTION_EJECT_AT_TEMP_C", retraction_cool_until_temp_C)
+# Smooth release of the thermal contraction accumulated during frozen-mechanics free cool.
+# The stored stress state is in balance at the eject temperature; the remaining T drop is
+# introduced through a smoothstep over RAMP_S instead of one instantaneous step.
+# 0 = legacy instantaneous release.
+const retraction_post_cool_thermal_ramp_s =
+    env_float("TP_CLIP_RETRACTION_POST_COOL_THERMAL_RAMP_S", 0.05)
+const retraction_post_cool_thermal_scale = Ref(1.0)
+const retraction_post_cool_thermal_Tref_K = retraction_eject_at_temp_C + 273.15
+# After eject: apply remaining T drop to COOL_UNTIL in one shot (room-temp warpage
+# without hours of Newton cooling), freeze T, then dwell mechanically.
+const retraction_bang_t_after_eject = sim_phase == "retraction" &&
+    retraction_cool_until_active &&
+    env_int("TP_CLIP_RETRACTION_BANG_T_AFTER_EJECT", 0) != 0
+const retraction_post_eject_dwell_s =
+    max(env_float("TP_CLIP_RETRACTION_POST_EJECT_DWELL_S", 0.5), 0.0)
+retraction_post_eject_bang_done = Ref(false)
+retraction_post_eject_bang_t = Ref(Inf)
+# After punch lift: set floor/mold (and blankholder) tool T for in-die cool sink.
+# NaN = leave tools at TP_CLIP_TOOL_TEMP (default).
+const retraction_tool_temp_after_punch_lift_C =
+    env_float("TP_CLIP_RETRACTION_TOOL_TEMP_AFTER_PUNCH_LIFT_C", NaN)
+const retraction_tool_temp_after_punch_lift_active =
+    (sim_phase == "retraction" || sim_phase == "full") &&
+    isfinite(retraction_tool_temp_after_punch_lift_C)
+retraction_tool_temp_after_punch_lift_done = Ref(false)
+# Physical unload: keep punch+floor closed after creep, cool by tool HTC (no ambient),
+# then lift when mean charge T ≤ tool T + 5 °C (cannot go below tool T in a closed die).
+# Set COOL_BEFORE_LIFT=0 for legacy time-based lift after creep only.
+const retraction_cool_before_lift = (sim_phase == "retraction" || sim_phase == "full") &&
+    env_int("TP_CLIP_RETRACTION_COOL_BEFORE_LIFT", 1) != 0
+const _retraction_tool_temp_C = env_float("TP_CLIP_TOOL_TEMP", 140.0)
+const retraction_cool_before_lift_C = env_float("TP_CLIP_RETRACTION_COOL_BEFORE_LIFT_C",
+    _retraction_tool_temp_C + 5.0)
+retraction_closed_die_cool_active = Ref(false)
+retraction_closed_die_cool_done = Ref(false)
+retraction_closed_die_cool_start_t = Ref(Inf)
+# Quasi-static closed-die cooling: hold T at an isothermal stage, equilibrate
+# mechanics/contact, then decrement the complete temperature field by ΔT. This
+# preserves its gradients and avoids both frozen-kin stress storage and a sudden
+# explicit release. The tools remain fixed until the final stage equilibrates.
+const retraction_qs_cool = retraction_cool_before_lift &&
+    env_int("TP_CLIP_RETRACTION_QS_COOL", 1) != 0
+const retraction_qs_cool_step_C =
+    max(env_float("TP_CLIP_RETRACTION_QS_COOL_STEP_C", 5.0), 0.0)
+const retraction_qs_equil_min_s =
+    max(env_float("TP_CLIP_RETRACTION_QS_EQUIL_MIN_S", 0.05), 0.0)
+const retraction_qs_equil_max_s =
+    max(env_float("TP_CLIP_RETRACTION_QS_EQUIL_MAX_S", 10.0),
+        retraction_qs_equil_min_s)
+const retraction_qs_sample_s =
+    max(env_float("TP_CLIP_RETRACTION_QS_SAMPLE_S", 0.05), 1.0e-4)
+const retraction_qs_equil_patience =
+    max(1, env_int("TP_CLIP_RETRACTION_QS_EQUIL_PATIENCE",
+                   retraction_springback_equil_patience))
+const retraction_qs_equil_rms_speed =
+    max(env_float("TP_CLIP_RETRACTION_QS_EQUIL_RMS_SPEED", 0.05), 0.0)
+const retraction_qs_equil_max_speed =
+    max(env_float("TP_CLIP_RETRACTION_QS_EQUIL_MAX_SPEED", 0.10), 0.0)
+const retraction_qs_max_j_floor_n =
+    max(0, env_int("TP_CLIP_RETRACTION_QS_MAX_J_FLOOR_N", 64))
+# Abort closed-die QS if span_z exceeds this (mm). Default Inf = off (L-die ~28 mm in cavity).
+# Bulk organosheet runs often set TP_CLIP_RETRACTION_QS_ABORT_SPAN_Z_MM=18–20.
+const retraction_qs_abort_span_z_mm =
+    env_float("TP_CLIP_RETRACTION_QS_ABORT_SPAN_Z_MM", Inf)
+const retraction_qs_abort_span_z_active = isfinite(retraction_qs_abort_span_z_mm)
+# Abort closed-die QS if min det(F) drops below this (default 0 = no inversion). Set to
+# retraction_J_floor (e.g. 0.05) to match J-floor target; use ≤ -998 to disable J abort.
+const retraction_qs_abort_j_min = env_float("TP_CLIP_RETRACTION_QS_ABORT_J_MIN", 0.0)
+const retraction_qs_abort_on_j_min = retraction_qs_abort_j_min > -998.0
+# Smooth kin ON at the start of closed-die cool (0 = instant).
+const retraction_closed_die_kin_ramp_s =
+    max(env_float("TP_CLIP_RETRACTION_CLOSED_DIE_KIN_RAMP_S", 0.5), 0.0)
+# Delay kin ON until Tmean ≤ this °C. Frozen + τ_th=0 until then (PVT/pressure,
+# not solid kinematics). Inf restores r10–r15 (kin ON at freeze-T).
+const retraction_qs_kin_after_C =
+    env_float("TP_CLIP_RETRACTION_QS_KIN_AFTER_C",
+              retraction_qs_cool ? retraction_cool_before_lift_C : Inf)
+# Skip solid CTE overlay until closed-die mechanics start (and after lift).
+const retraction_qs_skip_cte_until_kin = retraction_qs_cool &&
+    env_int("TP_CLIP_RETRACTION_QS_SKIP_CTE_UNTIL_KIN", 1) != 0
+# After kin ON, ramp τ_th in QS_STEP_C-equivalent stages instead of one bang.
+const retraction_qs_cte_ramp = retraction_qs_cool &&
+    env_int("TP_CLIP_RETRACTION_QS_CTE_RAMP", 0) != 0
+# After the frozen CTE-off drop, lift the punch before releasing charge
+# kinematics. Kinematic peel owns the frozen interval until mold clearance.
+const retraction_lift_first_after_frozen_cool = retraction_qs_cool &&
+    env_int("TP_CLIP_RETRACTION_LIFT_FIRST_AFTER_FROZEN_COOL", 0) != 0
+# Die-aware F_th: while kin is frozen, absorb dT<0 into F + floor-seated positions.
+# Not r9 centroid homothety. Overlay CTE stays off for the same ΔT.
+const clip_fth_die_aware = env_int("TP_CLIP_FTH_DIE_AWARE", 0) != 0
+const clip_kinematic_thermal_shrinkage = env_int("TP_CLIP_KINEMATIC_THERMAL_SHRINKAGE", 1) != 0
+const clip_fth_skip_post_peel_cte = clip_fth_die_aware &&
+    env_int("TP_CLIP_FTH_SKIP_POST_PEEL_CTE", 1) != 0
+const retraction_post_peel_cte_interval_s =
+    max(env_float("TP_CLIP_RETRACTION_POST_PEEL_CTE_INTERVAL_S", 0.05), 1.0e-6)
+retraction_qs_cte_scale = Ref(1.0)
+retraction_post_peel_cte_next_t = Ref(Inf)
+retraction_qs_stage_index = Ref(0)
+retraction_qs_stage_start_t = Ref(Inf)
+retraction_qs_stage_target_C = Ref(NaN)
+retraction_qs_equil_streak = Ref(0)
+retraction_qs_prev_snap = Ref{Any}(nothing)
+retraction_qs_next_sample_t = Ref(Inf)
+# Legacy r9 F_th state is retained only for checkpoint compatibility; the
+# centroid homothety itself is disabled below.
+thermal_Fth_initialized = Ref(false)
+thermal_Fth_cum_vol_logJ = Ref(0.0)
+thermal_Fth_u_modified = Ref(false)
+thermal_Fth_skip_Jp = Ref(false)
+@inline function reset_thermal_Fth_state!()
+    thermal_Fth_initialized[] = false
+    thermal_Fth_cum_vol_logJ[] = 0.0
+    thermal_Fth_u_modified[] = false
+    thermal_Fth_skip_Jp[] = false
+    retraction_qs_cte_scale[] = 1.0
+    retraction_post_peel_cte_next_t[] = Inf
+    retraction_qs_stage_index[] = 0
+    retraction_qs_stage_start_t[] = Inf
+    retraction_qs_stage_target_C[] = NaN
+    retraction_qs_equil_streak[] = 0
+    retraction_qs_prev_snap[] = nothing
+    retraction_qs_next_sample_t[] = Inf
+    return nothing
+end
+const retraction_eject_s = env_float("TP_CLIP_RETRACTION_EJECT_S", 0.10)
+const retraction_eject_clear_ps = env_float("TP_CLIP_RETRACTION_EJECT_CLEAR_PS", 2.0)
+const retraction_eject_min_dz_mm = env_float("TP_CLIP_RETRACTION_EJECT_MIN_DZ_MM", 0.0)
+# How far into the free mold↔punch gap to place the workpiece after eject:
+#   0.0 = just clear the mold (deck + clearance) — default; avoids flying into punch
+#   0.5 = mid-gap (old behaviour; can overshoot toward a high punch and tear the part)
+#   1.0 = just below the punch underside
+const retraction_eject_gap_frac = clamp(env_float("TP_CLIP_RETRACTION_EJECT_GAP_FRAC", 0.0), 0.0, 1.0)
+# Optional hard cap on workpiece eject lift [mm] (0 = no extra cap).
+const retraction_eject_max_dz_mm = env_float("TP_CLIP_RETRACTION_EJECT_MAX_DZ_MM", 0.0)
+retraction_eject_active = Ref(false)
+retraction_eject_complete = Ref(false)
+retraction_eject_announced = Ref(false)
+retraction_eject_start_t = Ref(Inf)
+retraction_eject_target_dz = Ref(0.0)
+retraction_eject_z_applied = Ref(0.0)
+retraction_indie_cool_announced = Ref(false)
+retraction_indie_cool_last_print_t = Ref(-Inf)
+retraction_post_cool_springback_active = Ref(false)
+retraction_post_cool_springback_start_t = Ref(Inf)
+retraction_post_cool_springback_announced = Ref(false)
+# During the rigid eject stroke: keep floor Reimann ON so deep-penetration caps
+# still apply while the workpiece is lifted. Punch/mold stay off. Default ON.
+const retraction_keep_floor_during_eject = sim_phase == "retraction" &&
+    env_int("TP_CLIP_RETRACTION_KEEP_FLOOR_DURING_EJECT", 1) != 0
+# After eject: rest on the die floor as a table (punch stays OFF). Demold/eject stroke unchanged.
+const retraction_keep_floor_after_eject = sim_phase == "retraction" &&
+    env_int("TP_CLIP_RETRACTION_KEEP_FLOOR_AFTER_EJECT", 0) != 0
+const retraction_gravity_after_eject = sim_phase == "retraction" ?
+    env_float("TP_CLIP_RETRACTION_GRAVITY_AFTER_EJECT", 0.0) : 0.0
+# Extra mass-proportional damping after eject (0 = off; γΔt ≳ 1 is explicit-Euler unstable).
+const retraction_rayleigh_after_eject = sim_phase == "retraction" ?
+    env_float("TP_CLIP_RETRACTION_RAYLEIGH_AFTER_EJECT", 0.0) : 0.0
 # Optional closed-die hold_creep before punch lift (default off — ramps run from retraction t0).
 const retraction_pre_lift_creep_s = sim_phase == "retraction" || sim_phase == "full" ?
     env_float("TP_CLIP_RETRACTION_PRE_LIFT_CREEP_S", 0.0) : 0.0
@@ -898,6 +1698,10 @@ const retraction_pre_lift_elastic_frac =
 const retraction_creep_audit_dt = (sim_phase == "retraction" || sim_phase == "full") &&
     retraction_pre_lift_creep_s > 0.0 ?
     env_float("TP_CLIP_RETRACTION_CREEP_AUDIT_DT", 0.05) : 0.0
+# Optional post-creep, pre-lift settle with mechanics ON and no new thermal load.
+const retraction_pre_lift_settle_s = (sim_phase == "retraction" || sim_phase == "full") &&
+    retraction_pre_lift_creep_s > 0.0 ?
+    max(env_float("TP_CLIP_RETRACTION_PRE_LIFT_SETTLE_S", 0.0), 0.0) : 0.0
 # Post-lift charge kin freeze is non-physical (punch opens while charge is glued).
 # Default OFF: charge kinematics stay at 1 from late closed-die creep through lift.
 # Floor overlap must be cleared *before* lift (see CREEP_KIN_AFTER_SIGMA + settle gate).
@@ -933,6 +1737,7 @@ const retraction_peel_tools_off = retraction_kinematic_peel &&
     env_int("TP_CLIP_RETRACTION_PEEL_TOOLS_OFF", 0) != 0
 retraction_peel_done = Ref(false)
 retraction_peel_announced = Ref(false)
+retraction_peel_hold_for_eject_announced = Ref(false)
 retraction_peel_release_announced = Ref(false)
 retraction_peel_release_time = Ref(Inf)
 retraction_floor_open_z_shift = Ref(0.0)
@@ -1040,13 +1845,37 @@ const compression_explicit_ignore_unstable = compression_use_explicit &&
 
 const retraction_integrator = clip_retraction_integrator()
 const retraction_use_explicit = retraction_integrator == :explicit
-# Explicit springback: freeze T (no conduction / HTC in kick) — mechanics-only is much cheaper.
+# Demold (creep→lift) must match moldClear6: FREEZE_T=1, dt=5e-3, mechanics ON.
+# In-die cool after punch lift: UNFREEZE_T_AFTER_PUNCH_LIFT (or EJECT_AFTER_COOL).
+# Post-eject free-cool may opt in with UNFREEZE_T_AFTER_EJECT.
 const retraction_explicit_freeze_t = retraction_use_explicit &&
     env_int("TP_CLIP_RETRACTION_EXPLICIT_FREEZE_T", 1) != 0
+const retraction_unfreeze_t_after_eject = retraction_use_explicit &&
+    env_int("TP_CLIP_RETRACTION_UNFREEZE_T_AFTER_EJECT", 0) != 0
+const retraction_unfreeze_t_after_punch_lift = retraction_use_explicit &&
+    (env_int("TP_CLIP_RETRACTION_UNFREEZE_T_AFTER_PUNCH_LIFT", 0) != 0 ||
+     retraction_eject_after_cool)
 const retraction_explicit_dt = env_float("TP_CLIP_RETRACTION_EXPLICIT_DT", 5.0e-3)
-# After the explicit mech-ramp freeze, springback needs a smaller dt (5e-7 blows up at release).
+# Optional larger step during pre-lift closed-die creep only (defaults to demold dt).
+const retraction_explicit_dt_creep = retraction_use_explicit ?
+    env_float("TP_CLIP_RETRACTION_EXPLICIT_DT_CREEP", retraction_explicit_dt) :
+    retraction_explicit_dt
+# Larger step whenever charge mechanics are off (creep, peel, eject stroke, thermal-only cool).
+const retraction_explicit_dt_mech_off = retraction_use_explicit ?
+    env_float("TP_CLIP_RETRACTION_EXPLICIT_DT_MECH_OFF", retraction_explicit_dt_creep) :
+    retraction_explicit_dt_creep
+# Free-cool / post-eject only. Demold (creep → lift → eject) always keeps RETRACTION_EXPLICIT_DT.
 const retraction_explicit_dt_springback = retraction_use_explicit ?
     env_float("TP_CLIP_RETRACTION_EXPLICIT_DT_SPRINGBACK", 5.0e-3) :
+    retraction_explicit_dt
+# Final mechanics release after thermal-only cooling can require a smaller step
+# than both demold and the large thermal-only free-cool step.
+const retraction_explicit_dt_post_cool = retraction_use_explicit ?
+    env_float("TP_CLIP_RETRACTION_EXPLICIT_DT_POST_COOL", retraction_explicit_dt) :
+    retraction_explicit_dt
+# Closed-die QS equilibration (mech ON, tools fixed): smaller step than demold/springback.
+const retraction_explicit_dt_qs_equil = retraction_use_explicit ?
+    env_float("TP_CLIP_RETRACTION_EXPLICIT_DT_QS_EQUIL", retraction_explicit_dt) :
     retraction_explicit_dt
 # SciMLBase default unstable_check aborts on any NaN/Inf in u; explicit contact can spike
 # briefly before the accepted-step repair runs — keep going and let the callback fix state.
@@ -1059,6 +1888,141 @@ end
 
 @inline function retraction_explicit_active()
     return retraction_use_explicit
+end
+
+# Post-eject free-cool window (ambient / large dt / freeze-mech). Demold never enters this.
+@inline function retraction_post_eject_phase()
+    retraction_eject_enable || return mold_retraction_complete[]
+    return retraction_eject_complete[]
+end
+
+# True → no conduction/HTC/plastic heat. Creep→lift frozen when FREEZE_T=1 (moldClear6).
+# Punch-up in-die cool and/or post-eject free-cool can unfreeze T.
+@inline function retraction_thermal_frozen_now()
+    # Quasi-static continuation owns T: freeze the thermal RHS through creep and
+    # all isothermal equilibrium stages. It mutates T only between stages.
+    if retraction_qs_cool && retraction_started[] &&
+       !retraction_closed_die_cool_done[]
+        return true
+    end
+    retraction_explicit_active() || return false
+    retraction_post_cool_springback_active[] && return true
+    if retraction_bang_t_after_eject && retraction_post_eject_bang_done[]
+        return true
+    end
+    if retraction_unfreeze_t_after_punch_lift && mold_retraction_complete[]
+        return false
+    end
+    if retraction_cool_before_lift && retraction_closed_die_cool_active[]
+        return false
+    end
+    if retraction_unfreeze_t_after_eject && retraction_post_eject_phase()
+        return false
+    end
+    # Demold / default: identical to moldClear6 when FREEZE_T=1.
+    return retraction_explicit_freeze_t
+end
+
+@inline function retraction_eject_stroke_freeze_now()
+    retraction_freeze_mech_during_eject || return false
+    return retraction_eject_active[] && !retraction_eject_complete[]
+end
+
+@inline function retraction_free_cool_thermal_only_now()
+    retraction_eject_stroke_freeze_now() && return true
+    if retraction_freeze_mech_after_eject && !retraction_post_cool_springback_active[]
+        # When freeze-mech is active (Option A: post-cool springback), freeze mechanics
+        # as soon as punch peel/lift is complete, throughout any in-die cooling,
+        # eject stroke, and free air cooling, until post-cool springback begins at room T.
+        return retraction_peel_done[] || mold_retraction_complete[] || retraction_post_eject_phase()
+    end
+    return false
+end
+
+# Ambient convection/radiation: after punch lift (in-die cool) and/or after eject.
+# Never during closed-die creep→lift.
+@inline function ambient_heat_loss_active_now()
+    use_ambient_heat_loss || return false
+    retraction_post_cool_springback_active[] && return false
+    if retraction_unfreeze_t_after_punch_lift || retraction_eject_after_cool
+        return mold_retraction_complete[]
+    end
+    if retraction_unfreeze_t_after_eject || retraction_cool_until_active ||
+       retraction_freeze_mech_after_eject
+        return retraction_post_eject_phase()
+    end
+    return true
+end
+
+# After punch lift / eject: no plastic-work→heat (Taylor–Quinney was heating the free-cool).
+const retraction_skip_plastic_heat_after_eject = retraction_use_explicit &&
+    env_int("TP_CLIP_RETRACTION_SKIP_PLASTIC_HEAT_AFTER_EJECT", 0) != 0
+
+@inline function retraction_plastic_off_after_punch_up()
+    # Closed-die cool keeps hold_creep plastic commit (same as freeze-T creep).
+    # Plastic-off / shrinkage-only starts after the punch has lifted.
+    return (retraction_unfreeze_t_after_punch_lift || retraction_eject_after_cool) &&
+        mold_retraction_complete[]
+end
+
+@inline function retraction_skip_plastic_heat_now()
+    retraction_thermal_frozen_now() && return true
+    retraction_skip_plastic_heat_after_eject || return false
+    retraction_plastic_off_after_punch_up() && return true
+    return retraction_post_eject_phase()
+end
+
+# After punch lift / eject: CTE shrinkage with mechanics ON; plastic flow/heat OFF.
+# SPH conduction stays ON (dt=5e-3 is inside the explicit thermal CFL).
+const retraction_thermal_shrinkage_only_after_eject = retraction_use_explicit &&
+    env_int("TP_CLIP_RETRACTION_THERMAL_SHRINKAGE_ONLY_AFTER_EJECT", 0) != 0
+const retraction_skip_sph_conduction_after_eject = retraction_use_explicit &&
+    env_int("TP_CLIP_RETRACTION_SKIP_CONDUCTION_AFTER_EJECT", 0) != 0
+
+@inline function retraction_thermal_shrinkage_only_now()
+    retraction_thermal_shrinkage_only_after_eject || return false
+    retraction_post_cool_springback_active[] && return false
+    retraction_plastic_off_after_punch_up() && return true
+    return retraction_post_eject_phase()
+end
+
+@inline function retraction_skip_sph_conduction_now()
+    return retraction_skip_sph_conduction_after_eject && retraction_post_eject_phase() &&
+        !retraction_post_cool_springback_active[]
+end
+
+# Large springback/free-cool dt only after demold eject finishes (never during demold).
+@inline function retraction_post_eject_springback_dt_active()
+    return retraction_post_eject_phase()
+end
+
+# True when drift/RHS skips full charge mechanics (thermal-only, kin freeze, peel, eject stroke).
+@inline function retraction_explicit_mech_integrator_off(t::Real)
+    !retraction_started[] && return false
+    charge_hold_thermal_only(t) && return true
+    hold_kinematics_frozen(t) && return true
+    retraction_charge_kinematics_gated(t) && return true
+    return false
+end
+
+@inline function retraction_qs_equil_dt_active(t::Real)
+    retraction_qs_cool || return false
+    retraction_closed_die_cool_active[] || return false
+    retraction_closed_die_cool_done[] && return false
+    return !retraction_explicit_mech_integrator_off(t)
+end
+
+@inline function retraction_explicit_target_dt(t::Real)
+    # Mech release after cool has its own stable dt; thermal-only free cool may use large dt.
+    retraction_post_cool_springback_active[] && return retraction_explicit_dt_post_cool
+    if retraction_post_eject_springback_dt_active()
+        retraction_explicit_mech_integrator_off(t) &&
+            return retraction_explicit_dt_mech_off
+        return retraction_explicit_dt_springback
+    end
+    retraction_qs_equil_dt_active(t) && return retraction_explicit_dt_qs_equil
+    retraction_explicit_mech_integrator_off(t) && return retraction_explicit_dt_mech_off
+    return retraction_explicit_dt
 end
 
 function enforce_explicit_compression_dt!(integrator)
@@ -1079,17 +2043,19 @@ function enforce_explicit_compression_dt!(integrator)
 end
 
 # Explicit retraction uses the same blended σ/contact/kinematics ramp as implicit.
-# Explicit Euler also needs springback dt from t0 and matched kick/drift kin scaling.
+# Demold always uses RETRACTION_EXPLICIT_DT; springback/free-cool dt only after eject.
 function enforce_explicit_retraction_dt!(integrator)
     if !(retraction_use_explicit && retraction_started[])
         return nothing
     end
-    t_now = integrator.t
-    target_dt = retraction_pre_lift_creep_active(t_now) ?
-        retraction_explicit_dt :
-        retraction_explicit_dt_springback
+    target_dt = retraction_explicit_target_dt(integrator.t)
     if integrator.dt != target_dt
         integrator.dt = target_dt
+        # Non-adaptive Euler ignores integrator.dt changes unless proposed dt is updated.
+        try
+            SciMLBase.set_proposed_dt!(integrator, target_dt)
+        catch
+        end
     end
     if integrator.opts.dtmax != target_dt
         integrator.opts.dtmax = target_dt
@@ -1121,6 +2087,12 @@ println("Simulation phase: ", sim_phase,
 (sim_phase == "full" || sim_phase == "hold") && checkpoint_finalize_on_save &&
     println("Hold: checkpoint finalize ON (J floor=", hold_end_J_floor,
             ", Fp repair", hold_end_fp_reset ? "+reset" : "", " on every save)")
+compress_J_floor > 0.0 &&
+    println("Compress: J floor ON (det(F)≥", compress_J_floor,
+            " after accepted steps while t < t_compress; inversions reset)")
+retraction_J_floor > 0.0 &&
+    println("Retraction: J floor ON (det(F)≥", retraction_J_floor,
+            " after every accepted step; inversions reset)")
 (sim_phase == "full" || sim_phase == "hold") && checkpoint_audit_on_save &&
     println("Hold: checkpoint audit ON (strict=", checkpoint_audit_strict, ")")
 sim_phase == "retraction" && !retraction_prepare_state &&
@@ -1164,7 +2136,7 @@ sim_phase == "retraction" && retraction_cfrp_style &&
             "GMRES/TRBDF2; no σ/contact/kin ramps)")
 sim_phase == "retraction" && retraction_tlsph_only && !retraction_cfrp_style &&
     println("Retraction: TLSPH elastoplastic + charge conduction + tool–charge HTC; ",
-            "WCSPH, Nakamura, molten drag, and flow-orientation kinetics are OFF")
+            "WCSPH, Nakamura, and molten drag are OFF; flow-orientation kinetics stay ON")
 compression_use_explicit && begin
     _, explicit_scheme_name = clip_explicit_euler_algorithm()
     println("Compression integrator: explicit ", explicit_scheme_name,
@@ -1174,10 +2146,27 @@ compression_use_explicit && begin
 end
 sim_phase == "retraction" && retraction_use_explicit && begin
     _, explicit_scheme_name = clip_explicit_euler_algorithm()
+    freeze_t_policy = if retraction_unfreeze_t_after_punch_lift
+        "demold FREEZE_T=$(retraction_explicit_freeze_t); unfreeze after punch lift"
+    elseif retraction_unfreeze_t_after_eject
+        "demold FREEZE_T=$(retraction_explicit_freeze_t); unfreeze after eject only"
+    elseif retraction_explicit_freeze_t
+        "always (moldClear6 demold)"
+    else
+        "off"
+    end
+    mech_off_dt_note = retraction_explicit_dt_mech_off != retraction_explicit_dt ?
+        "; mech-off dt=" * string(retraction_explicit_dt_mech_off) * " s" : ""
+    qs_equil_dt_note = retraction_qs_cool &&
+        retraction_explicit_dt_qs_equil != retraction_explicit_dt ?
+        "; closed-die QS equil dt=" * string(retraction_explicit_dt_qs_equil) * " s" : ""
     println("Retraction integrator: explicit ", explicit_scheme_name,
-            " (dt=", retraction_explicit_dt_springback,
-            " s; same σ/contact ramp as implicit; matched kick/drift kin scaling; freeze T=",
-            retraction_explicit_freeze_t,
+            " (demold dt=", retraction_explicit_dt, " s",
+            mech_off_dt_note,
+            qs_equil_dt_note,
+            "; free-cool/springback dt=", retraction_explicit_dt_springback,
+            " s after eject; same σ/contact ramp as implicit; freeze T=",
+            freeze_t_policy,
             "; ignore SciML unstable abort=", retraction_explicit_ignore_unstable, ")")
 end
 println("---------------------------------------")
@@ -1251,21 +2240,35 @@ function checkpoint_meta(; particle_spacing, n_charge, n_floor, n_mold,
     for (k, v) in pack
         meta[k] = v
     end
+    if separate_charge_plies
+        meta["charge_layout"] = "separate_plies"
+        meta["n_charge_systems"] = length(charge_ply_source_indices)
+        meta["charge_system_counts"] = length.(charge_ply_source_indices)
+    end
     return meta
 end
 
 function validate_checkpoint_meta!(ck, meta_now; motion_from_checkpoint=false)
     ck_meta = ck["meta"]
-    layout_keys = ("particle_spacing", "n_charge", "n_floor", "n_mold")
+    layout_keys = separate_charge_plies ?
+                  ("particle_spacing", "n_charge", "n_floor", "n_mold",
+                   "charge_layout", "n_charge_systems", "charge_system_counts") :
+                  ("particle_spacing", "n_charge", "n_floor", "n_mold")
     motion_keys = ("t_compress", "z_shift_down_end", "mold_velocity_state")
     keys_to_check = motion_from_checkpoint ? layout_keys : (layout_keys..., motion_keys...)
     for key in keys_to_check
-        if !haskey(ck_meta, key) || ck_meta[key] != meta_now[key]
+        if !haskey(ck_meta, key)
+            error("Checkpoint meta missing '$(key)'")
+        end
+        val_ck = ck_meta[key]
+        val_now = meta_now[key]
+        match = (val_ck isa Number && val_now isa Number) ? isapprox(val_ck, val_now; rtol=1e-4) : (val_ck == val_now)
+        if !match
             hint = key == "n_mold" ?
                    " Try TP_CLIP_COMPRESSION_RATIO=0.85 (or re-run hold with current geometry)." :
                    ""
-            error("Checkpoint meta mismatch on '$(key)': saved=$(get(ck_meta, key, nothing)), " *
-                  "current=$(meta_now[key]). Use the same geometry/env as the hold run." * hint)
+            error("Checkpoint meta mismatch on '$(key)': saved=$(val_ck), " *
+                  "current=$(val_now). Use the same geometry/env as the hold run." * hint)
         end
     end
     return nothing
@@ -1532,9 +2535,10 @@ end
 
 function capture_hold_checkpoint_state(integrator, semi_local)
     cyl_sys = semi_local.systems[1]
-    floor_sys = semi_local.systems[2]
-    mold_sys = semi_local.systems[3]
-    if checkpoint_finalize_on_save && solidification_complete[]
+    floor_sys = clip_floor_system(semi_local)
+    mold_sys = clip_mold_system(semi_local)
+    if checkpoint_finalize_on_save && solidification_complete[] && !retraction_started[] &&
+       !hold_tlsph_tail_active(integrator.t)
         finalize_hold_end_state_for_checkpoint!(cyl_sys, Fp_committed[], J_ref_particle_buf,
                                                 J_p_particle_buf)
     end
@@ -1554,8 +2558,8 @@ function capture_hold_checkpoint_state(integrator, semi_local)
                                   hold_tlsph_equilibrated=hold_tlsph_tail_s > 0.0),
         "v_ode" => clip_host_copy(v_ck),
         "u_ode" => clip_host_copy(u_ck),
-        "deformation_grad" => clip_host_copy(cyl_sys.deformation_grad),
-        "charge_temp" => clip_host_copy(cyl_sys.temp),
+        "deformation_grad" => clip_host_copy(clip_pack_charge_deformation_grad(semi_local)),
+        "charge_temp" => clip_host_copy(clip_pack_charge_temp(semi_local)),
         "floor_temp" => clip_host_copy(floor_sys.temp),
         "mold_temp" => clip_host_copy(mold_sys.temp),
         "Fp_state" => copy(Fp_state[]),
@@ -1593,6 +2597,60 @@ function save_hold_checkpoint!(path, ck)
     return nothing
 end
 
+function save_preeject_checkpoint!(integrator)
+    ck = capture_hold_checkpoint_state(integrator, integrator.p)
+    ck["meta"]["retraction_stage"] = "preeject"
+    ck["retraction_qs_cte_scale"] = retraction_qs_cte_scale[]
+    save_hold_checkpoint!(retraction_preeject_checkpoint_path, ck)
+    println(">>> Pre-eject checkpoint ready (skip creep/lift/cool next time): ",
+            abspath(retraction_preeject_checkpoint_path))
+    flush(stdout)
+    return nothing
+end
+
+function save_cool_end_checkpoint!(integrator)
+    isempty(retraction_cool_end_checkpoint_path) && return nothing
+    ck = capture_hold_checkpoint_state(integrator, integrator.p)
+    ck["meta"]["retraction_stage"] = "indie_cool"
+    ck["retraction_qs_cte_scale"] = retraction_qs_cte_scale[]
+    save_hold_checkpoint!(retraction_cool_end_checkpoint_path, ck)
+    cyl_sys = integrator.p.systems[1]
+    xs = @view cyl_sys.current_coordinates[1, :]
+    ys = @view cyl_sys.current_coordinates[2, :]
+    zs = @view cyl_sys.current_coordinates[3, :]
+    J_min, J_max, _ = charge_jacobian_extremes(cyl_sys)
+    println(">>> In-die cool checkpoint saved: ",
+            abspath(retraction_cool_end_checkpoint_path))
+    println("    span_x=", round((maximum(xs) - minimum(xs)) * 1e3; digits=3),
+            " mm  span_y=", round((maximum(ys) - minimum(ys)) * 1e3; digits=3),
+            " mm  span_z=", round((maximum(zs) - minimum(zs)) * 1e3; digits=3),
+            " mm  J_min=", round(J_min; sigdigits=4),
+            "  J_max=", round(J_max; sigdigits=4))
+    flush(stdout)
+    return nothing
+end
+
+function save_named_retraction_checkpoint!(integrator, path, stage)
+    isempty(path) && return nothing
+    ck = capture_hold_checkpoint_state(integrator, integrator.p)
+    ck["meta"]["retraction_stage"] = stage
+    ck["retraction_qs_cte_scale"] = retraction_qs_cte_scale[]
+    save_hold_checkpoint!(path, ck)
+    cyl_sys = integrator.p.systems[1]
+    xs = @view cyl_sys.current_coordinates[1, :]
+    ys = @view cyl_sys.current_coordinates[2, :]
+    zs = @view cyl_sys.current_coordinates[3, :]
+    J_min, J_max, _ = charge_jacobian_extremes(cyl_sys)
+    println(">>> Checkpoint ", stage, " saved: ", abspath(path))
+    println("    span_x=", round((maximum(xs) - minimum(xs)) * 1e3; digits=3),
+            " mm  span_y=", round((maximum(ys) - minimum(ys)) * 1e3; digits=3),
+            " mm  span_z=", round((maximum(zs) - minimum(zs)) * 1e3; digits=3),
+            " mm  J_min=", round(J_min; sigdigits=4),
+            "  J_max=", round(J_max; sigdigits=4))
+    flush(stdout)
+    return nothing
+end
+
 function maybe_save_periodic_checkpoint!(integrator, semi_local)
     isempty(periodic_checkpoint_save_times) && return
     retraction_started[] && return
@@ -1613,31 +2671,36 @@ function load_hold_checkpoint(path)
     ck = open(path, "r") do io
         deserialize(io)
     end
-    ck["version"] in (1, CHECKPOINT_VERSION) ||
-        error("Unsupported checkpoint version $(ck["version"]) (expected $(CHECKPOINT_VERSION))")
+    supported_versions = separate_charge_plies ? (CHECKPOINT_VERSION,) : (1, CHECKPOINT_VERSION)
+    ck["version"] in supported_versions ||
+        error("Unsupported checkpoint version $(ck["version"]) for " *
+              (separate_charge_plies ? "separate-ply layout (expected v3)" :
+               "legacy packed-charge layout (expected v1 or v2)"))
     return ck
 end
 
 function restore_hold_checkpoint_state!(ck, semi_local)
     cyl_sys = semi_local.systems[1]
-    floor_sys = semi_local.systems[2]
-    mold_sys = semi_local.systems[3]
+    floor_sys = clip_floor_system(semi_local)
+    mold_sys = clip_mold_system(semi_local)
 
-    clip_host_assign!(cyl_sys.deformation_grad, ck["deformation_grad"])
-    clip_host_assign!(cyl_sys.temp, ck["charge_temp"])
+    clip_unpack_charge_deformation_grad!(semi_local, ck["deformation_grad"])
+    clip_unpack_charge_temp!(semi_local, ck["charge_temp"])
     clip_host_assign!(floor_sys.temp, ck["floor_temp"])
     clip_host_assign!(mold_sys.temp, ck["mold_temp"])
 
     v_ck = ck["v_ode"]
     u_ck = ck["u_ode"]
-    v_cyl = TrixiParticles.wrap_v(v_ck, cyl_sys, semi_local)
-    u_cyl = TrixiParticles.wrap_u(u_ck, cyl_sys, semi_local)
-    NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
-    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-        for d in 1:NDIMS_CYL
-            cyl_sys.current_coordinates[d, particle] = u_cyl[d, particle]
-            cyl_sys.initial_condition.velocity[d, particle] = v_cyl[d, particle]
-            v_cyl[NDIMS_CYL + 1, particle] = cyl_sys.temp[particle]
+    clip_foreach_charge_system(semi_local) do system, _
+        v_sys = TrixiParticles.wrap_v(v_ck, system, semi_local)
+        u_sys = TrixiParticles.wrap_u(u_ck, system, semi_local)
+        nd = TrixiParticles.ndims(system)
+        @inbounds for particle in TrixiParticles.each_integrated_particle(system)
+            for d in 1:nd
+                system.current_coordinates[d, particle] = u_sys[d, particle]
+                system.initial_condition.velocity[d, particle] = v_sys[d, particle]
+            end
+            v_sys[nd + 1, particle] = system.temp[particle]
         end
     end
 
@@ -1673,6 +2736,26 @@ function restore_hold_checkpoint_state!(ck, semi_local)
     mold_retraction_complete[] = false
     springback_equil_streak[] = 0
     springback_equil_prev_snap[] = nothing
+    retraction_eject_active[] = false
+    retraction_eject_complete[] = false
+    retraction_eject_announced[] = false
+    retraction_eject_start_t[] = Inf
+    retraction_eject_target_dz[] = 0.0
+    retraction_eject_z_applied[] = 0.0
+    retraction_indie_cool_announced[] = false
+    retraction_indie_cool_last_print_t[] = -Inf
+    retraction_closed_die_cool_active[] = false
+    retraction_closed_die_cool_done[] = false
+    retraction_closed_die_cool_start_t[] = Inf
+    retraction_post_eject_bang_done[] = false
+    retraction_post_eject_bang_t[] = Inf
+    retraction_tool_temp_after_punch_lift_done[] = false
+    retraction_closed30_ckpt_saved[] = false
+    retraction_closed30_settle_start_t[] = Inf
+    reset_thermal_Fth_state!()
+    retraction_post_cool_springback_active[] = false
+    retraction_post_cool_springback_start_t[] = Inf
+    retraction_post_cool_springback_announced[] = false
     retraction_start_time[] = Inf
     retraction_lift_start_time[] = Inf
     mold_retraction_complete_time[] = Inf
@@ -1700,10 +2783,20 @@ function restore_hold_checkpoint_state!(ck, semi_local)
     end
 
     ck_meta = get(ck, "meta", Dict{String, Any}())
+    if get(ck_meta, "retraction_stage", "") == "preeject" ||
+       env_int("TP_CLIP_RETRACTION_RESUME_PREEJECT", 0) != 0
+        retraction_from_preeject[] = true
+        if haskey(ck, "retraction_qs_cte_scale")
+            retraction_qs_cte_scale[] = Float64(ck["retraction_qs_cte_scale"])
+        else
+            retraction_qs_cte_scale[] = 1.0
+        end
+    end
     equilibrated = get(ck_meta, "hold_tlsph_equilibrated", false)
     println(">>> Restored hold checkpoint at t=", round(ck["t"]; digits=6),
             " s (solidification_complete=", solidification_complete[],
-            ", TLSPH tail equilibrated=", equilibrated, ")")
+            ", TLSPH tail equilibrated=", equilibrated,
+            retraction_from_preeject[] ? ", stage=preeject" : "", ")")
     sim_phase == "retraction" && !equilibrated && hold_tlsph_tail_s > 0.0 &&
         @warn "Checkpoint predates TLSPH hold tail — re-run hold with TP_CLIP_HOLD_TLSPH_TAIL_S>0 " *
               "for a self-consistent solid TLSPH state before retraction."
@@ -1751,6 +2844,29 @@ particle_spacing = env_float("TP_CLIP_PS_MM", ps_mm_nominal) * 1e-3
 const tool_particle_spacing = haskey(ENV, "TP_CLIP_TOOL_PS_MM") ?
     env_float("TP_CLIP_TOOL_PS_MM", particle_spacing * 1e3) * 1e-3 :
     particle_spacing
+# Charge packing anisotropy (opt-in). Default OFF → isotropic pack identical to before.
+# Physics length scales (h, contact gaps, jac) always use `particle_spacing` = TP_CLIP_PS_MM.
+# When ON: Δx=Δy=TP_CLIP_PS_XY_MM (default PS_MM), Δz=TP_CLIP_PS_Z_MM (default PS_MM).
+const charge_ps_anisotropic = env_int("TP_CLIP_PS_ANISOTROPIC", 0) != 0
+const particle_spacing_xy = charge_ps_anisotropic ?
+    env_float("TP_CLIP_PS_XY_MM", particle_spacing * 1e3) * 1e-3 :
+    particle_spacing
+const particle_spacing_z = charge_ps_anisotropic ?
+    env_float("TP_CLIP_PS_Z_MM", particle_spacing * 1e3) * 1e-3 :
+    particle_spacing
+const particle_volume = particle_spacing_xy * particle_spacing_xy * particle_spacing_z
+if charge_ps_anisotropic
+    println(">>> Charge packing anisotropic: Δxy=", particle_spacing_xy * 1e3,
+            " mm, Δz=", particle_spacing_z * 1e3,
+            " mm; physics ref TP_CLIP_PS_MM=", particle_spacing * 1e3, " mm")
+end
+# Flyaway envelope: through the die, outside the blank radius, or isolated from the bulk.
+const flyaway_below_floor = env_float("TP_CLIP_FLYAWAY_BELOW_FLOOR_MM", 5.0) * 1e-3
+const flyaway_above_cavity = env_float("TP_CLIP_FLYAWAY_ABOVE_CAVITY_MM", 80.0) * 1e-3
+const flyaway_r_pad = env_float("TP_CLIP_FLYAWAY_R_PAD_MM",
+                                4.0 * particle_spacing * 1e3) * 1e-3
+const flyaway_isolate_dist = env_float("TP_CLIP_FLYAWAY_ISOLATE_DIST_MM",
+                                       8.0 * particle_spacing * 1e3) * 1e-3
 include(joinpath(@__DIR__, "clip_stl_geometry_setup.jl"))
 include(joinpath(@__DIR__, "clip_blankholder.jl"))
 const use_stl_geometry = clip_use_stl_geometry()
@@ -1788,6 +2904,22 @@ glass_temp_liq = celsius_to_kelvin(1500.0)
 # Enthalpy of fusion for iPP: 165 J/g (literature ΔHf for 100% crystalline = 209 J/g × ~79% crystallinity).
 # Source: Wunderlich 1990, Brucato 2002. Replaces previous 110 kJ/kg DSC-melting value.
 matrix_latent_heat = 1.65e5
+
+# ==========================================================================================
+# External Material Property Override Handler
+# Current default material properties are set above. If TP_CLIP_MATERIAL_FILE or
+# TP_CLIP_MATERIAL_CONFIG is set in ENV, the properties defined in that file will overwrite
+# the default properties above while retaining any un-specified defaults.
+# ==========================================================================================
+let mat_file = get(ENV, "TP_CLIP_MATERIAL_FILE", get(ENV, "TP_CLIP_MATERIAL_CONFIG", ""))
+    if !isempty(mat_file) && isfile(mat_file)
+        println("✓ Loading external material properties from: ", abspath(mat_file))
+        include(abspath(mat_file))
+    elseif !isempty(mat_file)
+        @warn "Material property file specified via TP_CLIP_MATERIAL_FILE not found: $(mat_file)"
+    end
+end
+
 # ==========================================================================================
 # Nakamura non-isothermal crystallization kinetics (Nakamura 1972; Pantani et al. 2005)
 # Model:  dα/dt = n·K_N(T)·(1−α)·[−ln(1−α)]^((n−1)/n)
@@ -1800,20 +2932,27 @@ matrix_latent_heat = 1.65e5
 #   Kg   = 3.5e5 K²   (Lauritzen-Hoffman nucleation constant, α-iPP)
 #   K_0, Kg, T_m0 calibrated vs Brucato (2002) non-isothermal DSC onset/peak T at Φ=2.5–40 K/s
 # ==========================================================================================
-nakamura_n      = 3.0          # Avrami exponent
-nakamura_K0     = env_float("TP_CLIP_NAKAMURA_K0", 891251.0) # pre-exponential [1/s]
-nakamura_U_star = 6284.0       # J/mol
-nakamura_T_inf  = celsius_to_kelvin(223.0)   # °C input; stored as K
-nakamura_Kg     = 245471.0     # K² — Lauritzen–Hoffman nucleation constant
-nakamura_T_m0   = celsius_to_kelvin(453.0)   # °C input; equilibrium melting point stored as K
-nakamura_R      = 8.31446      # J/(mol·K)
+# Defaults are iPP (Brucato/Pantani). TP_CLIP_MATERIAL_FILE may set PA6 (or other) values first.
+(@isdefined(nakamura_n)) || (nakamura_n = 3.0)          # Avrami exponent
+(@isdefined(nakamura_K0)) || (nakamura_K0 = 891251.0)   # pre-exponential [1/s]
+nakamura_K0 = env_float("TP_CLIP_NAKAMURA_K0", nakamura_K0)
+(@isdefined(nakamura_U_star)) || (nakamura_U_star = 6284.0)  # J/mol
+(@isdefined(nakamura_T_inf)) ||
+    (nakamura_T_inf = celsius_to_kelvin(223.0))   # °C input; stored as K
+(@isdefined(nakamura_Kg)) || (nakamura_Kg = 245471.0)  # K² — Lauritzen–Hoffman
+(@isdefined(nakamura_T_m0)) ||
+    (nakamura_T_m0 = celsius_to_kelvin(453.0))   # °C input; equilibrium melting point
+nakamura_R = 8.31446      # J/(mol·K)
 nakamura_seed_crystallinity = env_float("TP_CLIP_NAKAMURA_SEED", 1.0e-6)
 # Flag: when true the Nakamura ODE drives latent-heat release and phase fractions;
 # the temperature-based apparent-cp fallback is disabled to avoid double counting.
 use_nakamura_kinetics = true
-thermal_softening_reference_temp = celsius_to_kelvin(270.0)
-matrix_viscosity = env_float("TP_CLIP_MATRIX_VISCOSITY_PA_S", 1.86e8) # Pa·s at T_liq — Cross–WLF η_ref vs Laun (1986) iPP
-matrix_viscosity_ref_temp = matrix_temp_liq
+# Defaults below keep any values already set by TP_CLIP_MATERIAL_FILE (include above).
+(@isdefined(thermal_softening_reference_temp)) ||
+    (thermal_softening_reference_temp = celsius_to_kelvin(270.0))
+(@isdefined(matrix_viscosity)) || (matrix_viscosity = 1.86e8) # Pa·s — Cross–WLF η_ref (iPP default)
+matrix_viscosity = env_float("TP_CLIP_MATRIX_VISCOSITY_PA_S", matrix_viscosity)
+(@isdefined(matrix_viscosity_ref_temp)) || (matrix_viscosity_ref_temp = matrix_temp_liq)
 # Previous hot-flow form kept below as commented reference:
 #   eta_0(T) = eta_ref * exp(E_a / R * (1 / T - 1 / T_ref))
 #   eta(T, gamma_dot) = eta_0 / (1 + (lambda * gamma_dot)^(1 - n))
@@ -1824,26 +2963,31 @@ matrix_viscosity_ref_temp = matrix_temp_liq
 # A1=15 with η_ref=8.0e6 gives η₀ ≈ 1000 Pa·s at 453 K (180°C), which is
 # appropriate for a CF-reinforced thermoplastic charge after fiber concentration
 # effects. The earlier η_ref=8e4 gave ~10 Pa·s, too liquid-like for punch contact.
-cross_wlf_A1 = 15.0
-cross_wlf_A2 = 50.0
-cross_wlf_transition_temp = matrix_viscosity_ref_temp
+(@isdefined(cross_wlf_A1)) || (cross_wlf_A1 = 15.0)
+(@isdefined(cross_wlf_A2)) || (cross_wlf_A2 = 50.0)
+(@isdefined(cross_wlf_transition_temp)) ||
+    (cross_wlf_transition_temp = matrix_viscosity_ref_temp)
 # Critical stress τ* sets the onset of shear-thinning: γ̇* = τ*/η₀.
 # 2e4 Pa from Laun (1986, Rheol. Acta 25:447) iPP capillary data — gives
 # γ̇* ≈ 1–4 s⁻¹ at 180–220°C so shear-thinning is active in stamp-forming (1–100 s⁻¹).
 # (2e7 Pa was 1000× too large and made the melt effectively Newtonian.)
-cross_wlf_critical_stress = 21000.0
-cross_wlf_power_law_index = 0.28
+(@isdefined(cross_wlf_critical_stress)) || (cross_wlf_critical_stress = 21000.0)
+(@isdefined(cross_wlf_power_law_index)) || (cross_wlf_power_law_index = 0.28)
 fiber_max_packing_fraction = 0.64
 fiber_intrinsic_viscosity = 2.5
 # Legacy placeholder from the earlier rule-of-mixtures viscosity model.
 # The live hot-flow law below keeps viscosity matrix-dominated instead.
 glass_viscosity = 1.0e16
-matrix_yield_stress = 9.0e7
-glass_yield_stress = 4.9e9   # CF tensile strength (T700, Toray datasheet), vs glass 2.5 GPa
-matrix_hardening = 8.0e8
-glass_hardening = 1.5e10     # stiffer fibre — CF post-yield tangent stiffness estimate
-matrix_h_contact = 2.5e4  # W/m²K — tool–part contact HTC, Bernet 1999 / Ye 2005 (range 2–5×10⁴)
-glass_h_contact = 6.0e4   # W/m²K — CF surface vs metal tool (similar range to GF)
+(@isdefined(matrix_yield_stress)) || (matrix_yield_stress = 9.0e7)
+(@isdefined(glass_yield_stress)) ||
+    (glass_yield_stress = 4.9e9)   # CF tensile strength (T700, Toray datasheet)
+(@isdefined(matrix_hardening)) || (matrix_hardening = 8.0e8)
+(@isdefined(glass_hardening)) ||
+    (glass_hardening = 1.5e10)     # stiffer fibre — CF post-yield tangent estimate
+(@isdefined(matrix_h_contact)) ||
+    (matrix_h_contact = 2.5e4)  # W/m²K — tool–part HTC, Bernet 1999 / Ye 2005
+(@isdefined(glass_h_contact)) ||
+    (glass_h_contact = 6.0e4)   # W/m²K — CF surface vs metal tool
 mu_friction = env_float("TP_CLIP_MU_FRICTION", 0.3)  # Coulomb friction coefficient, tool–part interface
                                                       # 0.3 is representative for steel vs CFRTP (Guzman 2018)
 # IMEX split (optional): keep stiff tool contact implicit, but apply "soft" wall coupling
@@ -1861,16 +3005,21 @@ clip_use_gpu && _clip_tensile_stress_enabled &&
 # Coefficient of Thermal Expansion (CTE) for thermal residual stress / springback.
 # CF T700: α∥ ≈ −0.5 ppm/K (longitudinal), α⊥ ≈ 22 ppm/K (transverse).
 # PP matrix: α ≈ 80 ppm/K.  Refs: Chawla (2012), Sideridis (1994).
-fiber_cte_axial      = env_float("TP_CLIP_FIBER_CTE_AXIAL",  -0.5e-6)  # CF axial CTE, 1/K
-fiber_cte_transverse = env_float("TP_CLIP_FIBER_CTE_TRANS",   22.0e-6) # CF transverse CTE, 1/K
-matrix_cte           = env_float("TP_CLIP_MATRIX_CTE",        80.0e-6) # PP matrix CTE, 1/K
-# Stress-free reference temperature: the point at which the solid first bears load.
-# Below T_stress_free, cooling generates locked-in thermal residual stress — the
-# primary driver of springback on mold release.
+# Material file may override; ENV still wins when set.
+(@isdefined(fiber_cte_axial)) || (fiber_cte_axial = -0.5e-6)
+(@isdefined(fiber_cte_transverse)) || (fiber_cte_transverse = 22.0e-6)
+(@isdefined(matrix_cte)) || (matrix_cte = 80.0e-6)
+fiber_cte_axial      = env_float("TP_CLIP_FIBER_CTE_AXIAL",  fiber_cte_axial)
+fiber_cte_transverse = env_float("TP_CLIP_FIBER_CTE_TRANS",   fiber_cte_transverse)
+matrix_cte           = env_float("TP_CLIP_MATRIX_CTE",        matrix_cte)
+# Stress-free reference temperature: unconstrained thermal volume is J_th=exp(3α(T-T0)).
+# CTE overlay is J2-neutral. Whenever kinematics are frozen while T falls (hold
+# solidification cool and closed-die cool), F_th is applied to positions+F so the
+# overlay increment is matched by Δlog J instead of locking as a punch-lift kick.
 T_stress_free = matrix_tmelt
 
 # Flow-orientation kinetics (Jeffery + RSC slowdown + ARD anisotropic diffusion)
-fiber_aspect_ratio = 10000.0
+(@isdefined(fiber_aspect_ratio)) || (fiber_aspect_ratio = 10000.0)
 xi_ft = (fiber_aspect_ratio^2 - 1.0) / (fiber_aspect_ratio^2 + 1.0)
 ci_ft = 0.0
 kappa_rsc = 0.35
@@ -1880,6 +3029,8 @@ orientation_coupling_gain = 0.30
 
 # Meso-architecture — alternating 0/90 plies with tow bands.
 n_plies = max(2, env_int("TP_CLIP_N_PLIES", geometry_mode == :full3d ? 3 : 7))
+const min_z_layers_per_physical_ply =
+    max(1, env_int("TP_CLIP_MIN_Z_LAYERS_PER_PLY", 2))
 fiber_vf_in_tow = 0.58
 if haskey(ENV, "TP_CLIP_UNIFORM_FIBER_VF")
     uniform_vf = env_float("TP_CLIP_UNIFORM_FIBER_VF", fiber_vf_in_tow)
@@ -1896,7 +3047,9 @@ tow_gap = 0.0015
 function clip_uniform_fiber_orientation()
     haskey(ENV, "TP_CLIP_UNIFORM_FIBER_ORIENTATION") || return nothing
     axis = lowercase(strip(ENV["TP_CLIP_UNIFORM_FIBER_ORIENTATION"]))
-    if axis in ("x", "+x", "1", "0")
+    if axis in ("none", "off", "ply", "qi")
+        return nothing
+    elseif axis in ("x", "+x", "1", "0")
         return StaticArrays.SVector(1.0, 0.0, 0.0)
     elseif axis in ("y", "+y")
         return StaticArrays.SVector(0.0, 1.0, 0.0)
@@ -1938,6 +3091,19 @@ function apply_uniform_charge_temperature!(cyl_sys, semi_local, v_ode, temp_k::F
     return nothing
 end
 
+# Preserve the through-thickness/in-plane temperature gradients while advancing
+# a quasi-static cooling continuation by one uniform ΔT stage.
+function apply_charge_temperature_delta!(cyl_sys, semi_local, v_ode, delta_T::Float64)
+    v_cyl = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
+    NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        t_set = clamp(cyl_sys.temp[particle] + delta_T, temp_min_clip, temp_max_clip)
+        cyl_sys.temp[particle] = t_set
+        v_cyl[NDIMS_CYL + 1, particle] = t_set
+    end
+    return nothing
+end
+
 # Physical setup dimensions held fixed when particle spacing changes.
 # These values match the current pseudo-2D baseline at particle_spacing = 0.8 mm.
 charge_thickness_target = 0.0066
@@ -1965,22 +3131,22 @@ const charge_width_target = env_float("TP_CLIP_CHARGE_WIDTH_MM", 3.6) * 1e-3
 if geometry_mode == :full3d
     charge_layers_y = haskey(ENV, "TP_CLIP_CHARGE_LAYERS_Y") ?
                       max(2, env_int("TP_CLIP_CHARGE_LAYERS_Y", 2)) :
-                      max(2, ceil(Int, charge_width_target / particle_spacing))
+                      max(2, ceil(Int, charge_width_target / particle_spacing_xy))
 elseif geometry_mode == :thin3d
     charge_layers_y = max(2, env_int("TP_CLIP_CHARGE_LAYERS_Y", 3))
 else
     charge_layers_y = max(1, env_int("TP_CLIP_CHARGE_LAYERS_Y", 1))
 end
-charge_width = charge_layers_y * particle_spacing
+charge_width = charge_layers_y * particle_spacing_xy
 charge_thickness = charge_thickness_target
 
 if !use_stl_geometry
-    n_charge = (ceil(Int, charge_length / particle_spacing),
+    n_charge = (ceil(Int, charge_length / particle_spacing_xy),
                 charge_layers_y,
-                max(2, ceil(Int, charge_thickness / particle_spacing)))
+                max(2, ceil(Int, charge_thickness / particle_spacing_z)))
     # Recenter the discrete particle lattice on the geometric mid-plane.
-    charge_length_discrete = n_charge[1] * particle_spacing
-    charge_thickness_discrete = n_charge[3] * particle_spacing
+    charge_length_discrete = n_charge[1] * particle_spacing_xy
+    charge_thickness_discrete = n_charge[3] * particle_spacing_z
     charge_top_target = 0.00165 + charge_thickness_target
     charge_top_actual = charge_bottom_clearance + charge_thickness_discrete
     charge_origin = (-0.5 * charge_length_discrete, -0.5 * charge_width,
@@ -2023,9 +3189,14 @@ holder_layers = max(1, ceil(Int, holder_thickness / particle_spacing))
 function build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
                                   matrix_density, glass_density,
                                   n_plies, fiber_vf_in_tow, fiber_vf_resin_rich,
-                                  tow_width, tow_gap)
+                                  tow_width, tow_gap,
+                                  particle_spacing_xy=particle_spacing,
+                                  particle_spacing_z=particle_spacing)
     nx, ny, nz = n_charge
     n_total = nx * ny * nz
+    ps_xy = Float64(particle_spacing_xy)
+    ps_z = Float64(particle_spacing_z)
+    cell_vol = ps_xy * ps_xy * ps_z
 
     coordinates = Matrix{Float64}(undef, 3, n_total)
     velocity = zeros(3, n_total)
@@ -2038,9 +3209,9 @@ function build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
     idx_matrix_rich = Int[]
 
     x0, y0, z0 = charge_origin
-    ply_thickness = nz > 0 ? (nz * particle_spacing) / n_plies : particle_spacing
-    tow_cols_pseudo2d = max(1, round(Int, tow_width / particle_spacing))
-    gap_cols_pseudo2d = max(1, round(Int, tow_gap / particle_spacing))
+    ply_thickness = nz > 0 ? (nz * ps_z) / n_plies : ps_z
+    tow_cols_pseudo2d = max(1, round(Int, tow_width / ps_xy))
+    gap_cols_pseudo2d = max(1, round(Int, tow_gap / ps_xy))
     tow_pitch_cols_pseudo2d = tow_cols_pseudo2d + gap_cols_pseudo2d
 
     @inline function particle_in_tow_band(i, j, ply_aligned_x)
@@ -2067,9 +3238,9 @@ function build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
     for k in 1:nz, j in 1:ny, i in 1:nx
         p += 1
 
-        x = x0 + (i - 0.5) * particle_spacing
-        y = y0 + (j - 0.5) * particle_spacing
-        z = z0 + (k - 0.5) * particle_spacing
+        x = x0 + (i - 0.5) * ps_xy
+        y = y0 + (j - 0.5) * ps_xy
+        z = z0 + (k - 0.5) * ps_z
 
         coordinates[1, p] = x
         coordinates[2, p] = y
@@ -2100,7 +3271,7 @@ function build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
 
         rho_local = vf_local * glass_density + (1.0 - vf_local) * matrix_density
         density[p] = rho_local
-        mass[p] = rho_local * particle_spacing^3
+        mass[p] = rho_local * cell_vol
 
         if vf_local >= 0.5 * fiber_vf_in_tow
             push!(idx_fiber_rich, p)
@@ -2109,20 +3280,41 @@ function build_glass_fiber_charge(particle_spacing, n_charge, charge_origin;
         end
     end
 
-    ic = InitialCondition(; coordinates, velocity, mass, density)
+    ic = InitialCondition(; coordinates, velocity, mass, density,
+                          particle_spacing=Float64(particle_spacing))
 
     return ic, fiber_volume_fraction, fiber_direction, idx_fiber_rich, idx_matrix_rich
 end
 
 factor = 1.1
-smoothing_kernel = SchoenbergQuinticSplineKernel{3}()
+# Kernel compact support sets the physical SPH NHS / force search radius:
+#   quintic (default) → 3h ; quartic → 2.5h ; wendland_c2 → 2h
+# Pair with TP_CLIP_JAC_RADIUS_MULT ≥ support/h (e.g. quartic + jac 2.5).
+const _clip_smoothing_kernel_name = lowercase(get(ENV, "TP_CLIP_SMOOTHING_KERNEL", "quintic"))
+smoothing_kernel = if _clip_smoothing_kernel_name in ("wendland_c2", "wendlandc2", "wendland", "c2")
+    WendlandC2Kernel{3}()
+elseif _clip_smoothing_kernel_name in ("quartic", "schoenberg_quartic", "spline4")
+    SchoenbergQuarticSplineKernel{3}()
+elseif _clip_smoothing_kernel_name in ("quintic", "schoenberg_quintic", "spline5")
+    SchoenbergQuinticSplineKernel{3}()
+else
+    error("TP_CLIP_SMOOTHING_KERNEL must be 'quintic', 'quartic', or 'wendland_c2' " *
+          "(got $(_clip_smoothing_kernel_name))")
+end
 smoothing_length = factor * particle_spacing
 tool_smoothing_length = factor * tool_particle_spacing
+_clip_kernel_support_over_h = TrixiParticles.compact_support(smoothing_kernel,
+                                                            smoothing_length) /
+                              max(smoothing_length, eps(Float64))
+println("  - smoothing kernel: ", typeof(smoothing_kernel),
+        " (compact support ≈ ", round(_clip_kernel_support_over_h; digits=2), " h)")
 
 const stl_molding_geometry = Ref{Any}(nothing)
 if use_stl_geometry
     stl_molding_geometry[] = clip_setup_stl_molding_geometry(;
         particle_spacing=particle_spacing,
+        particle_spacing_xy=particle_spacing_xy,
+        particle_spacing_z=particle_spacing_z,
         tool_particle_spacing=tool_particle_spacing,
         geometry_mode=geometry_mode,
         charge_layers_y=charge_layers_y,
@@ -2160,8 +3352,63 @@ else
                                  fiber_vf_in_tow=fiber_vf_in_tow,
                                  fiber_vf_resin_rich=fiber_vf_resin_rich,
                                  tow_width=tow_width,
-                                 tow_gap=tow_gap)
+                                 tow_gap=tow_gap,
+                                 particle_spacing_xy=particle_spacing_xy,
+                                 particle_spacing_z=particle_spacing_z)
 end
+
+# In-plane random fiber directions (Song wet-laid sheet). Homogeneous Vf via
+# TP_CLIP_UNIFORM_FIBER_VF; this replaces 0/90 tow directions only.
+if env_int("TP_CLIP_RANDOM_FIBER_ORIENTATION", 0) != 0
+    Random.seed!(env_int("TP_CLIP_RANDOM_FIBER_SEED", 1))
+    n_orient = size(fiber_direction, 2)
+    @inbounds for p in 1:n_orient
+        θ = 2.0 * π * rand()
+        fiber_direction[1, p] = cos(θ)
+        fiber_direction[2, p] = sin(θ)
+        fiber_direction[3, p] = 0.0
+    end
+    println("  - fiber orientation: in-plane random (TP_CLIP_RANDOM_FIBER_ORIENTATION=1, seed=",
+            env_int("TP_CLIP_RANDOM_FIBER_SEED", 1), ")")
+end
+
+# Opt-in physical ply ownership. Keep the packed `polymer` and all packed
+# material arrays unchanged as the canonical global particle ordering; each
+# source index below maps a ply-local particle back to that ordering.
+charge_initial_conditions, charge_ply_source_indices =
+    if separate_charge_plies
+        plies, source_indices =
+            clip_split_charge_initial_condition(polymer, n_plies;
+                                                layer_tolerance=0.25 *
+                                                                particle_spacing_z,
+                                                min_layers_per_ply=
+                                                    min_z_layers_per_physical_ply)
+        println("  - physically separate charge plies: ", length(plies),
+                " TLSPH systems; particle counts = ", join(length.(source_indices), ", "))
+        println("  - resolved z-layer requirement: ≥",
+                min_z_layers_per_physical_ply, " layers per physical ply")
+        println("  - physical ply mass check: ",
+                sum(sum(ply.mass) for ply in plies), " kg (packed charge ",
+                sum(polymer.mass), " kg)")
+        ply_angles = let raw = strip(get(ENV, "TP_CLIP_PLY_ORIENTATIONS_DEG", "0,90,45,-45"))
+            [deg2rad(parse(Float64, s)) for s in split(raw, ',')]
+        end
+        for (ply_i, source) in enumerate(source_indices)
+            θ = ply_angles[mod1(ply_i, length(ply_angles))]
+            cθ, sθ = cos(θ), sin(θ)
+            @inbounds for p in source
+                fiber_direction[1, p] = cθ
+                fiber_direction[2, p] = sθ
+                fiber_direction[3, p] = 0.0
+            end
+        end
+        println("  - separate-ply fibre angles (deg) = ",
+                join(round.(rad2deg.(ply_angles); digits=1), ", "),
+                " repeating over ", length(source_indices), " plies")
+        plies, source_indices
+    else
+        [polymer], [collect(1:nparticles(polymer))]
+    end
 
 final_thickness_target = compression_thickness_ratio * charge_thickness_discrete
 
@@ -2202,6 +3449,111 @@ E2_particle = matrix_E .* (1.0 .+ 2.0 .* halpin_tsai_eta_E2 .* phase_vf_particle
               max.(1.0 .- halpin_tsai_eta_E2 .* phase_vf_particle, eps(Float64))
 k_fiber_particle = max.(0.0, (E1_particle .- E2_particle) ./ 4.0)
 
+const organosheet_mechanics = env_int("TP_CLIP_ORGANOSHEET_MECHANICS", 0) != 0
+const organosheet_architecture =
+    lowercase(strip(get(ENV, "TP_CLIP_ORGANOSHEET_ARCHITECTURE", "woven")))
+organosheet_architecture in ("woven", "ud", "qi", "quasi_isotropic") ||
+    error("TP_CLIP_ORGANOSHEET_ARCHITECTURE must be 'woven', 'ud', or 'qi'")
+const organosheet_ply_model = OrganosheetPlyModel(
+    fiber_stiffness=env_float("TP_CLIP_ORGANOSHEET_FIBER_STIFFNESS_PA", mean(E1_particle)),
+    shear_stiffness=env_float("TP_CLIP_ORGANOSHEET_SHEAR_STIFFNESS_PA",
+                              mean(E2_particle) /
+                              (2 * (1 + ((@isdefined(matrix_nu)) ? matrix_nu : 0.3)))),
+    locking_angle=deg2rad(env_float("TP_CLIP_ORGANOSHEET_LOCKING_ANGLE_DEG", 45.0)),
+    locking_stiffness=env_float("TP_CLIP_ORGANOSHEET_LOCKING_STIFFNESS_PA",
+                                mean(E1_particle)),
+    locking_exponent=max(1, env_int("TP_CLIP_ORGANOSHEET_LOCKING_EXPONENT", 3)))
+const organosheet_active_in_melt = env_int("TP_CLIP_ORGANOSHEET_ACTIVE_IN_MELT", 1) != 0
+organosheet_mechanics &&
+    println("  - organosheet constitutive mechanics: ON (", organosheet_architecture,
+            "; matrix plasticity remains matrix-only; molten fiber stress = ",
+            organosheet_active_in_melt ? "ACTIVE" : "OFF", ")")
+# #region agent log
+if organosheet_mechanics
+    println("  - organosheet stiffness [Pa]: fiber=", organosheet_ply_model.fiber_stiffness,
+            " shear=", organosheet_ply_model.shear_stiffness,
+            " lock=", organosheet_ply_model.locking_stiffness,
+            " | UL=", get(ENV, "TP_CLIP_UPDATED_LAGRANGE", "?"),
+            " DT0=", get(ENV, "TP_CLIP_DT0", "?"),
+            " mu=", get(ENV, "TP_CLIP_MU_FRICTION", "?"))
+    try
+        open("/home/sadaat/SPH_Code/TrixiParticles.jl_Saadat/.cursor/debug-b1cbaf.log", "a") do _dbg_io
+            _ts = round(Int, time() * 1000)
+            println(_dbg_io,
+                "{\"sessionId\":\"b1cbaf\",\"runId\":\"post-fix\",\"hypothesisId\":\"H1\",\"location\":\"stamping_cfk_clip_pseudo2d_implicit.jl:organosheet\",\"message\":\"organosheet stiffness at startup\",\"timestamp\":",
+                _ts,
+                ",\"data\":{\"architecture\":\"", organosheet_architecture,
+                "\",\"fiber_Pa\":", organosheet_ply_model.fiber_stiffness,
+                ",\"shear_Pa\":", organosheet_ply_model.shear_stiffness,
+                ",\"lock_Pa\":", organosheet_ply_model.locking_stiffness,
+                ",\"UL\":\"", get(ENV, "TP_CLIP_UPDATED_LAGRANGE", "?"),
+                "\",\"DT0\":\"", get(ENV, "TP_CLIP_DT0", "?"),
+                "\",\"mu\":\"", get(ENV, "TP_CLIP_MU_FRICTION", "?"),
+                "\",\"session\":\"", get(ENV, "SESSION", "?"), "\"}}")
+        end
+    catch
+    end
+end
+# #endregion
+
+# Homogenized stack: QI (or user) fibre angles by through-thickness ply ID.
+# Separate-ply mode already assigned these from the source maps above.
+if organosheet_mechanics && !separate_charge_plies
+    ply_ids = assign_organosheet_ply_ids(polymer.coordinates, n_plies)
+    ply_angles = let raw = strip(get(ENV, "TP_CLIP_PLY_ORIENTATIONS_DEG", "0,90,45,-45"))
+        [deg2rad(parse(Float64, s)) for s in split(raw, ',')]
+    end
+    @inbounds for particle in eachindex(ply_ids)
+        θ = ply_angles[mod1(ply_ids[particle], length(ply_angles))]
+        fiber_direction[1, particle] = cos(θ)
+        fiber_direction[2, particle] = sin(θ)
+        fiber_direction[3, particle] = 0.0
+    end
+    println("  - homogenized ply fibre angles (deg) = ",
+            join(round.(rad2deg.(ply_angles); digits=1), ", "),
+            " on ", n_plies, " material ply IDs (one TLSPH charge system)")
+end
+
+@inline function clip_organosheet_weft_direction(warp)
+    organosheet_architecture == "ud" && return nothing
+    weft = StaticArrays.SVector(-warp[2], warp[1], 0.0)
+    if norm(weft) <= sqrt(eps(Float64))
+        return StaticArrays.SVector(0.0, 1.0, 0.0)
+    end
+    return weft / norm(weft)
+end
+
+@inline function clip_organosheet_reinforcement_stress(F, warp, model::OrganosheetPlyModel,
+                                                       arch::AbstractString)
+    if arch == "ud"
+        return organosheet_fiber_pk1(F, warp, model) * transpose(F)
+    elseif arch == "woven"
+        weft = clip_organosheet_weft_direction(warp)
+        return organosheet_kirchhoff_stress(F, warp, weft, model)
+    elseif arch in ("qi", "quasi_isotropic")
+        # Homogenized [0, 90, 45, -45]s stack represented as two balanced orthogonal pairs:
+        # Pair 1: (0°, 90°)
+        weft1 = StaticArrays.SVector(-warp[2], warp[1], 0.0)
+        weft1_u = norm(weft1) > sqrt(eps(Float64)) ? weft1 / norm(weft1) : StaticArrays.SVector(0.0, 1.0, 0.0)
+        tau_pair1 = organosheet_kirchhoff_stress(F, warp, weft1_u, model)
+
+        # Pair 2: (+45°, -45°) rotated by 45° in-plane from warp
+        inv_sqrt2 = 0.7071067811865476
+        warp2 = StaticArrays.SVector(inv_sqrt2 * (warp[1] - warp[2]),
+                                     inv_sqrt2 * (warp[1] + warp[2]),
+                                     0.0)
+        warp2_u = norm(warp2) > sqrt(eps(Float64)) ? warp2 / norm(warp2) : StaticArrays.SVector(inv_sqrt2, inv_sqrt2, 0.0)
+        weft2 = StaticArrays.SVector(-warp2_u[2], warp2_u[1], 0.0)
+        weft2_u = norm(weft2) > sqrt(eps(Float64)) ? weft2 / norm(weft2) : StaticArrays.SVector(-inv_sqrt2, inv_sqrt2, 0.0)
+        tau_pair2 = organosheet_kirchhoff_stress(F, warp2_u, weft2_u, model)
+
+        # 50% volume fraction weighting per balanced pair
+        return 0.5 * (tau_pair1 + tau_pair2)
+    else
+        return organosheet_kirchhoff_stress(F, warp, nothing, model)
+    end
+end
+
 # Effective isotropic CTE per particle (volumetric average, transversely isotropic → isotropic).
 # α₁ (fiber direction): E-weighted Voigt rule of mixtures.
 # α₂ (transverse):      simple rule of mixtures.
@@ -2223,6 +3575,18 @@ hardening_base_particle = matrix_hardening .* (1.0 .- phase_vf_particle) .+
 viscosity_base_particle = fill(matrix_viscosity, length(phase_vf_particle))
 h_contact_particle = matrix_h_contact .* (1.0 .- phase_vf_particle) .+
                      glass_h_contact .* phase_vf_particle
+# Mechanical mass scaling must not slow boundary cooling. Internal SPH conduction
+# retains the existing scaled-density/k calibration, while ambient convection and
+# radiation use the physical composite density.
+@inline physical_thermal_density(cyl_sys, particle) =
+    cyl_sys.material_density[particle] / mass_scaling
+const contact_htc_scale = env_float("TP_CLIP_CONTACT_HTC_SCALE", 1.0)
+if contact_htc_scale != 1.0
+    h_contact_particle .*= contact_htc_scale
+    println(">>> Contact HTC scale = ", contact_htc_scale,
+            "  (mean h=", round(sum(h_contact_particle) / length(h_contact_particle); sigdigits=3),
+            " W/m²K)")
+end
 
 orientation_scalar_particle = ones(length(phase_vf_particle))
 
@@ -2257,6 +3621,9 @@ println("  - size [mm] = ", round.(StaticArrays.SVector(charge_length_discrete, 
                                               charge_thickness_discrete) .* 1e3,
                                       digits=2))
 println("  - particles = ", nparticles(polymer))
+println("  - physical charge mass = ",
+        round(sum(polymer.mass) / mass_scaling * 1e3; digits=3),
+        " g (SPH mass / TP_CLIP_MASS_SCALING=", mass_scaling, ")")
 haskey(ENV, "TP_CLIP_UNIFORM_FIBER_VF") &&
     println("  - uniform fibre Vf = ", round(fiber_vf_in_tow, digits=4),
             " (TP_CLIP_UNIFORM_FIBER_VF; tow/gap bands disabled in material)")
@@ -2740,7 +4107,7 @@ retraction_viscoplastic_gap_ps = sim_phase == "retraction" ?
 # Soft magnitude law: a ← a_cap·tanh(|a|/a_cap)·â. 0 = off.
 retraction_internal_accel_cap = sim_phase == "retraction" ?
     env_float("TP_CLIP_RETRACTION_INTERNAL_ACCEL_CAP", 0.0) : 0.0  # m/s²
-molten_wall_drag_factor = env_float("TP_CLIP_MOLTEN_WALL_DRAG_FACTOR", 0.05)
+molten_wall_drag_factor = env_float("TP_CLIP_MOLTEN_WALL_DRAG_FACTOR", 0.0005)
 molten_wall_drag_max_rate = env_float("TP_CLIP_MOLTEN_WALL_DRAG_MAX_RATE", 1.0e5) # 1/s
 
 # Target stroke: drive the punch from its start position (z_punch_bot) down until
@@ -2756,9 +4123,22 @@ if !haskey(ENV, "TP_CLIP_TARGET_STROKE_MM") &&
     println(">>> User L-die: seat punch to mold (mating stroke) = ",
             round(target_stroke * 1e3; digits=3), " mm")
 elseif haskey(ENV, "TP_CLIP_TARGET_STROKE_MM")
-    target_stroke = max(0.0, env_float("TP_CLIP_TARGET_STROKE_MM", 0.0) * 1e-3)
-    println(">>> Override: TP_CLIP_TARGET_STROKE_MM = ",
-            round(target_stroke * 1e3; digits=3), " mm")
+    _stroke_raw = lowercase(strip(get(ENV, "TP_CLIP_TARGET_STROKE_MM", "")))
+    if _stroke_raw in ("auto", "seat", "geometry")
+        # Seat punch to compressed thickness on cavity floor:
+        #   stroke = z_punch_bot − (z_base_top + final_thickness_target)
+        # For STL packs, z_base_top is the packed cavity-floor z (see clip_stl_geometry_setup).
+        target_stroke = max(0.0, z_punch_bot - (z_base_top + final_thickness_target))
+        println(">>> Target stroke from geometry (TP_CLIP_TARGET_STROKE_MM=",
+                _stroke_raw, ") = ", round(target_stroke * 1e3; digits=3),
+                " mm  [punch_bot=", round(z_punch_bot * 1e3; digits=3),
+                " floor=", round(z_base_top * 1e3; digits=3),
+                " final_t=", round(final_thickness_target * 1e3; digits=3), " mm]")
+    else
+        target_stroke = max(0.0, env_float("TP_CLIP_TARGET_STROKE_MM", 0.0) * 1e-3)
+        println(">>> Override: TP_CLIP_TARGET_STROKE_MM = ",
+                round(target_stroke * 1e3; digits=3), " mm")
+    end
 end
 
 tp_clip_max_press_force_n = env_float("TP_CLIP_MAX_PRESS_FORCE_N", 0.0)
@@ -2791,6 +4171,9 @@ end
 # Default: no time cap (Inf). Set TP_CLIP_SOLIDIFICATION_HOLD_MAX_S to a finite value to
 # allow early exit before full solidification (legacy/debug behaviour).
 solidification_hold_max = env_float("TP_CLIP_SOLIDIFICATION_HOLD_MAX_S", Inf)
+# Optional: stop hold when mean charge temperature (°C) cools to this value.
+# When set, this replaces the solidification-fraction completion criterion.
+hold_until_temp_C = env_float("TP_CLIP_HOLD_UNTIL_TEMP_C", NaN)
 # ODE tspan upper-bound when hold is unlimited (hold/hold-tail terminate earlier).
 solidification_hold_plan_s = env_float("TP_CLIP_SOLIDIFICATION_HOLD_PLAN_S", 1200.0)
 solidification_hold_budget = isfinite(solidification_hold_max) ?
@@ -2829,11 +4212,29 @@ function build_compress_hold_vtu_save_times(t_final)
     return times
 end
 post_solidification_dwell = env_float("TP_CLIP_POST_SOLID_DWELL_S", 2.0e-3)
-retraction_duration_max = abs(z_shift_down_end) / abs(mold_velocity_state) +
+# Demold-only: lift punch ABOVE the pre-compression open position so the ejected
+# workpiece can sit between mold and punch with clearance from both.
+# Non-eject runs keep 0 (no kinematics change). Override with
+# TP_CLIP_RETRACTION_PUNCH_EXTRA_LIFT_MM (mm above open).
+const retraction_punch_extra_lift = begin
+    if !retraction_eject_enable
+        0.0
+    elseif haskey(ENV, "TP_CLIP_RETRACTION_PUNCH_EXTRA_LIFT_MM") &&
+           !isempty(strip(get(ENV, "TP_CLIP_RETRACTION_PUNCH_EXTRA_LIFT_MM", "")))
+        max(0.0, env_float("TP_CLIP_RETRACTION_PUNCH_EXTRA_LIFT_MM", 0.0) * 1e-3)
+    else
+        clear = max(retraction_eject_clear_ps * particle_spacing, 0.0)
+        max(0.0, cavity_depth + charge_thickness_discrete + 2.0 * clear)
+    end
+end
+retraction_duration_max = (abs(z_shift_down_end) + retraction_punch_extra_lift) /
+                          abs(mold_velocity_state) +
                           0.5 * env_float("TP_CLIP_RETRACTION_RAMP_S",
                                           env_float("TP_CLIP_RETRACTION_KINEMATICS_RELEASE_S", 0.05))
 t_total = t_compress + solidification_hold_budget + post_solidification_dwell +
-      hold_tlsph_tail_s + retraction_duration_max + retraction_springback_dwell_s
+      hold_tlsph_tail_s + retraction_duration_max +
+      (retraction_eject_enable ? retraction_eject_s : 0.0) +
+      retraction_springback_dwell_s
 println("  - compression target = ", round(100 * compression_thickness_ratio; digits=0),
         "% of initial charge thickness (", round(charge_thickness_discrete * 1e3; digits=2),
         " mm -> ", round(final_thickness_target * 1e3; digits=2), " mm)")
@@ -2842,16 +4243,27 @@ println("  - press speed = ", abs(mold_velocity_state), " m/s, ramp = ", t_ramp_
         ", t_down_end = ", round(t_down_end; digits=6),
         " s, t_motion = ", round(t_compress; digits=6),
         " s, solidification hold ",
+        isfinite(hold_until_temp_C) ?
+            ("until mean charge T ≤ " * string(round(hold_until_temp_C; digits=1)) *
+             " °C (no time cap; plan " *
+             string(round(solidification_hold_plan_s; digits=6)) * " s)") :
         isfinite(solidification_hold_max) ?
             ("<= " * string(round(solidification_hold_max; digits=6)) * " s") :
             "until 100% particles solidify (no time cap; plan " *
             string(round(solidification_hold_plan_s; digits=6)) * " s)",
-        " (target ", round(100 * solidification_fraction_target; digits=0),
-        "% particles sf>=", solidification_fraction_threshold, ")",
+        isfinite(hold_until_temp_C) ? "" :
+            (" (target " * string(round(100 * solidification_fraction_target; digits=0)) *
+             "% particles sf>=" * string(solidification_fraction_threshold) * ")"),
     ", post-solidification dwell = ", round(post_solidification_dwell; digits=6),
     " s, TLSPH equilibration tail = ", round(hold_tlsph_tail_s; digits=6),
     " s, retract <= ", round(retraction_duration_max; digits=6),
-    " s, springback dwell <= ", round(retraction_springback_dwell_s; digits=6),
+    (retraction_punch_extra_lift > 0.0 ?
+        (", punch extra lift = " * string(round(retraction_punch_extra_lift * 1e3; digits=2)) * " mm") :
+        ""),
+    ", eject/demold = ",
+    retraction_eject_enable ?
+        (string(round(retraction_eject_s; digits=4)) * " s") : "off",
+    ", springback dwell <= ", round(retraction_springback_dwell_s; digits=6),
     " s, VTU save dt = ", vtu_save_dt, " s (compression ",
     compression_vtu_save_dt, " s)")
 
@@ -3006,7 +4418,7 @@ const retraction_diag_enabled = sim_phase == "retraction" &&
     env_int("TP_CLIP_RETRACTION_DIAG", 1) != 0
 const retraction_diag_interval = max(1, env_int("TP_CLIP_RETRACTION_DIAG_INTERVAL", 500))
 const retraction_diag_log_path = get(ENV, "TP_CLIP_RETRACTION_DIAG_LOG",
-                                     joinpath("out", "retraction_diag.csv"))
+                                     joinpath(clip_out_dir, "retraction_diag.csv"))
 const retraction_diag_spike_dv = env_float("TP_CLIP_RETRACTION_DIAG_SPIKE_DV", 1.0e5)
 const retraction_diag_spike_speed = env_float("TP_CLIP_RETRACTION_DIAG_SPIKE_SPEED", 1.0e3)
 # Short retraction window for fast smoke test (e.g. 0.02 s covers explicit blow-up at ~0.014 s).
@@ -3031,6 +4443,8 @@ hold_tlsph_equilibration_now = Ref(false)
 retraction_pre_lift_creep_announced = Ref(false)
 retraction_lift_started_announced = Ref(false)
 retraction_creep_audit_next_t = Ref(Inf)
+retraction_pre_lift_settle_announced = Ref(false)
+retraction_pre_lift_settle_done = Ref(false)
 retraction_lift_planned_time = Ref(Inf)  # nominal t0+creep; settle may postpone lift_start
 retraction_creep_floor_settle_announced = Ref(false)
 
@@ -3040,22 +4454,37 @@ retraction_creep_floor_settle_announced = Ref(false)
     return t < retraction_lift_start_time[]
 end
 
+@inline function retraction_pre_lift_settle_active(t)
+    retraction_pre_lift_settle_s <= 0.0 && return false
+    !retraction_started[] && return false
+    t0 = retraction_start_time[] + retraction_pre_lift_creep_s
+    return t >= t0 - 1.0e-14 && t < t0 + retraction_pre_lift_settle_s - 1.0e-14
+end
+
 function arm_retraction_phase!(t)
     retraction_started[] = true
     retraction_start_time[] = t
     # Reserve closed-die floor-settle budget up front so punch cannot lift one step early.
-    retraction_lift_planned_time[] = t + retraction_pre_lift_creep_s
-    # Contact settle: also reserve σ ramp after settle before punch may lift.
+    retraction_lift_planned_time[] = t + retraction_pre_lift_creep_s +
+                                     retraction_pre_lift_settle_s
     sigma_budget = retraction_closed_die_contact_settle ?
         retraction_contact_settle_sigma_ramp_s : 0.0
-    retraction_lift_start_time[] = retraction_lift_planned_time[] +
-        retraction_creep_floor_settle_max_s + sigma_budget
+    retraction_lift_start_time[] = retraction_cool_before_lift ? Inf :
+        (retraction_lift_planned_time[] +
+         retraction_creep_floor_settle_max_s + sigma_budget)
+    retraction_closed_die_cool_active[] = false
+    retraction_closed_die_cool_done[] = false
+    retraction_closed_die_cool_start_t[] = Inf
+    reset_thermal_Fth_state!()
     retraction_creep_floor_settle_announced[] = false
+    retraction_pre_lift_settle_announced[] = false
+    retraction_pre_lift_settle_done[] = false
     retraction_contact_settle_done[] = false
     retraction_sigma_ramp_start_t[] = Inf
     retraction_contact_settle_announced[] = false
     retraction_peel_done[] = false
     retraction_peel_announced[] = false
+    retraction_peel_hold_for_eject_announced[] = false
     retraction_peel_release_announced[] = false
     retraction_peel_release_time[] = Inf
     retraction_floor_open_z_shift[] = 0.0
@@ -3065,11 +4494,52 @@ function arm_retraction_phase!(t)
     retraction_floor_open_done[] = false
     retraction_floor_open_announced[] = false
     retraction_floor_projected[] = false
+    retraction_eject_active[] = false
+    retraction_eject_complete[] = false
+    retraction_eject_announced[] = false
+    retraction_eject_start_t[] = Inf
+    retraction_eject_target_dz[] = 0.0
+    retraction_eject_z_applied[] = 0.0
+    retraction_indie_cool_announced[] = false
+    retraction_indie_cool_last_print_t[] = -Inf
+    retraction_closed_die_cool_active[] = false
+    retraction_closed_die_cool_done[] = false
+    retraction_closed_die_cool_start_t[] = Inf
+    retraction_post_eject_bang_done[] = false
+    retraction_post_eject_bang_t[] = Inf
+    retraction_tool_temp_after_punch_lift_done[] = false
+    retraction_closed30_ckpt_saved[] = false
+    retraction_closed30_settle_start_t[] = Inf
+    reset_thermal_Fth_state!()
+    retraction_post_cool_springback_active[] = false
+    retraction_post_cool_springback_start_t[] = Inf
+    retraction_post_cool_springback_announced[] = false
     if retraction_pre_lift_creep_s > 0.0 && retraction_creep_audit_dt > 0.0
         retraction_creep_audit_next_t[] = t + retraction_creep_audit_dt
     else
         retraction_creep_audit_next_t[] = Inf
     end
+    return nothing
+end
+
+function arm_retraction_from_preeject!(t)
+    retraction_lift_planned_time[] = t - retraction_duration_max
+    retraction_lift_start_time[] = retraction_lift_planned_time[]
+    mold_retraction_complete[] = true
+    mold_retraction_complete_time[] = t
+    retraction_peel_done[] = true
+    retraction_peel_announced[] = true
+    retraction_peel_release_announced[] = true
+    retraction_peel_release_time[] = t
+    retraction_qs_cte_scale[] = max(retraction_qs_cte_scale[], 1.0)
+    retraction_lift_started_announced[] = true
+    retraction_pre_lift_creep_announced[] = true
+    retraction_tool_temp_after_punch_lift_done[] = true
+    retraction_closed_die_cool_done[] = true
+    retraction_closed_die_cool_active[] = false
+    println(">>> Resume pre-eject: skip creep/lift/in-die cool; punch stays up; ",
+            "freeze mech during eject stroke, then live mechanics")
+    flush(stdout)
     return nothing
 end
 
@@ -3094,8 +4564,16 @@ end
 # Kinematic peel keeps charge gated from lift start until gaps clear (or peel timeout).
 @inline function retraction_charge_kinematics_gated(t)
     !retraction_started[] && return false
+    # Rigid eject: freeze deformational kinematics while prescribed +z demold runs.
+    retraction_eject_active[] && return true
     retraction_pre_lift_creep_active(t) && return false
     if retraction_kinematic_peel
+        # Stepped closed-die QS (lift-first OFF): charge must move in the mold
+        # before punch lift; peel gating applies only after lift starts.
+        if retraction_qs_cool && !retraction_lift_first_after_frozen_cool &&
+           retraction_closed_die_cool_active[]
+            return false
+        end
         return !retraction_peel_done[]
     end
     retraction_post_lift_kin_freeze_s > 0.0 || return false
@@ -3110,6 +4588,7 @@ end
     sim_phase == "retraction" && return false
     hold_tlsph_tail_s <= 0.0 && return false
     solidification_complete[] || return false
+    hold_stress_rate_converged[] && return false
     elapsed = t - hold_tlsph_tail_start_t()
     return elapsed >= 0.0 && elapsed < hold_tlsph_tail_s
 end
@@ -3118,7 +4597,17 @@ end
     sim_phase == "retraction" && return false
     solidification_complete[] || return false
     dwell_elapsed = t - solidification_reached_time[]
+    dwell_elapsed < post_solidification_dwell && return false
+    hold_stress_rate_converged[] && return true
     return dwell_elapsed >= post_solidification_dwell + hold_tlsph_tail_s
+end
+
+@inline function hold_tlsph_tail_kinematics_scale(t)
+    sim_phase == "retraction" && return 1.0
+    hold_tlsph_tail_active(t) || return 0.0
+    hold_tlsph_tail_ramp_s <= 0.0 && return 1.0
+    elapsed = t - hold_tlsph_tail_start_t()
+    return smoothstep01(elapsed / hold_tlsph_tail_ramp_s)
 end
 
 # Mold closed, charge v/u frozen — thermal-only hold OR TLSPH equilibration tail / pre-lift creep.
@@ -3127,12 +4616,25 @@ end
 # must clear via contact mechanics (particle projection is scrapped).
 @inline function hold_kinematics_frozen(t)
     if retraction_pre_lift_creep_active(t)
+        if retraction_pre_lift_settle_active(t)
+            return false
+        end
+        # Closed-die QS cool needs live charge motion while punch+floor stay down.
+        if retraction_cool_before_lift && retraction_closed_die_cool_active[]
+            return false
+        end
         # Kinematic peel: charge stays glued through closed-die creep (mold lifts later).
         # Option B (free kin in creep) REJECTED: abort ~37 ms in with floor/mold soft-overlap
         # (kick≈1.3e6, J_min 0.22→0.07) while Strategy E bulk≈0 — tool contact, not bulk.
         retraction_kinematic_peel && return true
         # Contact-led closed-die settle: kin must be ACTIVE while σ is held at 0.
         retraction_closed_die_contact_settle && return false
+        # Cool-then-lift: freeze-T creep stays frozen (Fe_iso, moldClear6).
+        # Closed-die cool: kin ON only after T ≤ QS_KIN_AFTER_C (r15 extruded at 229 °C).
+        if retraction_cool_before_lift && !retraction_closed_die_cool_done[]
+            retraction_closed_die_cool_active[] && return false
+            return true
+        end
         env_int("TP_CLIP_RETRACTION_CREEP_KINEMATICS_FREEZE", 1) != 0 && return true
         if env_int("TP_CLIP_RETRACTION_CREEP_KIN_AFTER_SIGMA", 1) != 0
             return retraction_elastic_scale(t) < 1.0 - 1.0e-8
@@ -3152,16 +4654,48 @@ end
     end
 end
 
+# Unilateral thermal shrink while packing is frozen and T is actually falling.
+# Hold solidification cool AND closed-die cool. Freeze-T creep is excluded (dT=0).
+@inline function frozen_thermal_contraction_active(t)
+    hold_kinematics_frozen(t) || return false
+    sim_phase == "retraction" && retraction_thermal_frozen_now() && return false
+    return true
+end
+
+# 0 during frozen CTE-off cool; ramped or 1 after kin ON; 1 after lift.
+# SKIP_CTE=0: still off while creep kin is frozen (do not store τ_th), then
+# follow T in the closed die so the 190 K mismatch is never restored later.
+@inline function retraction_thermal_cte_scale()
+    if !retraction_qs_skip_cte_until_kin
+        retraction_closed_die_cool_done[] && return 1.0
+        retraction_closed_die_cool_active[] || return 0.0
+        return retraction_qs_cte_ramp ? retraction_qs_cte_scale[] : 1.0
+    end
+    if retraction_lift_first_after_frozen_cool
+        retraction_peel_done[] || return 0.0
+        return retraction_qs_cte_scale[]
+    end
+    retraction_closed_die_cool_done[] && return 1.0
+    retraction_closed_die_cool_active[] || return 0.0
+    return retraction_qs_cte_scale[]
+end
+
 # Closed-die hold (compression end → retraction): plastic commit substeps + optional skip_heat.
 @inline function hold_plastic_relax_active(t)
     t < t_compress && return false
     retraction_pre_lift_creep_active(t) && return true
+    retraction_closed_die_cool_active[] && retraction_closed_die_cool_plastic && return true
     sim_phase == "retraction" && return false
     return !retraction_started[]
 end
 
 @inline function charge_hold_thermal_only(t)
     retraction_pre_lift_creep_active(t) && return false
+    # Free-cool path: after demold eject, drop mechanics and integrate ambient/conduction only.
+    # Brief post-cool springback re-enables mechanics (returns false here).
+    if retraction_free_cool_thermal_only_now()
+        return true
+    end
     hold_kinematics_frozen(t) || return false
     return !hold_tlsph_tail_active(t)
 end
@@ -3235,6 +4769,11 @@ end
         return 1.0
     end
     if retraction_pre_lift_creep_active(t)
+        if retraction_closed_die_cool_active[]
+            retraction_closed_die_kin_ramp_s <= 0.0 && return 1.0
+            elapsed = t - retraction_closed_die_cool_start_t[]
+            return smoothstep01(elapsed / retraction_closed_die_kin_ramp_s)
+        end
         retraction_closed_die_contact_settle && return 1.0
         return retraction_pre_lift_ramp_scale(t, 1.0)
     end
@@ -3290,6 +4829,9 @@ end
 
 # Punch lift: uses mold scale (not charge gate). Charge may stay frozen while mold moves.
 @inline function mold_lift_z_shift_at(t)
+    if mold_retraction_complete[]
+        return z_shift_motion_end + mold_lift_z_full_shift(retraction_duration_max)
+    end
     if !retraction_started[] || retraction_pre_lift_creep_active(t)
         return z_shift_motion_end
     end
@@ -3329,7 +4871,8 @@ end
     else
         z_shift_motion_end
     end
-    return clamp(z_shift, z_shift_motion_end, 0.0)
+    # Upper bound 0 = pre-compression open; demold may lift further (+extra).
+    return clamp(z_shift, z_shift_motion_end, retraction_punch_extra_lift)
 end
 
 function clip_apply_mold_kinematics_cpu!(mold_sys, t)
@@ -3362,7 +4905,7 @@ end
 
 function clip_sync_tool_kinematics_gpu!(semi_local, t)
     clip_use_gpu || return nothing
-    clip_apply_mold_kinematics_cpu!(semi_local.systems[3], t)
+    clip_apply_mold_kinematics_cpu!(clip_mold_system(semi_local), t)
     return nothing
 end
 
@@ -3452,6 +4995,7 @@ function apply_imex_wall_drag_and_friction!(cyl_sys, floor_sys, mold_sys, semi_l
     resting_buf = charge_resting_on_shelf_buf[]
 
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        charge_particle_is_flyaway(particle) && continue
         x_i = cyl_sys.current_coordinates[1, particle]
         z_i = cyl_sys.current_coordinates[3, particle]
         gap_floor_drag = tool_surface_gap(floor_sys, x_i, z_i, particle_spacing; side=:lower)
@@ -3511,9 +5055,14 @@ function apply_imex_wall_drag_and_friction!(cyl_sys, floor_sys, mold_sys, semi_l
                 p_n     = max(0.0, -v_stress_buf[3, 3, particle])
                 rho_i   = cyl_sys.material_density[particle]
                 a_fric  = mu_eff * p_n / (rho_i * particle_spacing)
-                v_rel_x = v_wrap_state[1, particle]
-                if abs(v_rel_x) > 1.0e-12
-                    v_wrap_state[1, particle] -= dt * a_fric * sign(v_rel_x)
+                vx = v_wrap_state[1, particle]
+                vy = v_wrap_state[2, particle]
+                v_tan = hypot(vx, vy)
+                if v_tan > 1.0e-12
+                    change = min(v_tan, dt * a_fric)
+                    scale = change / v_tan
+                    v_wrap_state[1, particle] -= scale * vx
+                    v_wrap_state[2, particle] -= scale * vy
                 end
             end
         end
@@ -3526,17 +5075,31 @@ end
 end
 
 @inline function charge_kinematics_fully_released(t)
-    return !retraction_kinematics_ramping(t)
+    return !retraction_charge_kinematics_gated(t) && !retraction_kinematics_ramping(t)
 end
 
 function charge_span_ratio(cyl_sys)
     if retraction_reference_span_x[] <= 0.0 || retraction_reference_span_z[] <= 0.0
         return 1.0
     end
-    xs = @view cyl_sys.current_coordinates[1, :]
-    zs = @view cyl_sys.current_coordinates[3, :]
-    span_x = maximum(xs) - minimum(xs)
-    span_z = maximum(zs) - minimum(zs)
+    xmin = Inf
+    xmax = -Inf
+    zmin = Inf
+    zmax = -Inf
+    n_used = 0
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        charge_particle_is_flyaway(particle) && continue
+        x = cyl_sys.current_coordinates[1, particle]
+        z = cyl_sys.current_coordinates[3, particle]
+        xmin = min(xmin, x)
+        xmax = max(xmax, x)
+        zmin = min(zmin, z)
+        zmax = max(zmax, z)
+        n_used += 1
+    end
+    n_used == 0 && return 1.0
+    span_x = xmax - xmin
+    span_z = zmax - zmin
     return max(span_x / retraction_reference_span_x[],
                span_z / retraction_reference_span_z[])
 end
@@ -3559,6 +5122,15 @@ function floor_reimann_activation_factor(t, cyl_sys)
     if !retraction_started[]
         return 1.0
     end
+    # Rigid eject stroke: keep floor contact unless explicitly disabled.
+    # Punch/mold stay off (see mold_reimann_activation_factor).
+    if retraction_eject_enable && retraction_eject_active[]
+        return retraction_keep_floor_during_eject ? 1.0 : 0.0
+    end
+    # After eject: keep the floor as a resting table; punch/mold stay off.
+    if retraction_eject_enable && retraction_eject_complete[]
+        return retraction_keep_floor_after_eject ? 1.0 : 0.0
+    end
     # Post-peel diagnostic: TLSPH self only (no tool Reimann).
     if retraction_peel_tools_off && retraction_peel_done[]
         return 0.0
@@ -3578,6 +5150,9 @@ function mold_reimann_activation_factor(cyl_sys, mold_sys, t)
     if !retraction_started[]
         return 1.0
     end
+    if retraction_eject_enable && (retraction_eject_active[] || retraction_eject_complete[])
+        return 0.0
+    end
     if retraction_peel_tools_off && retraction_peel_done[]
         return 0.0
     end
@@ -3585,6 +5160,7 @@ function mold_reimann_activation_factor(cyl_sys, mold_sys, t)
     hold_release_factor(t) < 1.0 - 1.0e-8 && return 0.0
     min_gap = Inf
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        charge_particle_is_flyaway(particle) && continue
         x_i = cyl_sys.current_coordinates[1, particle]
         z_i = cyl_sys.current_coordinates[3, particle]
         min_gap = min(min_gap,
@@ -3616,6 +5192,7 @@ function charge_jacobian_extremes(cyl_sys)
     J_max = -Inf
     J_min_particle = 0
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        charge_particle_is_flyaway(particle) && continue
         J = charge_particle_jacobian(cyl_sys, particle)
         if J < J_min
             J_min = J
@@ -3628,10 +5205,115 @@ function charge_jacobian_extremes(cyl_sys)
     return J_min, J_max, J_min_particle
 end
 
+@inline function charge_particle_is_flyaway(particle::Int)
+    buf = charge_flyaway_buf[]
+    buf === nothing && return false
+    return 1 <= particle <= length(buf) && buf[particle]
+end
+
+function update_charge_flyaway_mask!(cyl_sys)
+    n = nparticles(cyl_sys)
+    mask = charge_flyaway_buf[]
+    if mask === nothing || length(mask) != n
+        mask = fill(false, n)
+        charge_flyaway_buf[] = mask
+    else
+        fill!(mask, false)
+    end
+    if !ignore_charge_flyaways
+        charge_flyaway_count[] = 0
+        return 0
+    end
+
+    coords = cyl_sys.current_coordinates
+    r_blank = 0.5 * max(charge_length, charge_width)
+    r_cut = r_blank + flyaway_r_pad
+    r_cut2 = r_cut * r_cut
+    z_lo = z_base_top - flyaway_below_floor
+    z_hi = z_base_top + max(cavity_depth, 0.0) + flyaway_above_cavity
+    r_neigh2 = (2.5 * particle_spacing)^2
+    n_neigh = zeros(Int, n)
+    @inbounds for i in 1:n
+        xi = coords[1, i]
+        yi = coords[2, i]
+        zi = coords[3, i]
+        for j in (i + 1):n
+            dx = xi - coords[1, j]
+            dy = yi - coords[2, j]
+            dz = zi - coords[3, j]
+            if dx * dx + dy * dy + dz * dz <= r_neigh2
+                n_neigh[i] += 1
+                n_neigh[j] += 1
+            end
+        end
+    end
+
+    sx = 0.0
+    sy = 0.0
+    sz = 0.0
+    n_bulk = 0
+    @inbounds for i in 1:n
+        n_neigh[i] < 6 && continue
+        sx += coords[1, i]
+        sy += coords[2, i]
+        sz += coords[3, i]
+        n_bulk += 1
+    end
+    if n_bulk == 0
+        @inbounds for i in 1:n
+            sx += coords[1, i]
+            sy += coords[2, i]
+            sz += coords[3, i]
+        end
+        n_bulk = n
+    end
+    inv_n = 1.0 / max(n_bulk, 1)
+    cx = sx * inv_n
+    cy = sy * inv_n
+    cz = sz * inv_n
+    isolate2 = flyaway_isolate_dist * flyaway_isolate_dist
+
+    n_fly = 0
+    @inbounds for i in 1:n
+        x = coords[1, i]
+        y = coords[2, i]
+        z = coords[3, i]
+        through_floor = z < z_lo
+        above_tools = z > z_hi
+        outside_r = (x * x + y * y) > r_cut2
+        dx = x - cx
+        dy = y - cy
+        dz = z - cz
+        isolated = n_neigh[i] < 3 && (dx * dx + dy * dy + dz * dz) > isolate2
+        if through_floor || outside_r || above_tools || isolated
+            mask[i] = true
+            n_fly += 1
+        end
+    end
+    charge_flyaway_count[] = n_fly
+    return n_fly
+end
+
+function apply_charge_flyaway_freeze!(dv_cyl, v_cyl, cyl_sys)
+    buf = charge_flyaway_buf[]
+    buf === nothing && return nothing
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        particle <= length(buf) && buf[particle] || continue
+        v_cyl[1, particle] = 0.0
+        v_cyl[2, particle] = 0.0
+        v_cyl[3, particle] = 0.0
+        dv_cyl[1, particle] = 0.0
+        dv_cyl[2, particle] = 0.0
+        dv_cyl[3, particle] = 0.0
+    end
+    return nothing
+end
+
 function charge_min_tool_gaps(cyl_sys, floor_sys, mold_sys)
     min_mold_gap = Inf
     min_floor_gap = Inf
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        charge_particle_is_flyaway(particle) && continue
         x_i = cyl_sys.current_coordinates[1, particle]
         z_i = cyl_sys.current_coordinates[3, particle]
         min_mold_gap = min(min_mold_gap,
@@ -3645,6 +5327,7 @@ end
 # Closed-die: after nominal creep, advance punch lift as soon as floor overlap is within
 # tolerance (or at settle deadline). Charge kinematics stay on — physical demold.
 function maybe_finish_closed_die_contact_settle!(t, cyl_sys, floor_sys, mold_sys)
+    retraction_cool_before_lift && !retraction_closed_die_cool_done[] && return false
     retraction_closed_die_contact_settle || return false
     retraction_started[] || return false
     retraction_contact_settle_done[] && return false
@@ -3692,6 +5375,7 @@ function maybe_finish_closed_die_contact_settle!(t, cyl_sys, floor_sys, mold_sys
 end
 
 function maybe_postpone_lift_for_floor_settle!(t, cyl_sys, floor_sys, mold_sys)
+    retraction_cool_before_lift && !retraction_closed_die_cool_done[] && return false
     retraction_creep_floor_settle_max_s <= 0.0 && return false
     retraction_started[] || return false
     retraction_lift_started_announced[] && return false
@@ -3784,6 +5468,22 @@ function maybe_update_kinematic_peel!(integrator, cyl_sys, floor_sys, mold_sys)
         retraction_peel_max_s - 1.0e-14
 
     if !mold_ok && !timed_out
+        return true
+    end
+
+    # F_th + cavity eject: punch-up is not separation. Ungating here left the
+    # charge nested on the floor (fth_aniso30: floor_gap≈−1.5 mm, span_z 11→20 mm).
+    # Stay frozen until the eject stroke has lifted the part out of the die.
+    if clip_fth_skip_post_peel_cte && retraction_eject_enable &&
+       !retraction_eject_complete[]
+        if !retraction_peel_hold_for_eject_announced[]
+            retraction_peel_hold_for_eject_announced[] = true
+            println(">>> Kinematic peel: punch clearance ",
+                    round(min_mold_gap * 1e3; digits=3),
+                    " mm, floor_gap=", round(min_floor_gap * 1e3; digits=4),
+                    " mm — charge stays FROZEN until eject (no in-cavity springback)")
+            flush(stdout)
+        end
         return true
     end
 
@@ -3905,7 +5605,9 @@ function maybe_update_kinematic_peel!(integrator, cyl_sys, floor_sys, mold_sys)
                     " mm vol_gap=", round(min_floor_vol * 1e3; digits=4),
                     " mm J_min=", round(jmin; digits=4),
                     " floor_shift=", round(retraction_floor_open_z_shift[] * 1e3; digits=4),
-                    " mm — enabling springback")
+                    retraction_eject_complete[] ?
+                        " mm — enabling springback on free part" :
+                        " mm — enabling springback")
         else
             println(">>> Kinematic peel timeout at t=", round(integrator.t; digits=6),
                     " s: min_mold_gap=", round(min_mold_gap * 1e3; digits=4),
@@ -3932,6 +5634,53 @@ function maybe_update_kinematic_peel!(integrator, cyl_sys, floor_sys, mold_sys)
         # #endregion
     end
     return false
+end
+
+# Restore the 150 °C thermal stress only after punch clearance. This is a
+# prescribed continuation parameter, not an equilibrium gate: each stage adds
+# the stress associated with QS_COOL_STEP_C until the full ΔT from T_stress_free
+# is active. Charge kinematics and the post-peel σ/contact ramp remain active.
+function maybe_update_post_peel_cte_ramp!(integrator, cyl_sys)
+    retraction_lift_first_after_frozen_cool || return false
+    retraction_peel_done[] || return false
+    if clip_fth_skip_post_peel_cte
+        retraction_qs_cte_scale[] = 0.0
+        return false
+    end
+    retraction_qs_cte_scale[] >= 1.0 - 1.0e-12 && return false
+
+    if !retraction_qs_cte_ramp
+        retraction_qs_cte_scale[] = 1.0
+        println(">>> Post-peel CTE enabled in one step at t=",
+                round(integrator.t; digits=6), " s")
+        flush(stdout)
+        return true
+    end
+
+    if !isfinite(retraction_post_peel_cte_next_t[])
+        retraction_post_peel_cte_next_t[] = integrator.t
+    end
+    integrator.t + 1.0e-12 >= retraction_post_peel_cte_next_t[] || return false
+
+    Tmean_C = mean(cyl_sys.temp) - 273.15
+    T_sf_C = T_stress_free - 273.15
+    dT_full = max(abs(Tmean_C - T_sf_C), retraction_qs_cool_step_C)
+    d_scale = min(1.0 - retraction_qs_cte_scale[],
+                  retraction_qs_cool_step_C / dT_full)
+    scale_from = retraction_qs_cte_scale[]
+    retraction_qs_cte_scale[] = scale_from + d_scale
+    retraction_qs_stage_index[] += 1
+    retraction_post_peel_cte_next_t[] =
+        integrator.t + retraction_post_peel_cte_interval_s
+
+    println(">>> Post-peel CTE stage ", retraction_qs_stage_index[],
+            ": cte_scale ", round(scale_from; sigdigits=4), " → ",
+            round(retraction_qs_cte_scale[]; sigdigits=4),
+            " (≈", retraction_qs_cool_step_C, " K of ",
+            round(dT_full; digits=1), " K); Tmean=",
+            round(Tmean_C; digits=2), " °C; punch clear; kin ON")
+    flush(stdout)
+    return true
 end
 
 function max_charge_kick_dv(dv_ode, cyl_sys, semi_local)
@@ -3971,15 +5720,24 @@ function build_retraction_diag_snapshot(integrator, cyl_sys, floor_sys, mold_sys
     span_x = maximum(xs) - minimum(xs)
     span_z = maximum(zs) - minimum(zs)
     J_min, J_max, J_min_particle = charge_jacobian_extremes(cyl_sys)
-    min_mold_gap, min_floor_gap = charge_min_tool_gaps(cyl_sys, floor_sys, mold_sys)
+    in_springback = retraction_post_cool_springback_active[] ||
+                    (mold_retraction_complete[] && (!retraction_eject_enable || retraction_eject_complete[]))
+    min_mold_gap, min_floor_gap = in_springback ? (NaN, NaN) : charge_min_tool_gaps(cyl_sys, floor_sys, mold_sys)
     max_speed = 0.0
     max_abs_vz = 0.0
+    sum_speed2 = 0.0
+    n_speed = 0
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
         vx = v_cyl[1, particle]
+        vy = v_cyl[2, particle]
         vz = v_cyl[3, particle]
-        max_speed = max(max_speed, hypot(vx, vz))
+        speed2 = vx * vx + vy * vy + vz * vz
+        max_speed = max(max_speed, sqrt(speed2))
         max_abs_vz = max(max_abs_vz, abs(vz))
+        sum_speed2 += speed2
+        n_speed += 1
     end
+    rms_speed = n_speed > 0 ? sqrt(sum_speed2 / n_speed) : 0.0
     t_now = integrator.t
     return (
         step = retraction_diag_step_count[],
@@ -3987,6 +5745,7 @@ function build_retraction_diag_snapshot(integrator, cyl_sys, floor_sys, mold_sys
         dt = integrator.dt,
         kick_max_dv = retraction_diag_kick_max_dv[],
         max_speed = max_speed,
+        rms_speed = rms_speed,
         max_abs_vz = max_abs_vz,
         span_x_mm = span_x * 1e3,
         span_z_mm = span_z * 1e3,
@@ -4075,10 +5834,36 @@ function retraction_early_abort_reason(snap, prev_snap)
 end
 
 function capture_retraction_reference_span!(cyl_sys)
-    xs = @view cyl_sys.current_coordinates[1, :]
-    zs = @view cyl_sys.current_coordinates[3, :]
-    retraction_reference_span_x[] = maximum(xs) - minimum(xs)
-    retraction_reference_span_z[] = maximum(zs) - minimum(zs)
+    n_fly = update_charge_flyaway_mask!(cyl_sys)
+    xmin = Inf
+    xmax = -Inf
+    zmin = Inf
+    zmax = -Inf
+    n_used = 0
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        charge_particle_is_flyaway(particle) && continue
+        x = cyl_sys.current_coordinates[1, particle]
+        z = cyl_sys.current_coordinates[3, particle]
+        xmin = min(xmin, x)
+        xmax = max(xmax, x)
+        zmin = min(zmin, z)
+        zmax = max(zmax, z)
+        n_used += 1
+    end
+    if n_used == 0
+        xs = @view cyl_sys.current_coordinates[1, :]
+        zs = @view cyl_sys.current_coordinates[3, :]
+        retraction_reference_span_x[] = maximum(xs) - minimum(xs)
+        retraction_reference_span_z[] = maximum(zs) - minimum(zs)
+    else
+        retraction_reference_span_x[] = xmax - xmin
+        retraction_reference_span_z[] = zmax - zmin
+    end
+    if ignore_charge_flyaways
+        println(">>> Ignoring ", n_fly, " / ", nparticles(cyl_sys),
+                " charge flyaways (frozen; skipped in contact, peel gaps, span, J-floor)")
+        flush(stdout)
+    end
     return nothing
 end
 
@@ -4133,19 +5918,75 @@ function repair_hold_end_fp_committed!(cyl_sys, Fp_buf)
     return n_repaired
 end
 
-function floor_hold_end_deformation_j!(cyl_sys, J_p_buf, J_floor)
+function clip_invert_correction_matrix(L)
+    L_inv = Matrix(1.0I, 3, 3)
+    Lx, Ly, Lz = L[1, 1], L[2, 2], L[3, 3]
+
+    is_thin_sheet_xy = (geometry_mode != :pseudo2d) &&
+                       (abs(Lz) < 0.2 * min(abs(Lx), abs(Ly)) ||
+                        (haskey(ENV, "TP_CLIP_PS_ANISOTROPIC") && env_int("TP_CLIP_PS_ANISOTROPIC", 0) != 0))
+
+    if is_thin_sheet_xy
+        # 3D thin sheet in x-y plane (thickness in z):
+        # Invert the well-conditioned 2x2 in-plane (x, y) block.
+        # Decouple z from in-plane to prevent boundary truncation cross-coupling (cond(L) ~ 1.0).
+        Lxy, Lyx = L[1, 2], L[2, 1]
+        detL_xy = Lx * Ly - Lxy * Lyx
+        detL_xy_reg = sign(detL_xy) * max(abs(detL_xy), 1e-6)
+        if abs(Lx) + abs(Ly) + abs(Lxy) + abs(Lyx) > 1e-9
+            L_inv[1, 1] = Ly / detL_xy_reg
+            L_inv[1, 2] = -Lxy / detL_xy_reg
+            L_inv[2, 1] = -Lyx / detL_xy_reg
+            L_inv[2, 2] = Lx / detL_xy_reg
+        end
+        L_inv[3, 3] = abs(Lz) > 1e-9 ? 1.0 / max(Lz, 1e-6) : 1.0
+        L_inv[1, 3] = 0.0
+        L_inv[3, 1] = 0.0
+        L_inv[2, 3] = 0.0
+        L_inv[3, 2] = 0.0
+        return L_inv
+    elseif geometry_mode == :pseudo2d || (abs(Ly) < 0.2 * min(abs(Lx), abs(Lz)))
+        # Pseudo-2D or thin-3D in x-z plane (out-of-plane is y):
+        # Invert the active 2x2 (x, z) block.
+        Lxz, Lzx = L[1, 3], L[3, 1]
+        detL_xz = Lx * Lz - Lxz * Lzx
+        detL_xz_reg = sign(detL_xz) * max(abs(detL_xz), 1e-6)
+        if abs(Lx) + abs(Lz) + abs(Lxz) + abs(Lzx) > 1e-9
+            L_inv[1, 1] = Lz / detL_xz_reg
+            L_inv[1, 3] = -Lxz / detL_xz_reg
+            L_inv[3, 1] = -Lzx / detL_xz_reg
+            L_inv[3, 3] = Lx / detL_xz_reg
+        end
+        L_inv[2, 2] = abs(Ly) > 1e-9 ? 1.0 / max(Ly, 1e-6) : 1.0
+        L_inv[1, 2] = 0.0
+        L_inv[2, 1] = 0.0
+        L_inv[2, 3] = 0.0
+        L_inv[3, 2] = 0.0
+        return L_inv
+    else
+        # Full 3D resolved / isotropic:
+        detL = det(L)
+        return abs(detL) < 1.0e-9 ? Matrix(1.0I, 3, 3) : Matrix(inv(L))
+    end
+end
+
+function floor_hold_end_deformation_j!(cyl_sys, J_p_buf, J_floor; update_jp::Bool=true)
     J_floor <= 0.0 && return 0
     I3 = StaticArrays.SMatrix{3, 3, Float64}(I)
     n_floored = 0
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        charge_particle_is_flyaway(particle) && continue
         F = TrixiParticles.deformation_gradient(cyl_sys, particle)
         det_F = det(F)
         isfinite(det_F) && det_F >= J_floor && continue
-        if !isfinite(det_F) || abs(det_F) < 1e-10
+        # Inverted or collapsed neighborhoods: iso-rescale of a negative det keeps
+        # det(F_new)<0. Reset to I (or scaled I) so J_min stays positive.
+        if !isfinite(det_F) || det_F <= 0.0 || abs(det_F) < 1e-10
+            s = cbrt(J_floor)
             for jj in 1:3, ii in 1:3
-                cyl_sys.deformation_grad[ii, jj, particle] = I3[ii, jj]
+                cyl_sys.deformation_grad[ii, jj, particle] = (ii == jj ? s : 0.0)
             end
-            use_volumetric_plasticity && (J_p_buf[particle] = 1.0)
+            (update_jp && use_volumetric_plasticity) && (J_p_buf[particle] = J_floor)
         else
             F_s = StaticArrays.SMatrix{3, 3, Float64}(F)
             F_iso = F_s / cbrt(det_F)
@@ -4153,11 +5994,50 @@ function floor_hold_end_deformation_j!(cyl_sys, J_p_buf, J_floor)
             for jj in 1:3, ii in 1:3
                 cyl_sys.deformation_grad[ii, jj, particle] = F_new[ii, jj]
             end
-            use_volumetric_plasticity && (J_p_buf[particle] = J_floor)
+            (update_jp && use_volumetric_plasticity) && (J_p_buf[particle] = J_floor)
         end
         n_floored += 1
     end
     return n_floored
+end
+
+const compress_J_floor_log_count = Ref(0)
+function apply_compress_j_floor_accepted!(cyl_sys, J_p_buf, t)
+    compress_J_floor <= 0.0 && return 0
+    # Compression stroke only (punch still closing). Hold/retract use hold-end / retract path.
+    t >= t_compress && return 0
+    n = floor_hold_end_deformation_j!(cyl_sys, J_p_buf, compress_J_floor; update_jp=false)
+    if n > 0
+        compress_J_floor_log_count[] += 1
+        if compress_J_floor_log_count[] <= 5 || compress_J_floor_log_count[] % 50 == 0
+            println(">>> Compress J floor: det(F)→≥", compress_J_floor,
+                    " on ", n, " particles at t=", round(t; digits=6),
+                    " s (event #", compress_J_floor_log_count[], ")")
+            flush(stdout)
+        end
+    end
+    return n
+end
+
+const retraction_J_floor_log_count = Ref(0)
+const retraction_last_J_floor_n = Ref(0)
+function apply_retraction_j_floor_accepted!(cyl_sys, J_p_buf, t)
+    if retraction_J_floor <= 0.0 || sim_phase != "retraction"
+        retraction_last_J_floor_n[] = 0
+        return 0
+    end
+    n = floor_hold_end_deformation_j!(cyl_sys, J_p_buf, retraction_J_floor)
+    retraction_last_J_floor_n[] = n
+    if n > 0
+        retraction_J_floor_log_count[] += 1
+        if retraction_J_floor_log_count[] <= 8 || retraction_J_floor_log_count[] % 40 == 0
+            println(">>> Retraction J floor: det(F)→≥", retraction_J_floor,
+                    " on ", n, " particles at t=", round(t; digits=6),
+                    " s (event #", retraction_J_floor_log_count[], ")")
+            flush(stdout)
+        end
+    end
+    return n
 end
 
 function prepare_charge_state_for_retraction!(cyl_sys, semi_local, v_ode, u_ode,
@@ -4165,10 +6045,39 @@ function prepare_charge_state_for_retraction!(cyl_sys, semi_local, v_ode, u_ode,
                                               dv_marker_buf; align_spencer::Bool=hold_end_spencer_align,
                                               reset_fp::Bool=hold_end_fp_reset)
     TrixiParticles.update_nhs!(semi_local, u_ode)
+    update_charge_flyaway_mask!(cyl_sys)
 
     v_cyl = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
     u_cyl = TrixiParticles.wrap_u(u_ode, cyl_sys, semi_local)
     freeze_charge_mechanical_state!(v_cyl, cyl_sys)
+
+    # Hold seating improvement: reduce excessive floor overlap on pocket corners.
+    floor_sys = length(semi_local.systems) >= floor_system_index ? clip_floor_system(semi_local) : nothing
+    if floor_sys !== nothing && env_int("TP_CLIP_IMPROVE_HOLD_SEATING", 1) != 0
+        max_overlap_mm = env_float("TP_CLIP_HOLD_SEATING_MAX_OVERLAP_MM", 0.25)
+        tol_gap = -max_overlap_mm * 1e-3
+        n_lifted = 0
+        max_dz = 0.0
+        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+            x_i = u_cyl[1, particle]
+            z_i = u_cyl[3, particle]
+            gap = tool_surface_gap(floor_sys, x_i, z_i, particle_spacing; side=:lower)
+            if gap < tol_gap
+                dz = tol_gap - gap
+                u_cyl[3, particle] += dz
+                cyl_sys.current_coordinates[3, particle] += dz
+                n_lifted += 1
+                max_dz = max(max_dz, dz)
+            end
+        end
+        if n_lifted > 0
+            TrixiParticles.update_nhs!(semi_local, u_ode)
+            println(">>> Improved hold seating on ", n_lifted, " pocket corner particles: max lift dz=",
+                    round(max_dz * 1e3; digits=3), " mm (floor overlap clamped to <= ",
+                    max_overlap_mm, " mm)")
+            flush(stdout)
+        end
+    end
 
     # Keep the hold-end F from compression/hold. Recalculating F from SPH neighborhoods on
     # frozen charge geometry can yield det(F) ≪ 1 and GPa-scale bulk stress at retraction.
@@ -4251,17 +6160,7 @@ function prepare_charge_state_for_retraction!(cyl_sys, semi_local, v_ode, u_ode,
         end
         for particle in TrixiParticles.eachparticle(cyl_sys)
             L = TrixiParticles.extract_smatrix(cyl_sys.correction_matrix, cyl_sys, particle)
-            Lx = L[1, 1]; Lxz = L[1, 3]
-            Lzx = L[3, 1]; Lz = L[3, 3]
-            detL2d = Lx * Lz - Lxz * Lzx
-            L_inv = Matrix(1.0I, 3, 3)
-            detL2d_reg = sign(detL2d) * max(abs(detL2d), 1e-6)
-            if abs(Lx) + abs(Lz) + abs(Lxz) + abs(Lzx) > 1e-9
-                L_inv[1, 1] = Lz / detL2d_reg
-                L_inv[1, 3] = -Lxz / detL2d_reg
-                L_inv[3, 1] = -Lzx / detL2d_reg
-                L_inv[3, 3] = Lx / detL2d_reg
-            end
+            L_inv = clip_invert_correction_matrix(L)
             for j in 1:3, i in 1:3
                 cyl_sys.correction_matrix[i, j, particle] = L_inv[i, j]
             end
@@ -4276,6 +6175,18 @@ function prepare_charge_state_for_retraction!(cyl_sys, semi_local, v_ode, u_ode,
 end
 
 function snapshot_charge_dv!(marker, dv_ode, cyl_sys, semi_local)
+    if separate_charge_plies
+        clip_foreach_charge_system(semi_local) do system, source
+            dv = TrixiParticles.wrap_v(dv_ode, system, semi_local)
+            @inbounds for particle in TrixiParticles.each_integrated_particle(system)
+                g = source[particle]
+                marker[1, g] = dv[1, particle]
+                marker[2, g] = dv[2, particle]
+                marker[3, g] = dv[3, particle]
+            end
+        end
+        return nothing
+    end
     dv = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
         marker[1, particle] = dv[1, particle]
@@ -4287,6 +6198,18 @@ end
 
 function blend_charge_dv_from_marker!(dv_ode, cyl_sys, semi_local, marker, scale)
     scale >= 1.0 - 1.0e-12 && return nothing
+    if separate_charge_plies
+        clip_foreach_charge_system(semi_local) do system, source
+            dv = TrixiParticles.wrap_v(dv_ode, system, semi_local)
+            @inbounds for particle in TrixiParticles.each_integrated_particle(system)
+                g = source[particle]
+                dv[1, particle] = marker[1, g] + scale * (dv[1, particle] - marker[1, g])
+                dv[2, particle] = marker[2, g] + scale * (dv[2, particle] - marker[2, g])
+                dv[3, particle] = marker[3, g] + scale * (dv[3, particle] - marker[3, g])
+            end
+        end
+        return nothing
+    end
     dv = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
         dv[1, particle] = marker[1, particle] +
@@ -4321,13 +6244,25 @@ function vtu_fiber_vf_quantity(sys, data, t)
            phase_vf_particle : fill(NaN, TrixiParticles.nparticles(sys))
 end
 
+# A11/A22/A33 from flow-orientation tensor (Song uses A11 for validation)
+function vtu_orientation_component(sys, data, t, i, j)
+    n = TrixiParticles.nparticles(sys)
+    A = orientation_tensor_state[]
+    size(A, 3) == n || return fill(NaN, n)
+    out = Vector{Float64}(undef, n)
+    @inbounds for p in 1:n
+        out[p] = A[i, j, p]
+    end
+    return out
+end
+vtu_a11_quantity(sys, data, t) = vtu_orientation_component(sys, data, t, 1, 1)
+vtu_a22_quantity(sys, data, t) = vtu_orientation_component(sys, data, t, 2, 2)
+vtu_a33_quantity(sys, data, t) = vtu_orientation_component(sys, data, t, 3, 3)
+
 function save_vtu_snapshot!(integrator; iter_override=nothing,
                             save_dt=nothing, time_origin=nothing)
-    dt_vtu = save_dt === nothing ?
-        active_vtu_save_dt(t=integrator.t, in_retraction=retraction_started[]) : save_dt
-    t0 = time_origin === nothing ? first(tspan) : time_origin
     iter = if iter_override === nothing
-        Int(div(integrator.t - t0, dt_vtu, RoundNearest))
+        TrixiParticles.take_vtu_save_iter!()
     else
         iter_override
     end
@@ -4339,9 +6274,214 @@ function save_vtu_snapshot!(integrator; iter_override=nothing,
     TrixiParticles.trixi2vtk(dvdu_ode, clip_integrator_vu_partition(integrator), integrator.p,
                              integrator.t;
                              iter=iter,
+                             output_directory=clip_out_dir,
                              prefix=vtu_output_prefix,
                              max_coordinates=Inf,
-                             fiber_vf=vtu_fiber_vf_quantity)
+                             fiber_vf=vtu_fiber_vf_quantity,
+                             a11=vtu_a11_quantity,
+                             a22=vtu_a22_quantity,
+                             a33=vtu_a33_quantity)
+    return nothing
+end
+
+function compute_retraction_eject_target_dz(cyl_sys, floor_sys, punch_sys)
+    zs = @view cyl_sys.current_coordinates[3, :]
+    z_charge_min = minimum(zs)
+    z_charge_max = maximum(zs)
+    z_charge_mean = 0.5 * (z_charge_min + z_charge_max)
+    span = max(z_charge_max - z_charge_min, 0.0)
+    # Die deck / land top (for norim STL this is the forming-face max).
+    z_deck = maximum(@view floor_sys.current_coordinates[3, :])
+    z_punch_min = minimum(@view punch_sys.current_coordinates[3, :])
+    clear = max(retraction_eject_clear_ps * particle_spacing, 0.0)
+    # Lift until the lowest charge particle is above the deck + clearance.
+    need_clear = max(0.0, (z_deck - z_charge_min) + clear)
+    # Also clear at least the nominal cavity/pocket depth when known.
+    need_cavity = max(0.0, cavity_depth + clear)
+    need_min = max(0.0, retraction_eject_min_dz_mm * 1e-3)
+    # Optional placement into the free mold↔punch gap.
+    # gap_frac=0 → mold-clear only (default). gap_frac=0.5 → old mid-gap aim.
+    gap_lo = z_deck + clear
+    gap_hi = z_punch_min - clear
+    need_gap = 0.0
+    if retraction_eject_gap_frac > 0.0 && gap_hi > gap_lo + span
+        target_center = gap_lo + retraction_eject_gap_frac * (gap_hi - gap_lo)
+        need_gap = max(0.0, target_center - z_charge_mean)
+        # Keep charge fully inside [gap_lo, gap_hi].
+        need_gap = max(need_gap, gap_lo - z_charge_min)
+        need_gap = min(need_gap, max(0.0, gap_hi - span - z_charge_min))
+    end
+    need = max(need_clear, need_cavity, need_min, need_gap)
+    if retraction_eject_max_dz_mm > 0.0
+        need = min(need, retraction_eject_max_dz_mm * 1e-3)
+    end
+    # Hard cap: do not drive the charge into / above the punch.
+    room = max(0.0, (z_punch_min - clear) - z_charge_max)
+    return min(need, room)
+end
+
+function apply_charge_eject_z!(integrator, z_abs)
+    prev = retraction_eject_z_applied[]
+    dz = z_abs - prev
+    abs(dz) <= 0.0 && return nothing
+    v_ode, u_ode = clip_integrator_vu(integrator)
+    cyl_sys = integrator.p.systems[1]
+    u_cyl = TrixiParticles.wrap_u(u_ode, cyl_sys, integrator.p)
+    v_cyl = TrixiParticles.wrap_v(v_ode, cyl_sys, integrator.p)
+    NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        u_cyl[3, particle] += dz
+        cyl_sys.current_coordinates[3, particle] += dz
+        v_cyl[1, particle] = 0.0
+        if NDIMS_CYL >= 2
+            v_cyl[2, particle] = 0.0
+        end
+        v_cyl[3, particle] = 0.0
+    end
+    retraction_eject_z_applied[] = z_abs
+    # Force NHS refresh on next RHS — charge left the cavity.
+    nhs_updated_at_t[] = -Inf
+    return nothing
+end
+
+function maybe_bang_room_temp_after_eject!(integrator)
+    retraction_bang_t_after_eject || return nothing
+    retraction_eject_complete[] || return nothing
+    retraction_post_eject_bang_done[] && return nothing
+    cyl_sys = integrator.p.systems[1]
+    v_ode, _ = clip_integrator_vu(integrator)
+    Tmean_C = mean(cyl_sys.temp) - 273.15
+    target_C = retraction_cool_until_temp_C
+    delta_C = target_C - Tmean_C
+    apply_charge_temperature_delta!(cyl_sys, integrator.p, v_ode, delta_C)
+    thermal_Fth_u_modified[] = true
+    retraction_post_eject_bang_done[] = true
+    retraction_post_eject_bang_t[] = integrator.t
+    println(">>> Post-eject bang T: Tmean ", round(Tmean_C; digits=2),
+            " → ", round(target_C; digits=2),
+            " °C (room-temp target); T frozen; kin ON for ",
+            retraction_post_eject_dwell_s, " s springback")
+    flush(stdout)
+    save_vtu_snapshot!(integrator)
+    return nothing
+end
+
+function start_retraction_eject!(integrator)
+    if !retraction_eject_announced[]
+        save_preeject_checkpoint!(integrator)
+    end
+    cyl_sys = integrator.p.systems[1]
+    floor_sys = clip_floor_system(integrator.p)
+    punch_sys = clip_mold_system(integrator.p)
+    retraction_eject_active[] = true
+    retraction_eject_complete[] = false
+    retraction_eject_start_t[] = integrator.t
+    retraction_eject_z_applied[] = 0.0
+    retraction_eject_target_dz[] = compute_retraction_eject_target_dz(cyl_sys, floor_sys, punch_sys)
+    if !retraction_eject_announced[]
+        z_deck = maximum(@view floor_sys.current_coordinates[3, :])
+        z_punch_min = minimum(@view punch_sys.current_coordinates[3, :])
+        println(">>> Starting workpiece eject / demold at t=",
+                round(integrator.t; digits=6),
+                " s: target_dz=",
+                round(retraction_eject_target_dz[] * 1e3; digits=3),
+                " mm over ", round(retraction_eject_s; digits=4),
+                " s (punch/mold OFF; floor ",
+                retraction_keep_floor_during_eject ? "ON during stroke" : "OFF",
+                retraction_freeze_mech_during_eject ? "; mech/F FROZEN during stroke" : "",
+                "; rigid +z into gap mold↔punch; deck=",
+                round(z_deck * 1e3; digits=2),
+                " mm, punch_min=",
+                round(z_punch_min * 1e3; digits=2), " mm)")
+        flush(stdout)
+        retraction_eject_announced[] = true
+    end
+    save_vtu_snapshot!(integrator)
+    return nothing
+end
+
+function maybe_update_retraction_eject!(integrator)
+    retraction_eject_enable || return false
+    retraction_eject_active[] || return false
+    retraction_eject_complete[] && return false
+    dur = max(retraction_eject_s, eps(Float64))
+    progress = clamp((integrator.t - retraction_eject_start_t[]) / dur, 0.0, 1.0)
+    # Smoothstep eject stroke.
+    s = progress * progress * (3.0 - 2.0 * progress)
+    apply_charge_eject_z!(integrator, s * retraction_eject_target_dz[])
+    if progress < 1.0 - 1.0e-12
+        return true
+    end
+    apply_charge_eject_z!(integrator, retraction_eject_target_dz[])
+    retraction_eject_active[] = false
+    retraction_eject_complete[] = true
+    save_vtu_snapshot!(integrator)
+    println(">>> Workpiece eject complete at t=", round(integrator.t; digits=6),
+            " s; lifted ",
+            round(retraction_eject_z_applied[] * 1e3; digits=3),
+            " mm out of mold; punch/mold OFF",
+            retraction_keep_floor_after_eject ? "; floor table ON" : "; floor OFF")
+    maybe_bang_room_temp_after_eject!(integrator)
+    if retraction_use_explicit
+        # Demold finished → allow larger free-cool / springback dt from here on.
+        enforce_explicit_retraction_dt!(integrator)
+        println(">>> Free cool after eject: dt→", retraction_explicit_dt_springback,
+                " s (demold stayed at ", retraction_explicit_dt, " s)")
+        if retraction_unfreeze_t_after_eject
+            println(">>> Free cool after eject: T UNFROZEN (demold used FREEZE_T=",
+                    retraction_explicit_freeze_t, " unchanged; ambient ON",
+                    retraction_skip_sph_conduction_after_eject ?
+                        "; SPH conduction OFF" : "; SPH conduction ON",
+                    retraction_thermal_shrinkage_only_after_eject ?
+                        "; plastic OFF; CTE shrinkage ON" :
+                        ("; plastic heat=" * (retraction_skip_plastic_heat_after_eject ? "OFF" : "ON")),
+                    ")")
+        end
+    end
+    if retraction_freeze_mech_after_eject
+        println(">>> Free cool: charge mechanics FROZEN after eject (thermal-only + ambient",
+                retraction_free_cool_exposure_floor > 0.0 ?
+                    "; exposure floor=" * string(retraction_free_cool_exposure_floor) : "",
+                "; post-cool springback=", retraction_post_cool_springback_s, " s)")
+    elseif retraction_thermal_shrinkage_only_after_eject
+        println(">>> Free cool: mechanics ON after eject (thermal shrinkage only; dt=",
+                retraction_explicit_dt_springback, " s)")
+    end
+    if retraction_keep_floor_after_eject || retraction_gravity_after_eject != 0.0 ||
+       retraction_rayleigh_after_eject > 0.0
+        println(">>> Free cool support: floor=",
+                retraction_keep_floor_after_eject ? "ON" : "OFF",
+                "  g=", retraction_gravity_after_eject,
+                " m/s²  extra Rayleigh γ=", retraction_rayleigh_after_eject, " 1/s")
+    end
+    flush(stdout)
+    # Arm free springback dwell clock from eject end.
+    mold_retraction_complete_time[] = integrator.t
+    cyl_sys = integrator.p.systems[1]
+    v_cyl_ref, _ = clip_integrator_vu(integrator)
+    v_cyl = TrixiParticles.wrap_v(v_cyl_ref, cyl_sys, integrator.p)
+    springback_equil_streak[] = 0
+    springback_equil_prev_snap[] = build_retraction_diag_snapshot(integrator, cyl_sys,
+        clip_floor_system(integrator.p), clip_mold_system(integrator.p), v_cyl)
+    return false
+end
+
+function apply_tool_temp_after_punch_lift!(integrator; when="after punch lift")
+    retraction_tool_temp_after_punch_lift_active || return nothing
+    retraction_tool_temp_after_punch_lift_done[] && return nothing
+    target_K = celsius_to_kelvin(retraction_tool_temp_after_punch_lift_C)
+    tool_names = String[]
+    for (idx, sys) in enumerate(integrator.p.systems[2:end])
+        sys.temp .= target_K
+        push!(tool_names, "systems[" * string(idx + 1) * "]")
+    end
+    retraction_tool_temp_after_punch_lift_done[] = true
+    println(">>> Tool temperature ", when, ": ",
+            join(tool_names, ", "), " → ",
+            round(retraction_tool_temp_after_punch_lift_C; digits=2),
+            " °C (closed-die / in-die cool sink)")
+    flush(stdout)
+    save_vtu_snapshot!(integrator)
     return nothing
 end
 
@@ -4349,7 +6489,24 @@ function complete_mold_retraction!(integrator)
     mold_retraction_complete[] = true
     mold_retraction_complete_time[] = integrator.t
     save_vtu_snapshot!(integrator)
-    if retraction_springback_dwell_s <= 0.0
+    if retraction_eject_enable
+        if retraction_eject_after_cool
+            apply_tool_temp_after_punch_lift!(integrator)
+            println(">>> Punch stroke complete at t=", round(integrator.t; digits=6),
+                    " s; punch UP — workpiece stays in die (floor ON, plastic OFF)")
+            println(">>> In-die cool: T UNFROZEN, convection ON, plastic OFF; eject when mean T ≤ ",
+                    retraction_cool_until_temp_C, " °C (dwell cap ",
+                    retraction_springback_dwell_s, " s)")
+            flush(stdout)
+            return nothing
+        end
+        println(">>> Punch stroke complete at t=", round(integrator.t; digits=6),
+                " s; beginning demold eject of workpiece from cavity")
+        flush(stdout)
+        return start_retraction_eject!(integrator)
+    end
+    apply_tool_temp_after_punch_lift!(integrator)
+    if retraction_springback_dwell_s <= 0.0 && !retraction_cool_until_active
         return complete_retraction_simulation!(integrator; reason="mold stroke complete (dwell=0)")
     end
     cyl_sys = integrator.p.systems[1]
@@ -4357,18 +6514,43 @@ function complete_mold_retraction!(integrator)
     v_cyl = TrixiParticles.wrap_v(v_cyl_ref, cyl_sys, integrator.p)
     springback_equil_streak[] = 0
     springback_equil_prev_snap[] = build_retraction_diag_snapshot(integrator, cyl_sys,
-        integrator.p.systems[2], integrator.p.systems[3], v_cyl)
-    println(">>> Mold stroke complete at t=", round(integrator.t; digits=6),
-            " s; springback equilibration dwell (max ",
-            round(retraction_springback_dwell_s; digits=4), " s)")
+        clip_floor_system(integrator.p), clip_mold_system(integrator.p), v_cyl)
+    if retraction_cool_until_active
+        println(">>> Punch stroke complete at t=", round(integrator.t; digits=6),
+                " s; punch UP — no eject; workpiece stays in die (floor ON, plastic OFF)")
+        println(">>> In-die cool (no eject): T UNFROZEN, convection ON; stop when mean T ≤ ",
+                retraction_cool_until_temp_C, " °C (dwell cap ",
+                retraction_springback_dwell_s, " s)")
+    else
+        println(">>> Mold stroke complete at t=", round(integrator.t; digits=6),
+                " s; springback equilibration dwell (max ",
+                round(retraction_springback_dwell_s; digits=4), " s)")
+    end
     flush(stdout)
     return nothing
 end
 
 function complete_retraction_simulation!(integrator; reason="springback equilibrated")
     retraction_complete[] = true
+    apply_retraction_j_floor_accepted!(integrator.p.systems[1],
+                                       J_p_particle_buf, integrator.t)
     save_vtu_snapshot!(integrator)
+    save_cool_end_checkpoint!(integrator)
     println(">>> Retraction finished (", reason, ") at t=", round(integrator.t; digits=6), " s")
+    cyl = integrator.p.systems[1]
+    xs = @view cyl.current_coordinates[1, :]
+    ys = @view cyl.current_coordinates[2, :]
+    zs = @view cyl.current_coordinates[3, :]
+    span_x_mm = (maximum(xs) - minimum(xs)) * 1e3
+    span_y_mm = (maximum(ys) - minimum(ys)) * 1e3
+    span_z_mm = (maximum(zs) - minimum(zs)) * 1e3
+    ref_x = retraction_reference_span_x[] * 1e3
+    ref_z = retraction_reference_span_z[] * 1e3
+    println(">>> Free-part warpage vs hold span: span_x=", round(span_x_mm; digits=3),
+            " mm (Δ", round(span_x_mm - ref_x; digits=3), " mm)  span_y=",
+            round(span_y_mm; digits=3), " mm  span_z=", round(span_z_mm; digits=3),
+            " mm (Δ", round(span_z_mm - ref_z; digits=3),
+            " mm)  Song Table 4 target 1.61 mm")
     flush(stdout)
     terminate!(integrator)
     return nothing
@@ -4392,6 +6574,171 @@ function freeze_charge_mechanical_state!(v_cyl, cyl_sys)
         v_cyl[3, particle] = 0.0
     end
     return nothing
+end
+
+# Transversely isotropic F_th = λ⊥ I + (λ∥ − λ⊥) n⊗n, n = F n_ref / |F n_ref|
+# (Fig. 4 principal fibre). Positions: same F_th about (cx, cy, z_floor).
+@inline function clip_aniso_thermal_stretch(cyl_sys, particle, F, dT)
+    α_par = alpha1_particle[particle]
+    α_perp = alpha2_particle[particle]
+    lam_par = clamp(exp(α_par * dT), 0.90, 1.02)
+    lam_perp = clamp(exp(α_perp * dT), 0.90, 1.02)
+    n_ref = StaticArrays.SVector{3, Float64}(fiber_direction[1, particle],
+                                             fiber_direction[2, particle],
+                                             fiber_direction[3, particle])
+    F_s = StaticArrays.SMatrix{3, 3, Float64}(F)
+    Fn = F_s * n_ref
+    nrm2 = Fn[1] * Fn[1] + Fn[2] * Fn[2] + Fn[3] * Fn[3]
+    n = if nrm2 > 1.0e-24
+        Fn / sqrt(nrm2)
+    else
+        nrm_ref = sqrt(n_ref[1] * n_ref[1] + n_ref[2] * n_ref[2] + n_ref[3] * n_ref[3])
+        nrm_ref > 1.0e-14 ? n_ref / nrm_ref :
+            StaticArrays.SVector{3, Float64}(1.0, 0.0, 0.0)
+    end
+    dlam = lam_par - lam_perp
+    Fth = lam_perp * one(StaticArrays.SMatrix{3, 3, Float64}) + dlam * (n * n')
+    return Fth, lam_par, lam_perp
+end
+
+# Die-aware F_th (not r9 centroid homothety): shrink onto the floor in z and
+# about the charge xy centroid, and scale F so det(F) tracks J_th. Kin stays frozen.
+function apply_frozen_thermal_contraction!(cyl_sys, u_ode, semi_local, t;
+                                          v_ode=nothing, force::Bool=false)
+    clip_fth_die_aware || return false
+    if !force
+        frozen_thermal_contraction_active(t) || return false
+    else
+        hold_kinematics_frozen(t) || return false
+    end
+    n = 0
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        n += 1
+    end
+    n == 0 && return false
+    if !thermal_Fth_initialized[]
+        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+            thermal_Fth_T_prev[particle] = cyl_sys.temp[particle]
+        end
+        thermal_Fth_initialized[] = true
+        return false
+    end
+
+    u_cyl = TrixiParticles.wrap_u(u_ode, cyl_sys, semi_local)
+    nd = TrixiParticles.ndims(cyl_sys)
+    v_cyl = v_ode === nothing ? nothing : TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
+    floor_sys = length(semi_local.systems) >= floor_system_index ? clip_floor_system(semi_local) : nothing
+    z_floor = if floor_sys !== nothing
+        maximum(@view floor_sys.current_coordinates[3, :])
+    else
+        zmin = Inf
+        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+            zmin = min(zmin, u_cyl[3, particle])
+        end
+        zmin
+    end
+
+    cx = 0.0
+    cy = 0.0
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        cx += u_cyl[1, particle]
+        nd >= 2 && (cy += u_cyl[2, particle])
+    end
+    invn = 1.0 / n
+    cx *= invn
+    cy *= invn
+
+    sum_lam_par = 0.0
+    sum_lam_perp = 0.0
+    sum_dT = 0.0
+    n_move = 0
+    xmin0 = Inf
+    xmax0 = -Inf
+    ymin0 = Inf
+    ymax0 = -Inf
+    zmin0 = Inf
+    zmax0 = -Inf
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        xmin0 = min(xmin0, u_cyl[1, particle])
+        xmax0 = max(xmax0, u_cyl[1, particle])
+        if nd >= 2
+            ymin0 = min(ymin0, u_cyl[2, particle])
+            ymax0 = max(ymax0, u_cyl[2, particle])
+        end
+        zmin0 = min(zmin0, u_cyl[3, particle])
+        zmax0 = max(zmax0, u_cyl[3, particle])
+        T_now = cyl_sys.temp[particle]
+        dT = T_now - thermal_Fth_T_prev[particle]
+        thermal_Fth_T_prev[particle] = T_now
+        dT >= -1.0e-8 && continue
+        F = TrixiParticles.deformation_gradient(cyl_sys, particle)
+        Fth, lam_par, lam_perp = clip_aniso_thermal_stretch(cyl_sys, particle, F, dT)
+        F_new = Fth * StaticArrays.SMatrix{3, 3, Float64}(F)
+        for jj in 1:3, ii in 1:3
+            cyl_sys.deformation_grad[ii, jj, particle] = F_new[ii, jj]
+        end
+        J_scale = lam_par * lam_perp * lam_perp
+        J_ref_particle_buf[particle] = max(J_ref_particle_buf[particle] * J_scale, 1e-6)
+        use_volumetric_plasticity &&
+            (J_p_particle_buf[particle] = max(J_p_particle_buf[particle] * J_scale, 1e-6))
+        dx = u_cyl[1, particle] - cx
+        dy = nd >= 2 ? (u_cyl[2, particle] - cy) : 0.0
+        dz = u_cyl[3, particle] - z_floor
+        x_new = cx + Fth[1, 1] * dx + Fth[1, 2] * dy + Fth[1, 3] * dz
+        y_new = cy + Fth[2, 1] * dx + Fth[2, 2] * dy + Fth[2, 3] * dz
+        z_new = z_floor + Fth[3, 1] * dx + Fth[3, 2] * dy + Fth[3, 3] * dz
+        u_cyl[1, particle] = x_new
+        cyl_sys.current_coordinates[1, particle] = x_new
+        if nd >= 2
+            u_cyl[2, particle] = y_new
+            cyl_sys.current_coordinates[2, particle] = y_new
+        end
+        u_cyl[3, particle] = z_new
+        cyl_sys.current_coordinates[3, particle] = z_new
+        if v_cyl !== nothing
+            v_cyl[1, particle] = 0.0
+            nd >= 2 && (v_cyl[2, particle] = 0.0)
+            v_cyl[3, particle] = 0.0
+        end
+        sum_lam_par += lam_par
+        sum_lam_perp += lam_perp
+        sum_dT += dT
+        n_move += 1
+    end
+    n_move == 0 && return false
+
+    thermal_Fth_skip_Jp[] = true
+    TrixiParticles.update_nhs!(semi_local, u_ode)
+    xmin1 = Inf
+    xmax1 = -Inf
+    ymin1 = Inf
+    ymax1 = -Inf
+    zmin1 = Inf
+    zmax1 = -Inf
+    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        xmin1 = min(xmin1, u_cyl[1, particle])
+        xmax1 = max(xmax1, u_cyl[1, particle])
+        if nd >= 2
+            ymin1 = min(ymin1, u_cyl[2, particle])
+            ymax1 = max(ymax1, u_cyl[2, particle])
+        end
+        zmin1 = min(zmin1, u_cyl[3, particle])
+        zmax1 = max(zmax1, u_cyl[3, particle])
+    end
+    println(">>> Die-aware F_th (aniso Fig.4): n=", n_move, " mean λ∥=",
+            round(sum_lam_par / n_move; sigdigits=6), " mean λ⊥=",
+            round(sum_lam_perp / n_move; sigdigits=6), " mean dT=",
+            round(sum_dT / n_move; digits=2), " K; span_x ",
+            round((xmax0 - xmin0) * 1e3; digits=3), " → ",
+            round((xmax1 - xmin1) * 1e3; digits=3), " mm; span_y ",
+            nd >= 2 ? round((ymax0 - ymin0) * 1e3; digits=3) : 0.0, " → ",
+            nd >= 2 ? round((ymax1 - ymin1) * 1e3; digits=3) : 0.0,
+            " mm; span_z ",
+            round((zmax0 - zmin0) * 1e3; digits=3), " → ",
+            round((zmax1 - zmin1) * 1e3; digits=3), " mm; z_floor=",
+            round(z_floor * 1e3; digits=3), " mm; kin frozen")
+    flush(stdout)
+    return true
 end
 
 @inline function clip_thermal_freeze_restore!(dv_cyl, cyl_sys, t)
@@ -4675,21 +7022,36 @@ function agent_debug_peel_rhs!(dv_ode, cyl_sys, semi_local, floor_sys, mold_sys,
 end
 # #endregion
 
+@inline function compute_ambient_cooling_rate(T_i, exposure, rho_i, cp_eff, dx, t)
+    T_i <= temp_ambient && return 0.0
+    flux_conv = h_ambient * (T_i - temp_ambient)
+    flux_rad = stefan_boltzmann * emissivity_charge * (T_i^4 - temp_ambient^4)
+    raw_dT_dt = exposure * (flux_conv + flux_rad) / (rho_i * cp_eff * dx)
+    # Unconditional exponential decay safeguard against explicit Euler overshoot:
+    dt_step = retraction_use_explicit ? retraction_explicit_target_dt(t) : 0.005
+    decay_rate = raw_dT_dt / max(T_i - temp_ambient, 1e-6)
+    decay_factor = (1.0 - exp(-decay_rate * dt_step)) / max(dt_step, 1e-6)
+    return (T_i - temp_ambient) * decay_factor
+end
+
 function apply_charge_hold_thermal_kick!(dv_ode, v_ode, semi_local, t)
     cyl_sys = semi_local.systems[1]
-    floor_sys = semi_local.systems[2]
-    mold_sys = semi_local.systems[3]
+    floor_sys = clip_floor_system(semi_local)
+    mold_sys = clip_mold_system(semi_local)
     v_cyl = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
     NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
 
     freeze_charge_mechanical_state!(v_cyl, cyl_sys)
 
+    T_floor = ambient_heat_loss_active_now() ? max(temp_ambient, temp_min_clip) : temp_min_clip
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
         t_trial = v_cyl[NDIMS_CYL + 1, particle]
         if !isfinite(t_trial)
             t_trial = cyl_sys.temp[particle]
         end
-        cyl_sys.temp[particle] = clamp(t_trial, temp_min_clip, temp_max_clip)
+        t_clamped = clamp(t_trial, T_floor, temp_max_clip)
+        cyl_sys.temp[particle] = t_clamped
+        v_cyl[NDIMS_CYL + 1, particle] = t_clamped
     end
 
     dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
@@ -4702,10 +7064,16 @@ function apply_charge_hold_thermal_kick!(dv_ode, v_ode, semi_local, t)
         return dv_ode
     end
 
-    contact_heat_flux = compute_contact_heat_flux!(contact_heat_flux_buf, cyl_sys,
-                                                   floor_sys, mold_sys, particle_spacing)
-    TrixiParticles.thermal_rhs_sph3d!(cyl_sys, dv_cyl, v_cyl, 0.0,
-                                      particle_spacing, bound_coordinate_thermal, semi_local)
+    contact_heat_flux = if retraction_post_eject_phase()
+        fill!(contact_heat_flux_buf, 0.0)
+    else
+        compute_contact_heat_flux!(contact_heat_flux_buf, cyl_sys,
+                                   floor_sys, mold_sys, particle_spacing, t)
+    end
+    if !retraction_skip_sph_conduction_now()
+        TrixiParticles.thermal_rhs_sph3d!(cyl_sys, dv_cyl, v_cyl, 0.0,
+                                          particle_spacing, bound_coordinate_thermal, semi_local)
+    end
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
         T_i = cyl_sys.temp[particle]
         cp_eff = effective_heat_capacity_particle(T_i, particle)
@@ -4718,17 +7086,15 @@ function apply_charge_hold_thermal_kick!(dv_ode, v_ode, semi_local, t)
             dv_cyl[NDIMS_CYL + 1, particle] += L_i * dα_dt / cp_i
         end
         if contact_heat_flux[particle] != 0.0
-            rho_i = cyl_sys.material_density[particle]
+            rho_i = physical_thermal_density(cyl_sys, particle)
             dv_cyl[NDIMS_CYL + 1, particle] -= contact_heat_flux[particle] /
                                               (rho_i * cp_eff * particle_spacing)
         end
-        if use_ambient_heat_loss
-            exposure = charge_boundary_exposure[particle]
+        if ambient_heat_loss_active_now()
+            exposure = free_cool_ambient_exposure(particle)
             if exposure > 0.0
-                rho_i = cyl_sys.material_density[particle]
-                flux_conv = h_ambient * (T_i - temp_ambient)
-                flux_rad = stefan_boltzmann * emissivity_charge * (T_i^4 - temp_ambient^4)
-                dT_dt_loss = exposure * (flux_conv + flux_rad) / (rho_i * cp_eff * particle_spacing)
+                rho_i = physical_thermal_density(cyl_sys, particle)
+                dT_dt_loss = compute_ambient_cooling_rate(T_i, exposure, rho_i, cp_eff, particle_spacing, t)
                 dv_cyl[NDIMS_CYL + 1, particle] -= dT_dt_loss
             end
         end
@@ -4741,8 +7107,21 @@ function apply_charge_hold_thermal_kick!(dv_ode, v_ode, semi_local, t)
     return dv_ode
 end
 
+@inline function free_cool_ambient_exposure(particle)
+    exp0 = charge_boundary_exposure[particle]
+    if retraction_free_cool_thermal_only_now() && retraction_free_cool_exposure_floor > 0.0
+        return max(exp0, retraction_free_cool_exposure_floor)
+    end
+    return exp0
+end
+
 function apply_charge_hold_rhs!(dv_ode, v_ode, u_ode, semi_local, t)
     apply_charge_hold_thermal_kick!(dv_ode, v_ode, semi_local, t)
+    # Post-eject free cool: skip frozen stress every step (thermal-only + large dt).
+    # Thermal residual is applied when post-cool springback re-enables mechanics.
+    if retraction_free_cool_thermal_only_now()
+        return dv_ode
+    end
     # Frozen-geometry stress evaluation (no contact / momentum): keeps σ and Fp commit
     # consistent through solidification without reintroducing stiff tool interaction.
     enable_elastic_stress || return dv_ode
@@ -4753,8 +7132,9 @@ function apply_charge_hold_rhs!(dv_ode, v_ode, u_ode, semi_local, t)
         TrixiParticles.update_nhs!(semi_local, u_ode)
         nhs_updated_at_t[] = t
     end
-    TrixiParticles.TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM[] = objectid(cyl_sys)
-    apply_charge_plane_strain_F_fix!(cyl_sys)
+    TrixiParticles.TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM[] =
+        clip_deformation_only_selector(semi_local)
+    apply_all_charge_plane_strain_F_fixes!(semi_local)
     update_implicit_stress_cache!(semi_local, v_ode, t)
     dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
@@ -4774,6 +7154,13 @@ function apply_charge_plane_strain_F_fix!(cyl_sys)
         deform[2, 3, particle] = 0.0
         deform[1, 2, particle] = 0.0
         deform[3, 2, particle] = 0.0
+    end
+    return nothing
+end
+
+function apply_all_charge_plane_strain_F_fixes!(semi_local)
+    clip_foreach_charge_system(semi_local) do system, _
+        apply_charge_plane_strain_F_fix!(system)
     end
     return nothing
 end
@@ -4801,9 +7188,8 @@ function apply_charge_interact_skip_penalty_only!(dv_ode, v_ode, semi_local)
     dv = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
     v_cyl = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
 
-    _cached = TrixiParticles.STRESS_TENSOR_CACHE[]
-    _use_cache = _cached !== nothing && _cached[1] == objectid(cyl_sys)
-    _cache_stress = _use_cache ? _cached[2] : nothing
+    _cache_stress = TrixiParticles.stress_tensor_cache_for(cyl_sys)
+    _use_cache = _cache_stress !== nothing
     _tensile_cache = TrixiParticles.tensile_stress_cache_tlsph(cyl_sys.tensile_stress, cyl_sys,
                                                                _use_cache, _cache_stress)
 
@@ -4857,43 +7243,57 @@ function apply_charge_interact_skip_penalty_only!(dv_ode, v_ode, semi_local)
     return dv_ode
 end
 
+function clip_update_punch_contact_force_z!(dv_ode, mold_sys, semi_local)
+    # Sum contact force on the punch from ∂v/∂t * m (action–reaction after interact!).
+    # Must run whenever press tonnage limiting is enabled — including the fully-active
+    # system_interaction! fast path (previously skipped → force stuck at 0).
+    tp_clip_max_press_force_n > 0.0 || return nothing
+    dv_mold = TrixiParticles.wrap_v(dv_ode, mold_sys, semi_local)
+    Fz = 0.0
+    @inbounds for i in 1:size(dv_mold, 2)
+        Fz += dv_mold[3, i] * mold_sys.mass[i]
+    end
+    punch_contact_force_z[] = Fz
+    return nothing
+end
+
 function system_interaction_ramped!(dv_ode, v_ode, u_ode, semi_local,
                                     floor_activation, mold_activation)
     if floor_activation >= 1.0 - 1.0e-8 && mold_activation >= 1.0 - 1.0e-8
         TrixiParticles.system_interaction!(dv_ode, v_ode, u_ode, semi_local)
+        mold_sys = clip_mold_system(semi_local)
+        clip_update_punch_contact_force_z!(dv_ode, mold_sys, semi_local)
         return dv_ode
     end
 
     apply_charge_interact_skip_penalty_only!(dv_ode, v_ode, semi_local)
 
-    cyl_sys = semi_local.systems[1]
-    floor_sys = semi_local.systems[2]
-    mold_sys = semi_local.systems[3]
+    floor_sys = clip_floor_system(semi_local)
+    mold_sys = clip_mold_system(semi_local)
+    bh_sys = blankholder_neighbor_system[]
 
     if floor_activation > 1.0e-10
-        for (system, neighbor) in ((cyl_sys, floor_sys), (floor_sys, cyl_sys))
-            TrixiParticles.interact!(dv_ode, v_ode, u_ode, system, neighbor, semi_local)
+        clip_foreach_charge_system(semi_local) do cyl_sys, _
+            for (system, neighbor) in ((cyl_sys, floor_sys), (floor_sys, cyl_sys))
+                TrixiParticles.interact!(dv_ode, v_ode, u_ode, system, neighbor, semi_local)
+            end
         end
     end
 
     if mold_activation > 1.0e-10
-        for (system, neighbor) in ((cyl_sys, mold_sys), (mold_sys, cyl_sys))
-            TrixiParticles.interact!(dv_ode, v_ode, u_ode, system, neighbor, semi_local)
-        end
-        if tp_clip_max_press_force_n > 0.0
-            dv_mold = TrixiParticles.wrap_v(dv_ode, mold_sys, semi_local)
-            Fz = 0.0
-            @inbounds for i in 1:size(dv_mold, 2)
-                Fz += dv_mold[3, i] * mold_sys.mass[i]
+        clip_foreach_charge_system(semi_local) do cyl_sys, _
+            for (system, neighbor) in ((cyl_sys, mold_sys), (mold_sys, cyl_sys))
+                TrixiParticles.interact!(dv_ode, v_ode, u_ode, system, neighbor, semi_local)
             end
-            punch_contact_force_z[] = Fz
         end
+        clip_update_punch_contact_force_z!(dv_ode, mold_sys, semi_local)
     end
 
-    bh_sys = blankholder_neighbor_system[]
     if bh_sys !== nothing
-        for (system, neighbor) in ((cyl_sys, bh_sys), (bh_sys, cyl_sys))
-            TrixiParticles.interact!(dv_ode, v_ode, u_ode, system, neighbor, semi_local)
+        clip_foreach_charge_system(semi_local) do cyl_sys, _
+            for (system, neighbor) in ((cyl_sys, bh_sys), (bh_sys, cyl_sys))
+                TrixiParticles.interact!(dv_ode, v_ode, u_ode, system, neighbor, semi_local)
+            end
         end
     end
 
@@ -4917,7 +7317,7 @@ else
                 else
                     z_shift_motion_end
                 end
-                z_shift = clamp(z_shift, z_shift_motion_end, 0.0)
+                z_shift = clamp(z_shift, z_shift_motion_end, retraction_punch_extra_lift)
             end
             x + StaticArrays.SVector(0.0, 0.0, z_shift)
         end,
@@ -4944,10 +7344,11 @@ println("  - Composite feedstock: carbon fibres in thermoplastic matrix (CF–PP
 # ==========================================================================================
 # STEP 5: Build the TLSPH systems
 # ==========================================================================================
-material_polymer = (density=density_cylinder, E=E_composite_eff, nu=0.3, beta=0.000,
+(@isdefined(matrix_nu)) || (matrix_nu = 0.3)
+material_polymer = (density=density_cylinder, E=E_composite_eff, nu=matrix_nu, beta=0.000,
                     temp=thermal_softening_reference_temp,
                     temp_ref=thermal_softening_reference_temp,
-                    cp=mean(cp_particle), k=mean(k_particle),
+                    cp=mean(cp_particle), k=mean(k_particle) * mass_scaling,
                     temp_liq=mean(temp_liq_particle),
                     h=mean(h_contact_particle),
                     hardening=mean(hardening_base_particle),
@@ -4962,8 +7363,9 @@ const local_regime_threshold = 0.5 * material_polymer.tmelt
 # Δt ~ 1e-7 s under contact because the penalty residual becomes extremely stiff.
 E_boundary = 0.01 * material_polymer.E
 
-# Molten compression: Reimann k_n = (E_scale * E)/ps with E_scale ≈ K_melt/E (~1 MPa per 1% ps overlap).
-const compression_contact_e_scale_default = matrix_K_melt / material_polymer.E
+# Molten compression: Reimann k_n = (E_scale * E)/ps.
+# Default E_scale=0.1 (L-die nocap_v4); override with TP_CLIP_COMPRESSION_CONTACT_E_SCALE.
+const compression_contact_e_scale_default = 0.1
 compression_contact_e_scale[] = env_float("TP_CLIP_COMPRESSION_CONTACT_E_SCALE",
                                         compression_contact_e_scale_default)
 contact_penalty_alpha[] = env_float("TP_CLIP_CONTACT_PENALTY_ALPHA", 0.25)
@@ -4988,8 +7390,9 @@ else
 end
 println("  - compression Reimann contact E scale = ",
         round(compression_contact_e_scale[], digits=4),
-        " (default K_melt/E = ",
+        " (driver default = ",
         round(compression_contact_e_scale_default, digits=4), ")")
+println("  - molten wall drag factor = ", molten_wall_drag_factor)
 println("  - contact penalty: α=", contact_penalty_alpha[],
         " ps deadband, overlap sat=", contact_overlap_sat_frac[], " ps")
 println("  - contact dashpot ζ=", contact_dashpot_zeta[],
@@ -5021,6 +7424,14 @@ if sim_phase == "retraction" &&
             " 1/s, viscoplastic a_y=", retraction_viscoplastic_accel_yield,
             " m/s² (gap<", retraction_viscoplastic_gap_ps, "·ps)")
 end
+sim_phase == "retraction" && retraction_eject_enable &&
+    println("  - eject after cool=", retraction_eject_after_cool,
+            "  during eject: floor=",
+            retraction_keep_floor_during_eject ? "ON" : "OFF",
+            "  after eject: floor=",
+            retraction_keep_floor_after_eject ? "ON" : "OFF",
+            "  g=", retraction_gravity_after_eject,
+            " m/s²  extra Rayleigh γ=", retraction_rayleigh_after_eject, " 1/s")
 _clip_max_liquid = env_float("TP_CLIP_MAX_LIQUID_ACCEL", 2.5e5)
 max_liquid_accel = max(_clip_max_liquid, contact_accel_cap_molten[])
 println("  - max liquid mechanics |a| = ", max_liquid_accel,
@@ -5050,7 +7461,7 @@ _clip_n_tool_particles > 2000 &&
     println("  - NHS max_points_per_cell = ",
             clip_nhs_max_points_per_cell(_clip_n_tool_particles),
             " (tool particles = ", _clip_n_tool_particles, ")")
-nhs_template = clip_precomputed_nhs_template(;
+nhs_template = clip_charge_nhs_template(;
     max_neighbors=use_stl_geometry ? max(300, env_int("TP_CLIP_NHS_MAX_NEIGHBORS", 400)) : 200,
     n_tool=_clip_n_tool_particles)
 
@@ -5094,28 +7505,134 @@ mold_system = TotalLagrangianSPHSystem(mold_particles,
                                        acceleration=(0.0, 0.0, 0.0),
                                        self_interaction_nhs=nothing)
 
-cylinder_system = TotalLagrangianSPHSystem(polymer,
-                                           smoothing_kernel,
-                                           smoothing_length,
-                                           material_polymer.E,
-                                           material_polymer.nu,
-                                           material_polymer.beta,
-                                           material_polymer.temp,
-                                           material_polymer.temp_ref,
-                                           material_polymer.cp,
-                                           material_polymer.k,
-                                           material_polymer.temp_liq,
-                                           material_polymer.h,
-                                           material_polymer.hardening,
-                                           material_polymer.tmelt,
-                                           material_polymer.yield_stress;
-                                           acceleration=(0.0, 0.0, 0.0),
-                                           penalty_force=PenaltyForceGanzenmueller(
-                                               alpha=env_float("TP_CLIP_PENALTY_ALPHA", 0.05)),
-                                           viscosity=ArtificialViscosityMonaghan(alpha=0.5,
-                                                                                   beta=4.0),
-                                           tensile_stress=clip_tensile_stress,
-                                           self_interaction_nhs=nhs_template)
+function build_charge_tlsph_system(initial_condition; self_interaction_nhs=nhs_template)
+    return TotalLagrangianSPHSystem(initial_condition,
+                                    smoothing_kernel,
+                                    smoothing_length,
+                                    material_polymer.E,
+                                    material_polymer.nu,
+                                    material_polymer.beta,
+                                    material_polymer.temp,
+                                    material_polymer.temp_ref,
+                                    material_polymer.cp,
+                                    material_polymer.k,
+                                    material_polymer.temp_liq,
+                                    material_polymer.h,
+                                    material_polymer.hardening,
+                                    material_polymer.tmelt,
+                                    material_polymer.yield_stress;
+                                    acceleration=(0.0, 0.0, 0.0),
+                                    penalty_force=let a = env_float("TP_CLIP_PENALTY_ALPHA", 0.05)
+                                        a > 0.0 ? PenaltyForceGanzenmueller(alpha=a) : nothing
+                                    end,
+                                    viscosity=ArtificialViscosityMonaghan(alpha=0.5,
+                                                                            beta=4.0),
+                                    tensile_stress=clip_tensile_stress,
+                                    self_interaction_nhs=self_interaction_nhs)
+end
+
+charge_systems = if separate_charge_plies
+    map(charge_initial_conditions) do ply
+        ply_nhs = clip_charge_nhs_template(;
+            max_neighbors=use_stl_geometry ?
+                          max(300, env_int("TP_CLIP_NHS_MAX_NEIGHBORS", 400)) : 200,
+            n_tool=_clip_n_tool_particles)
+        build_charge_tlsph_system(ply; self_interaction_nhs=ply_nhs)
+    end
+else
+    [build_charge_tlsph_system(polymer)]
+end
+cylinder_system = first(charge_systems) # Legacy alias; never denotes all plies.
+n_charge_systems = length(charge_systems)
+println("  - Updated Lagrangian re-referencing: ", clip_updated_lagrange ? "ON (interval=$(clip_updated_lagrange_interval) s)" : "OFF")
+charge_system_indices = 1:n_charge_systems
+floor_system_index = n_charge_systems + 1
+mold_system_index = n_charge_systems + 2
+blankholder_system_index = blankholder_system === nothing ? nothing : n_charge_systems + 3
+
+@inline function clip_charge_systems(semi_local)
+    return ntuple(i -> semi_local.systems[charge_system_indices[i]],
+                  length(charge_system_indices))
+end
+@inline clip_floor_system(semi_local) = semi_local.systems[floor_system_index]
+@inline clip_mold_system(semi_local) = semi_local.systems[mold_system_index]
+@inline clip_is_charge_system_index(index::Integer) = index in charge_system_indices
+
+function clip_register_charge_source_maps!(semi_local)
+    systems = collect(clip_charge_systems(semi_local))
+    source_map = clip_build_charge_source_map(systems, charge_ply_source_indices,
+                                              n_cylinder_particles)
+    contact_charge_source_indices[] = source_map
+    return source_map
+end
+
+function clip_foreach_charge_system(f, semi_local)
+    source_map = contact_charge_source_indices[]
+    source_map === nothing &&
+        error("charge source maps have not been registered")
+    for system in clip_charge_systems(semi_local)
+        indices = get(source_map, objectid(system), nothing)
+        indices === nothing &&
+            error("encountered an unregistered charge system")
+        f(system, indices)
+    end
+    return nothing
+end
+
+@inline function clip_deformation_only_selector(semi_local)
+    separate_charge_plies ||
+        return objectid(first(clip_charge_systems(semi_local)))
+    return Set(objectid(system) for system in clip_charge_systems(semi_local))
+end
+
+@inline function clip_charge_packed_index(source, local_particle::Integer)
+    return source[local_particle]
+end
+
+function clip_pack_charge_deformation_grad(semi_local)
+    packed = zeros(Float64, 3, 3, n_cylinder_particles)
+    clip_foreach_charge_system(semi_local) do system, source
+        clip_charge_particle_scatter!(packed, source, system.deformation_grad)
+    end
+    return packed
+end
+
+function clip_pack_charge_temp(semi_local)
+    packed = zeros(Float64, n_cylinder_particles)
+    clip_foreach_charge_system(semi_local) do system, source
+        clip_charge_particle_scatter!(packed, source, system.temp)
+    end
+    return packed
+end
+
+function clip_unpack_charge_deformation_grad!(semi_local, packed)
+    clip_foreach_charge_system(semi_local) do system, source
+        system.deformation_grad .= clip_charge_particle_view(packed, source)
+    end
+    return nothing
+end
+
+function clip_unpack_charge_temp!(semi_local, packed)
+    clip_foreach_charge_system(semi_local) do system, source
+        system.temp .= clip_charge_particle_view(packed, source)
+    end
+    return nothing
+end
+
+function clip_preheat_charge_systems!(semi_local, charge_temp, tool_temp;
+                                      punch_temp=tool_temp, die_temp=tool_temp,
+                                      blankholder_temp=tool_temp)
+    # floor = lower die (female); mold = upper punch (male). Optional split temps
+    # match Haanappel ECCM14 / thesis Ch.2 (preheated steel male + cold female).
+    clip_foreach_charge_system(semi_local) do system, _
+        system.temp .= charge_temp
+    end
+    clip_floor_system(semi_local).temp .= die_temp
+    clip_mold_system(semi_local).temp .= punch_temp
+    bh = blankholder_system
+    bh !== nothing && (bh.temp .= blankholder_temp)
+    return nothing
+end
 
 # ==========================================================================================
 # STEP 6: Semidiscretization and solve
@@ -5123,22 +7640,116 @@ cylinder_system = TotalLagrangianSPHSystem(polymer,
 mold_nhs_coords = blankholder_system === nothing ?
     mold_particles.coordinates :
     hcat(mold_particles.coordinates, bh_particles.coordinates)
-semi = if blankholder_system === nothing
+semi = if !separate_charge_plies && blankholder_system === nothing
     Semidiscretization(cylinder_system, floor_system, mold_system;
-                       neighborhood_search=clip_build_neighborhood_search(
-                           smoothing_length;
-                           polymer_coords=polymer.coordinates,
-                           floor_coords=floor_particles.coordinates,
-                           mold_coords=mold_nhs_coords),
-                       parallelization_backend=clip_parallelization_backend)
-else
+        neighborhood_search=clip_build_neighborhood_search(
+            smoothing_length;
+            polymer_coords=polymer.coordinates,
+            floor_coords=floor_particles.coordinates,
+            mold_coords=mold_nhs_coords),
+        parallelization_backend=clip_parallelization_backend)
+elseif !separate_charge_plies
     Semidiscretization(cylinder_system, floor_system, mold_system, blankholder_system;
-                       neighborhood_search=clip_build_neighborhood_search(
-                           smoothing_length;
-                           polymer_coords=polymer.coordinates,
-                           floor_coords=floor_particles.coordinates,
-                           mold_coords=mold_nhs_coords),
-                       parallelization_backend=clip_parallelization_backend)
+        neighborhood_search=clip_build_neighborhood_search(
+            smoothing_length;
+            polymer_coords=polymer.coordinates,
+            floor_coords=floor_particles.coordinates,
+            mold_coords=mold_nhs_coords),
+        parallelization_backend=clip_parallelization_backend)
+else
+    ordered_systems = blankholder_system === nothing ?
+                      (charge_systems..., floor_system, mold_system) :
+                      (charge_systems..., floor_system, mold_system, blankholder_system)
+    Semidiscretization(ordered_systems...;
+        neighborhood_search=clip_build_neighborhood_search(
+            smoothing_length;
+            polymer_coords=polymer.coordinates,
+            floor_coords=floor_particles.coordinates,
+            mold_coords=mold_nhs_coords),
+        parallelization_backend=clip_parallelization_backend)
+end
+
+charge_source_map = clip_register_charge_source_maps!(semi)
+if blankholder_system !== nothing
+    # NHS lookup is by === on semi.systems. Re-bind after Semidiscretization
+    # so gripper contact does not throw "system is not in the semidiscretization".
+    bh_idx = findfirst(s -> s === blankholder_system, semi.systems)
+    blankholder_neighbor_system[] = bh_idx === nothing ? semi.systems[end] :
+        semi.systems[bh_idx]
+end
+contact_ply_interface_rest_separation[] =
+    env_float("TP_CLIP_PLY_INTERFACE_REST_SEPARATION_MM",
+              particle_spacing_z * 1e3) * 1e-3
+# Ellipsoidal tool–charge rest (default):
+#   rest_xy = Δxy so the punch cannot slip between charge points
+#   rest_z  = sheet + ½ tool Δz on thin packs (n_z ≤ 8), else ½(Δz_c+Δz_t) (bulk ≈ sphere)
+# Ply–ply rest stays spherical Δz.
+# Overrides: TP_CLIP_TOOL_CHARGE_REST_XY_MM / _Z_MM.
+# Legacy TP_CLIP_TOOL_CHARGE_REST_SEPARATION_MM without XY/Z is xy only, not isotropic.
+_tool_ps_z_contact = if haskey(ENV, "TP_CLIP_TOOL_PS_Z_MM")
+    env_float("TP_CLIP_TOOL_PS_Z_MM", tool_particle_spacing * 1e3) * 1e-3
+else
+    Float64(tool_particle_spacing)
+end
+_n_z_layers = max(1, round(Int, charge_thickness_discrete /
+                               max(particle_spacing_z, eps(Float64))))
+_rest_xy_default_mm = particle_spacing * 1e3
+_rest_z_default_mm = if _n_z_layers <= 8
+    (charge_thickness_discrete + 0.5 * _tool_ps_z_contact) * 1e3
+else
+    0.5 * (particle_spacing_z + _tool_ps_z_contact) * 1e3
+end
+_legacy_tool_rest_mm = haskey(ENV, "TP_CLIP_TOOL_CHARGE_REST_SEPARATION_MM") &&
+                       !haskey(ENV, "TP_CLIP_TOOL_CHARGE_REST_XY_MM") ?
+    env_float("TP_CLIP_TOOL_CHARGE_REST_SEPARATION_MM", _rest_xy_default_mm) :
+    _rest_xy_default_mm
+contact_tool_charge_rest_xy[] =
+    env_float("TP_CLIP_TOOL_CHARGE_REST_XY_MM", _legacy_tool_rest_mm) * 1e-3
+contact_tool_charge_rest_z[] =
+    env_float("TP_CLIP_TOOL_CHARGE_REST_Z_MM", _rest_z_default_mm) * 1e-3
+contact_tool_charge_rest_separation[] = contact_tool_charge_rest_xy[]
+_legacy_grip_rest_mm = haskey(ENV, "TP_CLIP_GRIPPER_REST_SEPARATION_MM") &&
+                       !haskey(ENV, "TP_CLIP_GRIPPER_REST_XY_MM") ?
+    env_float("TP_CLIP_GRIPPER_REST_SEPARATION_MM",
+              contact_tool_charge_rest_xy[] * 1e3) :
+    contact_tool_charge_rest_xy[] * 1e3
+contact_gripper_rest_xy[] =
+    env_float("TP_CLIP_GRIPPER_REST_XY_MM", _legacy_grip_rest_mm) * 1e-3
+contact_gripper_rest_z[] =
+    env_float("TP_CLIP_GRIPPER_REST_Z_MM",
+              contact_tool_charge_rest_z[] * 1e3) * 1e-3
+contact_gripper_rest_separation[] = contact_gripper_rest_xy[]
+contact_search_radius_h_mult[] = env_float("TP_CLIP_CONTACT_RADIUS", 0.0)
+_rest_kind = _n_z_layers <= 8 ? "organosheet (n_z≤8)" : "bulk (n_z>8)"
+println(">>> Tool–charge contact rest ellipsoid: xy = ",
+        round(contact_tool_charge_rest_xy[] * 1e3; digits=3),
+        " mm, z = ",
+        round(contact_tool_charge_rest_z[] * 1e3; digits=3),
+        " mm (", _rest_kind, ", n_z=", _n_z_layers, "; punch/die)")
+println(">>> Gripper rest ellipsoid: xy = ",
+        round(contact_gripper_rest_xy[] * 1e3; digits=3),
+        " mm, z = ",
+        round(contact_gripper_rest_z[] * 1e3; digits=3),
+        " mm")
+if contact_search_radius_h_mult[] > 0.0
+    println(">>> Contact search radius = ", contact_search_radius_h_mult[],
+            " h  (Jacobian radius = ", clip_jac_radius_mult, " h)")
+end
+flush(stdout)
+if separate_charge_plies &&
+   contact_ply_interface_rest_separation[] > 1.5 * particle_spacing
+    error("TP_CLIP_PLY_INTERFACE_REST_SEPARATION_MM=" *
+          "$(contact_ply_interface_rest_separation[] * 1e3) exceeds the " *
+          "cross-system Reimann search radius $(1.5 * particle_spacing * 1e3) mm; " *
+          "increase the physics particle spacing/search radius or use a compatible " *
+          "through-thickness packing")
+end
+
+if separate_charge_plies
+    println(">>> Separate-ply hold: ", n_charge_systems, " charge TLSPH systems; ",
+            "floor index=", floor_system_index, " punch index=", mold_system_index,
+            " (retraction/full still unsupported)")
+    flush(stdout)
 end
 
 function initialize_charge_boundary_exposure!(exposure_vec, semi_local)
@@ -5179,19 +7790,37 @@ end
 initialize_charge_boundary_exposure!(charge_boundary_exposure, semi)
 
 # Preheat temperatures are specified in °C and stored as K for thermal laws.
+# TP_CLIP_TOOL_TEMP remains the common default. Optional split:
+#   TP_CLIP_PUNCH_TEMP → upper punch / male (mold_system)
+#   TP_CLIP_DIE_TEMP   → lower die / female (floor_system)
+#   TP_CLIP_BLANKHOLDER_TEMP → grippers (default = punch temp)
 preheating_target_temp = celsius_to_kelvin(env_float("TP_CLIP_CHARGE_TEMP", 453.0))
-tool_preheat_temp = celsius_to_kelvin(env_float("TP_CLIP_TOOL_TEMP", 320.0))
+_tool_temp_C = env_float("TP_CLIP_TOOL_TEMP", 320.0)
+tool_preheat_temp = celsius_to_kelvin(_tool_temp_C)
+_punch_temp_C = haskey(ENV, "TP_CLIP_PUNCH_TEMP") ?
+    env_float("TP_CLIP_PUNCH_TEMP", _tool_temp_C) : _tool_temp_C
+_die_temp_C = haskey(ENV, "TP_CLIP_DIE_TEMP") ?
+    env_float("TP_CLIP_DIE_TEMP", _tool_temp_C) : _tool_temp_C
+_bh_temp_C = haskey(ENV, "TP_CLIP_BLANKHOLDER_TEMP") ?
+    env_float("TP_CLIP_BLANKHOLDER_TEMP", _punch_temp_C) : _punch_temp_C
+punch_preheat_temp = celsius_to_kelvin(_punch_temp_C)
+die_preheat_temp = celsius_to_kelvin(_die_temp_C)
+blankholder_preheat_temp = celsius_to_kelvin(_bh_temp_C)
 
 println("\n=== PREHEATING PHASE ===")
-semi.systems[1].temp .= preheating_target_temp
-for sys in semi.systems[2:end]
-    sys.temp .= tool_preheat_temp
-end
+clip_preheat_charge_systems!(semi, preheating_target_temp, tool_preheat_temp;
+                             punch_temp=punch_preheat_temp,
+                             die_temp=die_preheat_temp,
+                             blankholder_temp=blankholder_preheat_temp)
 println("✓ Cylinder preheated: T = ", fmt_temp(preheating_target_temp))
-println("✓ Floor preheated:    T = ", fmt_temp(tool_preheat_temp))
-println("✓ Mold  preheated:    T = ", fmt_temp(tool_preheat_temp))
+println("✓ Floor (die/female) preheated:  T = ", fmt_temp(die_preheat_temp))
+println("✓ Mold  (punch/male) preheated:  T = ", fmt_temp(punch_preheat_temp))
+if _punch_temp_C != _die_temp_C
+    println("  - split tool temps ON (TP_CLIP_PUNCH_TEMP=", _punch_temp_C,
+            " °C, TP_CLIP_DIE_TEMP=", _die_temp_C, " °C)")
+end
 blankholder_system !== nothing &&
-    println("✓ Blankholder preheated: T = ", fmt_temp(tool_preheat_temp),
+    println("✓ Blankholder preheated: T = ", fmt_temp(blankholder_preheat_temp),
             " (kinematically fixed)")
 println("=== PREHEATING COMPLETE ===\n")
 
@@ -5209,14 +7838,16 @@ if sim_phase == "retraction"
     validate_checkpoint_meta!(hold_checkpoint_restore, meta_now;
                               motion_from_checkpoint=retraction_motion_from_checkpoint)
     t_ret0 = hold_checkpoint_restore["t"]
-    # Include optional floor-settle + contact-settle σ ramp past nominal creep.
-    t_ret1 = t_ret0 + retraction_pre_lift_creep_s + retraction_creep_floor_settle_max_s +
+    # Include optional pre-lift settle + floor-settle + contact-settle σ ramp past nominal creep.
+    t_ret1 = t_ret0 + retraction_pre_lift_creep_s + retraction_pre_lift_settle_s +
+        retraction_creep_floor_settle_max_s +
         retraction_contact_settle_sigma_ramp_s +
         max(retraction_duration_max,
             retraction_post_lift_kin_freeze_s,
             retraction_kinematic_peel ? retraction_peel_max_s : 0.0) +
         (retraction_kinematic_peel ? retraction_peel_sigma_ramp_s : 0.0) +
         (retraction_peel_floor_open ? retraction_peel_floor_open_s : 0.0) +
+        (retraction_eject_enable ? retraction_eject_s : 0.0) +
         retraction_springback_dwell_s
     if retraction_probe_s > 0.0
         t_ret1 = min(t_ret1, t_ret0 + retraction_probe_s)
@@ -5234,6 +7865,12 @@ if sim_phase == "retraction"
     flush(stdout)
 elseif sim_phase == "hold"
     tspan = (0.0, t_total)
+    hold_probe_s = env_float("TP_CLIP_HOLD_PROBE_S", 0.0)
+    if hold_probe_s > 0.0
+        tspan = (0.0, min(t_total, hold_probe_s))
+        println(">>> Hold PROBE: tspan capped to ", hold_probe_s,
+                " s for solver validation/benchmark")
+    end
     println(">>> Hold-only run: will save checkpoint and stop before retraction")
     flush(stdout)
 else
@@ -5252,17 +7889,48 @@ if sim_phase in ("full", "hold") && env_int("TP_CLIP_RESTORE_CHECKPOINT", 0) != 
                                z_shift_down_end=z_shift_down_end,
                                mold_velocity_state=mold_velocity_state,
                                compression_thickness_ratio=compression_thickness_ratio)
-    validate_checkpoint_meta!(hold_checkpoint_restore, meta_now)
+    validate_checkpoint_meta!(hold_checkpoint_restore, meta_now; motion_from_checkpoint=(env_int("TP_CLIP_PROFILE_FROM_CHECKPOINT", 1) != 0))
     t_ck = hold_checkpoint_restore["t"]
     tspan = (t_ck, t_total)
+    # Skip leftover punch travel and enter closed-die hold at the restored time.
+    # Compute freeze_z on the original downstroke timeline before shortening t_down_end.
+    if env_int("TP_CLIP_ENTER_HOLD_NOW", 0) != 0
+        freeze_z = mold_z_shift_at_time(t_ck)
+        t_compress = t_ck
+        t_down_end = t_ck
+        z_shift_down_end = freeze_z
+        z_shift_motion_end = freeze_z
+        retraction_duration_max = (abs(z_shift_down_end) + retraction_punch_extra_lift) /
+                                  abs(mold_velocity_state) +
+                                  0.5 * env_float("TP_CLIP_RETRACTION_RAMP_S",
+                                                  env_float("TP_CLIP_RETRACTION_KINEMATICS_RELEASE_S", 0.05))
+        t_total = t_compress + solidification_hold_budget + post_solidification_dwell +
+              hold_tlsph_tail_s + retraction_duration_max +
+              (retraction_eject_enable ? retraction_eject_s : 0.0) +
+              retraction_springback_dwell_s
+        tspan = (t_ck, t_total)
+        println(">>> ENTER HOLD NOW: punch frozen at t=", round(t_ck; digits=6),
+                " s, z_shift=", round(freeze_z * 1e3; digits=3),
+                " mm (remaining downstroke skipped; kinematics frozen)")
+        flush(stdout)
+    end
     println(">>> RESTORE from checkpoint: t0=", round(t_ck; digits=6),
             " s, tspan=", tspan)
     flush(stdout)
 end
 
 # VTU save schedule (compress/hold/full). Retraction-only uses fixed dt instead.
-const compress_hold_vtu_save_times = sim_phase == "retraction" ?
-    Float64[] : build_compress_hold_vtu_save_times(t_total)
+const compress_hold_vtu_save_times = if sim_phase == "retraction"
+    Float64[]
+else
+    times = filter(t -> t <= last(tspan) + 1.0e-12,
+                   build_compress_hold_vtu_save_times(t_total))
+    if last(tspan) < t_total - 1.0e-12
+        push!(times, last(tspan))
+        sort!(unique!(times))
+    end
+    times
+end
 # Overwrite the hold checkpoint .dat on the same cadence as VTU output (t=0 + each save time).
 const periodic_checkpoint_with_vtu = save_checkpoint_at_hold &&
     env_int("TP_CLIP_CHECKPOINT_SAVE_WITH_VTU", 1) != 0
@@ -5277,14 +7945,12 @@ if periodic_checkpoint_with_vtu && sim_phase != "retraction"
 end
 
 # ==========================================================================================
-# PSEUDO-2D TLSPH FIX: Compute the 2x2 Gradient Correction Matrix
-# The default 3D correction_matrix_inversion_step! sees det(L) = 0 because all particles
-# are coplanar in y, so it falls back to the identity matrix L_inv = I. This completely
-# disables kernel correction, ruining TLSPH stability.
-# We manually re-compute the x-z components of L, invert the 2x2 block, and set y=1.
+# KERNEL CORRECTION MATRIX
+# Coplanar pseudo-2D particles require inversion of only the active x-z block. Resolved
+# full-3D particles must retain all matrix components and use the full 3x3 inverse.
 # Must run on CPU before semidiscretize (GPU transfer happens in semidiscretize).
 # ==========================================================================================
-println(">>> Applying pseudo-2D kernel correction matrix fix...")
+println(">>> Applying geometry-adapted kernel correction matrix...")
 TrixiParticles.foreach_system(semi) do system
     TrixiParticles.set_zero!(system.correction_matrix)
     initial_coords = TrixiParticles.initial_coordinates(system)
@@ -5302,34 +7968,20 @@ TrixiParticles.foreach_system(semi) do system
     end
     for particle in TrixiParticles.eachparticle(system)
         L = TrixiParticles.extract_smatrix(system.correction_matrix, system, particle)
-        Lx = L[1, 1]; Lxz = L[1, 3]
-        Lzx = L[3, 1]; Lz = L[3, 3]
-        detL2d = Lx * Lz - Lxz * Lzx
-        L_inv = Matrix(1.0I, 3, 3)
-
-        # Regularize the determinant to avoid catastrophic jumps when detL2d < 1e-9
-        # that drop kernel correction entirely and result in massive unphysical forces.
-        detL2d_reg = sign(detL2d) * max(abs(detL2d), 1e-6)
-        # Fall back to identity ONLY if the whole matrix is nearly zero to prevent NaNs
-        if abs(Lx) + abs(Lz) + abs(Lxz) + abs(Lzx) > 1e-9
-            L_inv[1, 1] = Lz / detL2d_reg
-            L_inv[1, 3] = -Lxz / detL2d_reg
-            L_inv[3, 1] = -Lzx / detL2d_reg
-            L_inv[3, 3] = Lx / detL2d_reg
-        end
+        L_inv = clip_invert_correction_matrix(L)
         for j in 1:3, i in 1:3
             system.correction_matrix[i, j, particle] = L_inv[i, j]
         end
     end
 end
-println(">>> Pseudo-2D kernel correction applied.")
+println(">>> Geometry-adapted kernel correction applied.")
 # ==========================================================================================
 
 ode_base = clip_gpu_allowscalar(() -> semidiscretize(semi, tspan))
 semi = ode_base.p
 if clip_use_gpu
     clip_gpu_allowscalar() do
-        clip_apply_mold_kinematics_cpu!(semi.systems[3], tspan[1])
+        clip_apply_mold_kinematics_cpu!(clip_mold_system(semi), tspan[1])
     end
 end
 
@@ -5380,6 +8032,7 @@ J_ref_particle_buf = clip_use_gpu ? CUDA.ones(Float64, n_cylinder_particles) :
 # Volumetric plastic Jacobian J_p (Strategy E). Stress-free bulk: J_e_vol = det(F)/J_p = 1.
 J_p_particle_buf = clip_use_gpu ? CUDA.ones(Float64, n_cylinder_particles) :
                                   ones(n_cylinder_particles)
+thermal_Fth_T_prev = clip_particle_buffer(Float64, n_cylinder_particles)
 # Nakamura crystallinity state: α_c ∈ [0, 1].  0 = fully liquid, 1 = fully crystallized.
 # Initialised to 0 because the charge starts fully molten at ~430 K > T_melt.
 crystallinity_particle_buf = clip_particle_buffer(Float64, n_cylinder_particles)
@@ -5392,6 +8045,9 @@ contact_liquid_fraction_buf[] = liquid_fraction_particle_buf
 clip_host_assign!(vis_particle_buf, viscosity_base_particle)
 orientation_tensor_state = Ref(zeros(3, 3, n_cylinder_particles))
 solidification_hold_announced = Ref(false)
+# When restoring a solidified hold checkpoint with TP_CLIP_HOLD_UNTIL_TEMP_C, keep the
+# die closed and continue thermal cool until mean charge T reaches the target.
+hold_cool_continue_announced = Ref(false)
 solidification_complete = Ref(false)
 
 # Solidification-capture: track which particles were liquid on the previous RHS call.
@@ -5411,9 +8067,22 @@ const clip_integrator_dt = Ref(dt_cap)
     return nothing
 end
 
+function clip_reduced_trbdf2_refresh_fsalfirst!(integrator)
+    clip_reduced_trbdf2_active() || return nothing
+    fs = integrator.fsalfirst
+    clip_reduced_trbdf2_fsalfirst[] = fs
+    abs(integrator.t - clip_reduced_prev_t[]) <= 1.0e-14 * max(1.0, abs(integrator.t)) ||
+        return nothing
+    integrator.f(fs, integrator.u, integrator.p, integrator.t)
+    return nothing
+end
+
 function clip_sync_trial_dt_from_integrator!(integrator)
     clip_integrator_dt[] = integrator.dt
     trial_dt_state[] = integrator.dt
+    if clip_reduced_trbdf2_active()
+        clip_reduced_trbdf2_refresh_fsalfirst!(integrator)
+    end
     return nothing
 end
 
@@ -5469,7 +8138,7 @@ const formulation_profile_enabled = env_int("TP_CLIP_FORMULATION_PROFILE", 0) !=
 const formulation_profile_interval = max(1, env_int("TP_CLIP_FORMULATION_PROFILE_INTERVAL", 1000))
 const formulation_profile_time_dt = env_float("TP_CLIP_FORMULATION_PROFILE_TIME_DT", 0.0)
 const formulation_profile_path = get(ENV, "TP_CLIP_FORMULATION_PROFILE_LOG",
-                                     joinpath("out", "formulation_profile.log"))
+                                     joinpath(clip_out_dir, "formulation_profile.log"))
 const formulation_profile_step_count = Ref(0)
 const rhs_eval_count = Ref(0)
 const rhs_heartbeat_interval = max(0, env_int("TP_CLIP_RHS_HEARTBEAT", 0))
@@ -5736,9 +8405,9 @@ function apply_retraction_explicit_kick_soft_limit!(dv_cyl, cyl_sys, t)
     cap = retraction_explicit_kick_cap(t)
     !isfinite(cap) && return nothing
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-        dv_cyl[1, particle] = hard_limit(dv_cyl[1, particle], cap)
-        dv_cyl[2, particle] = hard_limit(dv_cyl[2, particle], cap)
-        dv_cyl[3, particle] = hard_limit(dv_cyl[3, particle], cap)
+        dv_cyl[1, particle] = soft_limit(dv_cyl[1, particle], cap)
+        dv_cyl[2, particle] = soft_limit(dv_cyl[2, particle], cap)
+        dv_cyl[3, particle] = soft_limit(dv_cyl[3, particle], cap)
     end
     return nothing
 end
@@ -5748,9 +8417,9 @@ function apply_retraction_deep_contact_velocity_hard_clamp!(v_cyl, cyl_sys)
     !isfinite(retraction_deep_contact_speed_cap) && return nothing
     vmax = retraction_deep_contact_speed_cap
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-        v_cyl[1, particle] = hard_limit(v_cyl[1, particle], vmax)
-        v_cyl[2, particle] = hard_limit(v_cyl[2, particle], vmax)
-        v_cyl[3, particle] = hard_limit(v_cyl[3, particle], vmax)
+        v_cyl[1, particle] = soft_limit(v_cyl[1, particle], vmax)
+        v_cyl[2, particle] = soft_limit(v_cyl[2, particle], vmax)
+        v_cyl[3, particle] = soft_limit(v_cyl[3, particle], vmax)
     end
     return nothing
 end
@@ -5779,15 +8448,17 @@ end
 # Prefer these over hard |a|/|v| clamps: dissipate / regularize via force laws.
 function apply_retraction_visco_rayleigh_damping!(dv_cyl, v_cyl, cyl_sys,
                                                   floor_sys, mold_sys, t)
-    sim_phase == "retraction" || return nothing
-    retraction_started[] || return nothing
-    γ0 = retraction_rayleigh_damp
-    γc = retraction_rayleigh_damp_contact
+    in_retract = sim_phase == "retraction" && retraction_started[]
+    in_hold_tail = hold_tlsph_tail_active(t)
+    (in_retract || in_hold_tail) || return nothing
+    γ0 = in_hold_tail ? max(retraction_rayleigh_damp, 200.0) : retraction_rayleigh_damp
+    γc = in_hold_tail ? max(retraction_rayleigh_damp_contact, 2.0e3) : retraction_rayleigh_damp_contact
     γ_base = velocity_damping_base
     γ_near = velocity_damping_contact
     a_y = retraction_viscoplastic_accel_yield
-    use_rayleigh = (γ0 > 0.0) || (γc > 0.0) || (γ_base > 0.0) || (γ_near > 0.0)
-    use_vp = a_y > 0.0 && isfinite(a_y)
+    use_rayleigh = (γ0 > 0.0) || (γc > 0.0) || (γ_base > 0.0) || (γ_near > 0.0) ||
+        (retraction_rayleigh_after_eject > 0.0)
+    use_vp = in_retract && a_y > 0.0 && isfinite(a_y)
     use_rayleigh || use_vp || return nothing
 
     contact_damp_dist = 0.8 * smoothing_length
@@ -5805,6 +8476,9 @@ function apply_retraction_visco_rayleigh_damping!(dv_cyl, v_cyl, cyl_sys,
 
         if use_rayleigh
             γ = γ0 + γ_base
+            if retraction_post_eject_phase()
+                γ += retraction_rayleigh_after_eject
+            end
             if near_f || near_m
                 act_f = near_f ?
                     (1.0 - clamp(gap_f / max(contact_damp_dist, eps(Float64)), 0.0, 1.0)) : 0.0
@@ -5988,6 +8662,7 @@ end
 function charge_min_floor_top_gap(cyl_sys, floor_sys)
     min_gap = Inf
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+        charge_particle_is_flyaway(particle) && continue
         x_i = cyl_sys.current_coordinates[1, particle]
         z_i = cyl_sys.current_coordinates[3, particle]
         min_gap = min(min_gap,
@@ -6024,24 +8699,41 @@ end
     return center_gap - particle_spacing
 end
 
+const thermal_gap_floor_cache = Float64[]
+const thermal_gap_mold_cache = Float64[]
+const thermal_gap_cache_valid = Ref(false)
+
 @inline function tool_thermal_gap(system_tool, x_target, z_target, particle_spacing)
     best_distance2 = Inf
-
+    x_band = 5.0 * particle_spacing
+    z_band = 5.0 * particle_spacing
     @inbounds for p in 1:nparticles(system_tool)
         dx = x_target - system_tool.current_coordinates[1, p]
+        abs(dx) > x_band && continue
         dz = z_target - system_tool.current_coordinates[3, p]
+        abs(dz) > z_band && continue
         distance2 = dx * dx + dz * dz
         if distance2 < best_distance2
             best_distance2 = distance2
         end
     end
-
+    if isinf(best_distance2)
+        @inbounds for p in 1:nparticles(system_tool)
+            dx = x_target - system_tool.current_coordinates[1, p]
+            dz = z_target - system_tool.current_coordinates[3, p]
+            distance2 = dx * dx + dz * dz
+            if distance2 < best_distance2
+                best_distance2 = distance2
+            end
+        end
+    end
     return sqrt(best_distance2) - particle_spacing
 end
 
 function compute_contact_heat_flux!(ext_heat_per_particle, system_cyl, system_floor,
-                                    system_mold, particle_spacing)
-    fill!(ext_heat_per_particle, 0.0)
+                                    system_mold, particle_spacing, t=-Inf;
+                                    source_indices=nothing, reset::Bool=true)
+    reset && fill!(ext_heat_per_particle, 0.0)
 
     T_floor = mean(system_floor.temp)
     T_mold = mean(system_mold.temp)
@@ -6063,29 +8755,60 @@ function compute_contact_heat_flux!(ext_heat_per_particle, system_cyl, system_fl
     # C∞ dT activation: 1 - exp(-(dT/band)²) is smooth at dT=0 and saturates to 1.
     @inline dT_activation(dT) = 1.0 - exp(-(dT / T_smooth_band)^2)
 
-    @inbounds for i in 1:nparticles(system_cyl)
+    n_cyl = nparticles(system_cyl)
+    # Cache gaps only in closed-die solidification hold: punch has finished its
+    # stroke (t ≥ t_down_end) and charge kinematics are frozen. During compression
+    # the punch moves, so gaps must be recomputed every call.
+    use_thermal_gap_cache = !separate_charge_plies &&
+        (sim_phase == "hold" || sim_phase == "full") &&
+        hold_kinematics_mode == :frozen &&
+        isfinite(t) && t >= t_down_end
+    if use_thermal_gap_cache
+        if !thermal_gap_cache_valid[] || length(thermal_gap_floor_cache) != n_cyl
+            resize!(thermal_gap_floor_cache, n_cyl)
+            resize!(thermal_gap_mold_cache, n_cyl)
+            @inbounds for i in 1:n_cyl
+                x_i = system_cyl.current_coordinates[1, i]
+                z_i = system_cyl.current_coordinates[3, i]
+                thermal_gap_floor_cache[i] = tool_thermal_gap(system_floor, x_i, z_i, particle_spacing)
+                thermal_gap_mold_cache[i] = tool_thermal_gap(system_mold, x_i, z_i, particle_spacing)
+            end
+            thermal_gap_cache_valid[] = true
+            println(">>> Pre-cached tool thermal gaps for ", n_cyl,
+                    " workpiece particles at t≥t_down_end=", round(t_down_end; digits=6),
+                    " s (closed-die hold; no gap searches until retract).")
+            flush(stdout)
+        end
+    else
+        thermal_gap_cache_valid[] = false
+    end
+
+    @inbounds for i in 1:n_cyl
+        g = source_indices === nothing ? i : source_indices[i]
         x_i = system_cyl.current_coordinates[1, i]
         z_i = system_cyl.current_coordinates[3, i]
         T_i = system_cyl.temp[i]
-        h_contact_i = h_contact_particle[i]
+        h_contact_i = h_contact_particle[g]
 
-        gap_floor = tool_thermal_gap(system_floor, x_i, z_i, particle_spacing)
+        gap_floor = use_thermal_gap_cache ? thermal_gap_floor_cache[i] :
+            tool_thermal_gap(system_floor, x_i, z_i, particle_spacing)
         if gap_floor <= contact_threshold
             gap_floor_eff = clamp(gap_floor, 0.0, contact_threshold)
             dT = T_i - T_floor
             flux_floor = h_contact_i * dT * gap_activation(gap_floor_eff) * dT_activation(dT)
             if flux_floor != 0.0
-                ext_heat_per_particle[i] += flux_floor
+                ext_heat_per_particle[g] += flux_floor
             end
         end
 
-        gap_mold = tool_thermal_gap(system_mold, x_i, z_i, particle_spacing)
+        gap_mold = use_thermal_gap_cache ? thermal_gap_mold_cache[i] :
+            tool_thermal_gap(system_mold, x_i, z_i, particle_spacing)
         if gap_mold <= contact_threshold
             gap_mold_eff = clamp(gap_mold, 0.0, contact_threshold)
             dT = T_i - T_mold
             flux_mold = h_contact_i * dT * gap_activation(gap_mold_eff) * dT_activation(dT)
             if flux_mold != 0.0
-                ext_heat_per_particle[i] += flux_mold
+                ext_heat_per_particle[g] += flux_mold
             end
         end
     end
@@ -6220,6 +8943,15 @@ function initialize_orientation_tensor_state(fiber_direction; a0=0.85)
     A_state = zeros(3, 3, n)
     I3 = Matrix{Float64}(I, 3, 3)
 
+    if organosheet_architecture in ("qi", "quasi_isotropic")
+        @inbounds for i in 1:n
+            A_state[1, 1, i] = 0.5
+            A_state[2, 2, i] = 0.5
+            A_state[3, 3, i] = 0.0
+        end
+        return A_state
+    end
+
     @inbounds for i in 1:n
         p_col = fiber_direction[:, i]
         nrm = norm(p_col)
@@ -6236,7 +8968,112 @@ function initialize_orientation_tensor_state(fiber_direction; a0=0.85)
     return A_state
 end
 
-orientation_tensor_state[] = initialize_orientation_tensor_state(fiber_direction)
+# Song et al. CompA 114 (2018) Fig. 4 — digitized initial FO at charge location P.
+# Fig.4 frame: A11 along plotted X (thickness, lowest), A22 along Y (highest), A33 along Z.
+const song_fig4_zn = (-1.0, -0.875, -0.75, -0.625, -0.5, -0.375, -0.25, -0.125,
+                      0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0)
+const song_fig4_A11 = (0.18, 0.16, 0.14, 0.15, 0.17, 0.16, 0.15, 0.17,
+                       0.18, 0.16, 0.14, 0.15, 0.17, 0.19, 0.17, 0.16, 0.18)
+const song_fig4_A22 = (0.50, 0.48, 0.45, 0.43, 0.42, 0.46, 0.48, 0.47,
+                       0.45, 0.44, 0.48, 0.52, 0.50, 0.47, 0.48, 0.50, 0.52)
+const song_fig4_A33 = (0.32, 0.36, 0.41, 0.42, 0.41, 0.38, 0.37, 0.36,
+                       0.37, 0.40, 0.38, 0.33, 0.33, 0.34, 0.35, 0.34, 0.30)
+
+function _lerp_fig4(zn_query, zn_tab, a_tab)
+    z = clamp(zn_query, zn_tab[1], zn_tab[end])
+    if z <= zn_tab[1]
+        return Float64(a_tab[1])
+    elseif z >= zn_tab[end]
+        return Float64(a_tab[end])
+    end
+    i = 1
+    while i < length(zn_tab) && zn_tab[i + 1] < z
+        i += 1
+    end
+    z0 = Float64(zn_tab[i]); z1 = Float64(zn_tab[i + 1])
+    a0 = Float64(a_tab[i]); a1 = Float64(a_tab[i + 1])
+    t = (z - z0) / max(z1 - z0, eps(Float64))
+    return (1.0 - t) * a0 + t * a1
+end
+
+"""Map Song Fig.4 CT FO onto the SPH charge.
+
+Default mold-frame map (`length_x_preferred`):
+  charge thickness z ← Fig.4 X (low A11) → A_zz
+  charge length x    ← Fig.4 Y (high A22) → A_xx
+  charge width y     ← Fig.4 Z (mid A33)  → A_yy
+
+`fiber_direction` is set to the principal eigenvector of A (Spencer n_ref).
+"""
+function initialize_orientation_tensor_song_fig4!(A_state, fiber_dir, coords;
+                                                  map_mode::AbstractString="length_x_preferred")
+    n = size(A_state, 3)
+    zs = @view coords[3, 1:n]
+    zmin = minimum(zs); zmax = maximum(zs)
+    zspan = max(zmax - zmin, eps(Float64))
+    mode = lowercase(strip(map_mode))
+    mean_axx = 0.0; mean_ayy = 0.0; mean_azz = 0.0
+
+    @inbounds for i in 1:n
+        zn = 2.0 * (coords[3, i] - zmin) / zspan - 1.0
+        a11 = _lerp_fig4(zn, song_fig4_zn, song_fig4_A11)
+        a22 = _lerp_fig4(zn, song_fig4_zn, song_fig4_A22)
+        a33 = _lerp_fig4(zn, song_fig4_zn, song_fig4_A33)
+        s = a11 + a22 + a33
+        a11 /= s; a22 /= s; a33 /= s
+
+        # Diagonal A in mold frame (off-diagonals ≈ 0 in Fig.4 mean sense).
+        if mode in ("length_x_preferred", "default", "song", "x")
+            a_xx, a_yy, a_zz = a22, a33, a11
+        elseif mode in ("fig4_xyz", "ct", "raw")
+            a_xx, a_yy, a_zz = a11, a22, a33
+        else
+            error("TP_CLIP_FO_FIG4_MAP must be 'length_x_preferred' or 'fig4_xyz' (got $map_mode)")
+        end
+
+        fill!(view(A_state, :, :, i), 0.0)
+        A_state[1, 1, i] = a_xx
+        A_state[2, 2, i] = a_yy
+        A_state[3, 3, i] = a_zz
+        project_orientation_tensor!(view(A_state, :, :, i))
+
+        A = Symmetric(A_state[:, :, i])
+        evals, evecs = eigen(A)
+        p = evecs[:, argmax(evals)]
+        nrm = norm(p)
+        if nrm < eps(Float64)
+            p = [1.0, 0.0, 0.0]
+        else
+            p = p ./ nrm
+            # Prefer +x hemisphere for a stable Spencer reference.
+            p[1] < 0.0 && (p = -p)
+        end
+        fiber_dir[1, i] = p[1]
+        fiber_dir[2, i] = p[2]
+        fiber_dir[3, i] = p[3]
+        mean_axx += A_state[1, 1, i]
+        mean_ayy += A_state[2, 2, i]
+        mean_azz += A_state[3, 3, i]
+    end
+    invn = 1.0 / n
+    println("  - fiber orientation: Song Fig.4 mapped init (TP_CLIP_FO_INIT=song_fig4, map=",
+            mode, "); mean Axx/Ayy/Azz = ",
+            round(mean_axx * invn; digits=3), " / ",
+            round(mean_ayy * invn; digits=3), " / ",
+            round(mean_azz * invn; digits=3))
+    return A_state
+end
+
+fo_init_mode = lowercase(strip(get(ENV, "TP_CLIP_FO_INIT", "")))
+if fo_init_mode in ("song_fig4", "fig4", "song-fig4")
+    orientation_tensor_state[] = zeros(3, 3, n_cylinder_particles)
+    initialize_orientation_tensor_song_fig4!(orientation_tensor_state[], fiber_direction,
+                                             polymer.coordinates;
+                                             map_mode=get(ENV, "TP_CLIP_FO_FIG4_MAP",
+                                                          "length_x_preferred"))
+else
+    orientation_tensor_state[] = initialize_orientation_tensor_state(fiber_direction)
+end
 
 function update_flow_orientation_kinetics!(A_state, orientation_scalar, vel_grad, dt,
                                            fiber_direction;
@@ -6372,42 +9209,45 @@ end
     return max(det(F_reg), 1e-6)
 end
 
-@inline function elastic_volumetric_J(F_reg, particle, Fp_local)
+@inline function elastic_volumetric_J(F_reg, particle, Fp_local;
+                                      global_particle=particle)
     if use_volumetric_plasticity
-        J_p = max(J_p_particle_buf[particle], 1e-6)
+        J_p = max(J_p_particle_buf[global_particle], 1e-6)
         return max(particle_J_total(F_reg) / J_p, 1e-6)
     end
     Fp_inv = inv(Fp_local)
     return max(det(F_reg * Fp_inv), 1e-6)
 end
 
-@inline function matrix_bulk_log_J(F_reg, particle, Fp_local, matrix_blend, J_ref_legacy)
+@inline function matrix_bulk_log_J(F_reg, particle, Fp_local, matrix_blend, J_ref_legacy;
+                                   global_particle=particle)
     if use_volumetric_plasticity
         matrix_blend < 1.0 - 1e-6 && return 0.0
-        J_e_vol = elastic_volumetric_J(F_reg, particle, Fp_local)
+        J_e_vol = elastic_volumetric_J(F_reg, particle, Fp_local; global_particle)
         return log(max(J_e_vol / elastic_bulk_J_ref, 1e-6))
     end
     if matrix_blend < 1.0 - 1e-6
-        J_e = elastic_volumetric_J(F_reg, particle, Fp_local)
+        J_e = elastic_volumetric_J(F_reg, particle, Fp_local; global_particle)
         return log(max(J_e / J_e, 1e-6))
     end
-    J_e = elastic_volumetric_J(F_reg, particle, Fp_local)
+    J_e = elastic_volumetric_J(F_reg, particle, Fp_local; global_particle)
     return log(max(J_e / max(J_ref_legacy, 1e-6), 1e-6))
 end
 
-function commit_volumetric_plastic_relax!(F_reg, particle; active, commit_blend, matrix_blend)
+function commit_volumetric_plastic_relax!(F_reg, particle; active, commit_blend, matrix_blend,
+                                          global_particle=particle)
     use_volumetric_plasticity || return
     active || return
     commit_blend < 1e-6 && return
     J_tot = particle_J_total(F_reg)
     if matrix_blend < 1.0 - 1e-6
-        J_p_particle_buf[particle] = J_tot
+        J_p_particle_buf[global_particle] = J_tot
         return
     end
-    J_p = max(J_p_particle_buf[particle], 1e-6)
+    J_p = max(J_p_particle_buf[global_particle], 1e-6)
     rate = clamp(volumetric_plastic_relax_rate, 0.0, 1.0)
     J_p_new = J_p + rate * (J_tot - J_p)
-    J_p_particle_buf[particle] = clamp(J_p_new, 1e-6, max(J_tot, 1e-6))
+    J_p_particle_buf[global_particle] = clamp(J_p_new, 1e-6, max(J_tot, 1e-6))
     return nothing
 end
 
@@ -6416,7 +9256,8 @@ end
 function elastic_stress3d_trial_skip_liquid!(system, ys, hard, vis, dt, _alpha, _Fp, semi;
                                              solid_fraction_buf,
                                              v_elas_buf=nothing,
-                                             skip_solid_fraction=0.0)
+                                             skip_solid_fraction=0.0,
+                                             source_indices=nothing)
     (; deformation_grad, young_modulus, poisson_ratio, temp, tmelt, hardening) = system
 
     n_particles = size(deformation_grad, 3)
@@ -6425,9 +9266,34 @@ function elastic_stress3d_trial_skip_liquid!(system, ys, hard, vis, dt, _alpha, 
     mu = young_modulus / (2 + 2 * poisson_ratio)
     K  = young_modulus / (3 - 6 * poisson_ratio)
     H_theta = 1.0 / (tmelt - system.temp_ref[1])
+    cte_s = retraction_thermal_cte_scale()
 
     Threads.@threads for particle in 1:n_particles
+        global_particle = source_indices === nothing ? particle : source_indices[particle]
         if solid_fraction_buf[particle] <= skip_solid_fraction
+            if organosheet_mechanics && organosheet_active_in_melt
+                F = TrixiParticles.deformation_gradient(system, particle)
+                L_corr = @inbounds TrixiParticles.correction_matrix(system, particle)
+                det_F = det(F)
+                F_reg = if !isfinite(det_F) || abs(det_F) < 1e-10
+                    F + 1e-4 * one(StaticArrays.SMatrix{3, 3, eltype(F)})
+                else
+                    F
+                end
+                n_ref_p = StaticArrays.SVector{3}(fiber_direction[1, global_particle],
+                                                  fiber_direction[2, global_particle],
+                                                  fiber_direction[3, global_particle])
+                reinforcement_tau_p = clip_organosheet_reinforcement_stress(
+                    F_reg, n_ref_p, organosheet_ply_model, organosheet_architecture)
+                if all(isfinite, reinforcement_tau_p)
+                    FinvT = inv(F_reg)'
+                    v_local = (reinforcement_tau_p * FinvT) * L_corr
+                    if all(isfinite, v_local)
+                        @inbounds v_elas[:, :, particle] .= v_local
+                        continue
+                    end
+                end
+            end
             @inbounds v_elas[:, :, particle] .= 0.0
             # Fp and J_ref tracking for liquid particles is done in the accepted-step
             # callback (commit_plastic_history_and_heat!) — NOT here. Writing _Fp or
@@ -6458,23 +9324,48 @@ function elastic_stress3d_trial_skip_liquid!(system, ys, hard, vis, dt, _alpha, 
             end
         end
 
+        n_ref_p = StaticArrays.SVector{3}(fiber_direction[1, global_particle],
+                                          fiber_direction[2, global_particle],
+                                          fiber_direction[3, global_particle])
+
+        # Kinematic thermal contraction (F = Fe * Fp * Fth  =>  F_mech = F * inv(Fth))
+        F_mech = if (clip_kinematic_thermal_shrinkage && sim_phase == "retraction" &&
+                     retraction_post_cool_springback_active[])
+            delta_T_th = temp[particle] - retraction_post_cool_thermal_Tref_K
+            ramp_th = retraction_post_cool_thermal_scale[]
+            dT_eff = ramp_th * delta_T_th
+            α_par = alpha1_particle[global_particle]
+            α_perp = alpha2_particle[global_particle]
+            lam_par = clamp(exp(α_par * dT_eff), 0.90, 1.02)
+            lam_perp = clamp(exp(α_perp * dT_eff), 0.90, 1.02)
+            inv_lam_perp = 1.0 / lam_perp
+            d_inv_lam = (1.0 / lam_par) - inv_lam_perp
+            inv_Fth = inv_lam_perp * one(StaticArrays.SMatrix{3, 3, Float64}) + d_inv_lam * (n_ref_p * n_ref_p')
+            F_reg * inv_Fth
+        else
+            F_reg
+        end
+
         Fp_inv = inv(Fp_local)
-        Fe = F_reg * Fp_inv
+        Fe = F_mech * Fp_inv
         J_e = max(det(Fe), 1e-6)
         be = Fe * Fe'
         be_bar = be / (J_e^(2 / 3))
         dev_be = be_bar - 1 / 3 * tr(be_bar) * I
         # Per-particle Lamé constants: Halpin–Tsai transverse E2 as isotropic base.
-        mu = E2_particle[particle] / (2 + 2 * poisson_ratio)
-        K  = E2_particle[particle] / (3 - 6 * poisson_ratio)
+        mu = E2_particle[global_particle] / (2 + 2 * poisson_ratio)
+        K  = E2_particle[global_particle] / (3 - 6 * poisson_ratio)
 
-        # Spencer fiber direction (always active — fibers remain solid in molten matrix).
-        n_ref_p = StaticArrays.SVector{3}(fiber_direction[1, particle],
-                                          fiber_direction[2, particle],
-                                          fiber_direction[3, particle])
-        Fn_p = F_reg * n_ref_p
+        Fn_p = F_mech * n_ref_p
         I4_p = dot(Fn_p, Fn_p)
-        spencer_tau_p = (2 * k_fiber_particle[particle] * (I4_p - 1.0)) .* (Fn_p * Fn_p')
+        I4_tensile = max(I4_p - 1.0, 0.0)
+        reinforcement_tau_p = if organosheet_mechanics
+            clip_organosheet_reinforcement_stress(F_reg, n_ref_p, organosheet_ply_model,
+                                                  organosheet_architecture)
+        else
+            (2 * k_fiber_particle[global_particle] * I4_tensile) .*
+                (Fn_p * Fn_p')
+        end
 
         # Smooth blend of matrix solid fraction over a 20 K window centred on matrix_tmelt.
         # blend = 1 → fully solid  (T ≤ matrix_tmelt - matrix_blend_half_K)
@@ -6489,12 +9380,13 @@ function elastic_stress3d_trial_skip_liquid!(system, ys, hard, vis, dt, _alpha, 
         # Retraction only: Strategy E ln(J_e_vol)=ln(det(F)/J_p) via matrix_bulk_log_J
         # (matches commit/audit; avoids fake GPa bulk from isochoric Fp).
         # NOTE: do NOT write J_ref_particle_buf here (Jacobian corruption).
-        J_ref_p = max(J_ref_particle_buf[particle], 1e-6)
+        J_ref_p = max(J_ref_particle_buf[global_particle], 1e-6)
         if matrix_blend < 1.0 - 1e-6
             J_ref_p = J_e
         end
         bulk_log = if use_volumetric_plasticity && sim_phase == "retraction"
-            matrix_bulk_log_J(F_reg, particle, Fp_local, matrix_blend, J_ref_p)
+            matrix_bulk_log_J(F_reg, particle, Fp_local, matrix_blend, J_ref_p;
+                              global_particle)
         else
             log(max(J_e / J_ref_p, 1e-6))
         end
@@ -6502,12 +9394,12 @@ function elastic_stress3d_trial_skip_liquid!(system, ys, hard, vis, dt, _alpha, 
         # fiber reinforcement (depends on total F, not Fe) — keep it in the elastic
         # stress below, but do not let it drive Fp updates (same philosophy as heating).
         tau_matrix = K * bulk_log * I + mu * dev_be
-        tau_solid = tau_matrix + spencer_tau_p
+        tau_solid = tau_matrix + reinforcement_tau_p
 
         dev_tau = tau_matrix - 1 / 3 * tr(tau_matrix) * I
         yf = sqrt(1.5) * sqrt(sum(dev_tau .^ 2)) - (ys[particle] + hard[particle])
 
-        if matrix_blend > 1e-6 && yf > 1e-6
+        if matrix_blend > 1e-6 && yf > 1e-6 && !retraction_thermal_shrinkage_only_now()
             H_alpha_theta = hardening * (1 - H_theta * (temp[particle] - system.temp_ref[1]))
             if temp[particle] < 0.5 * tmelt
                 delta_gamma = yf / (3 * mu + H_alpha_theta)
@@ -6528,28 +9420,67 @@ function elastic_stress3d_trial_skip_liquid!(system, ys, hard, vis, dt, _alpha, 
                 Fp_local = Fp_local / cbrt(det(Fp_local))
 
                 Fp_inv = inv(Fp_local)
-                Fe = F_reg * Fp_inv
+                Fe = F_mech * Fp_inv
                 J_e = max(det(Fe), 1e-6)
                 be = Fe * Fe'
                 be_bar = be / (J_e^(2 / 3))
                 dev_be = be_bar - 1 / 3 * tr(be_bar) * I
                 bulk_log = if use_volumetric_plasticity && sim_phase == "retraction"
-                    matrix_bulk_log_J(F_reg, particle, Fp_local, matrix_blend, J_ref_p)
+                    matrix_bulk_log_J(F_reg, particle, Fp_local, matrix_blend, J_ref_p;
+                                      global_particle)
                 else
                     log(max(J_e / J_ref_p, 1e-6))
                 end
                 tau_matrix = K * bulk_log * I + mu * dev_be
-                tau_solid = tau_matrix + spencer_tau_p
+                tau_solid = tau_matrix + reinforcement_tau_p
             end
         end
 
-        # Thermal Kirchhoff stress: τ_th = −K·3·α_eff·ΔT·I  (volumetric, J2-neutral).
-        delta_T_th = temp[particle] - T_stress_free
-        tau_solid += (-K * 3.0 * alpha_eff_particle[particle] * delta_T_th *
-                      solid_fraction_buf[particle]) * I
+        # Thermal stress for springback:
+        # Transversely isotropic deviatoric thermal stress drives angle spring-in:
+        # τ_th,dev = -2·μ·(α₁ - α₂)·ΔT · (n⊗n - 1/3·I)
+        # where n is the current deformed fiber direction.
+        # This is strictly traceless (zero artificial hydrostatic pressure) and
+        # directly reproduces the classical Radford & Rennick (1999) / Song et al. (2018)
+        # corner spring-in bending moment without causing unphysical volumetric cavitation/expansion.
+        T_ref_th = sim_phase == "retraction" ?
+            retraction_post_cool_thermal_Tref_K : T_stress_free
+        delta_T_th = temp[particle] - T_ref_th
+        ramp_th = retraction_post_cool_thermal_scale[]
+        if ramp_th < 1.0
+            delta_T_th *= ramp_th
+        end
 
-        # Blend: above melt the matrix+Spencer contribution fades to zero continuously.
-        tau = matrix_blend * tau_solid
+        Fn_p = F_reg * n_ref_p
+        nrm2 = dot(Fn_p, Fn_p)
+        n_curr = nrm2 > 1.0e-24 ? Fn_p / sqrt(nrm2) : n_ref_p
+        M_dev = (n_curr * n_curr') - (1.0 / 3.0) * one(StaticArrays.SMatrix{3, 3, Float64})
+        alpha_diff = alpha1_particle[global_particle] - alpha2_particle[global_particle]
+        # Optional deviatoric thermal stress (governed by TP_CLIP_DEVIATORIC_THERMAL_CTE, default 0 in retraction to prevent unphysical compressive buckling and flange waviness)
+        dev_cte_scale = env_float("TP_CLIP_DEVIATORIC_THERMAL_CTE", sim_phase == "retraction" ? 0.0 : 1.0)
+        tau_th_dev = dev_cte_scale > 0.0 ?
+            (dev_cte_scale * (-2.0 * mu * alpha_diff * delta_T_th * M_dev * (cte_s * solid_fraction_buf[particle]))) :
+            zero(StaticArrays.SMatrix{3, 3, Float64})
+
+        # Optional isotropic volumetric thermal pressure (governed by TP_CLIP_VOLUMETRIC_THERMAL_CTE, default 0 in retraction to prevent boundary blowup)
+        vol_cte_scale = env_float("TP_CLIP_VOLUMETRIC_THERMAL_CTE", sim_phase == "retraction" ? 0.0 : 1.0)
+        tau_th_vol = if vol_cte_scale > 0.0
+            (vol_cte_scale * cte_s * (-K * 3.0 * alpha_eff_particle[global_particle] * delta_T_th *
+             solid_fraction_buf[particle])) * one(StaticArrays.SMatrix{3, 3, Float64})
+        else
+            zero(StaticArrays.SMatrix{3, 3, Float64})
+        end
+
+        tau_matrix += (tau_th_dev + tau_th_vol)
+        tau_solid += (tau_th_dev + tau_th_vol)
+
+        # Blend: above melt the matrix contribution fades to zero continuously,
+        # while continuous fiber reinforcement remains active when organosheet_active_in_melt is on.
+        tau = if organosheet_mechanics && organosheet_active_in_melt
+            matrix_blend * tau_matrix + reinforcement_tau_p
+        else
+            matrix_blend * tau_solid
+        end
 
         FinvT = inv(F_reg)'
         v_local = (tau * FinvT) * L_corr
@@ -6575,10 +9506,12 @@ function update_dual_phase_properties!(ys, hard, vis, temp, alpha,
                                        thermal_softening_particle_buf,
                                        liquid_fraction_particle_buf,
                                        solid_fraction_particle_buf;
-                                       vel_grad_buf=nothing, update_viscosity::Bool=true)
+                                       vel_grad_buf=nothing, update_viscosity::Bool=true,
+                                       source_indices=nothing)
     gas_constant = 8.31446261815324
     t_prop_start = time_ns()
     @inbounds for i in eachindex(temp)
+        global_i = source_indices === nothing ? i : source_indices[i]
         temp_i = temp[i]
         if !isfinite(temp_i)
             temp_i = matrix_temp_liq
@@ -6587,7 +9520,7 @@ function update_dual_phase_properties!(ys, hard, vis, temp, alpha,
 
         liquid_fraction = use_nakamura_kinetics ?
                   liquid_fraction_particle_buf[i] :
-                  liquid_fraction_particle(temp_i, i)
+                  liquid_fraction_particle(temp_i, global_i)
         solid_fraction = 1.0 - liquid_fraction
         liquid_fraction_particle_buf[i] = liquid_fraction
         solid_fraction_particle_buf[i] = solid_fraction
@@ -6601,14 +9534,20 @@ function update_dual_phase_properties!(ys, hard, vis, temp, alpha,
                        (0.4 * matrix_tmelt + eps(Float64)), 0.0, 1.0)
         solid_factor = 1.0 - melt_softening
 
-        orient_scale = 1.0 + phase_vf_particle[i] * orientation_coupling_gain *
-                             (orientation_scalar_particle[i] - 1.0)
+        orient_scale = 1.0 + phase_vf_particle[global_i] * orientation_coupling_gain *
+                             (orientation_scalar_particle[global_i] - 1.0)
 
+        yield_base = organosheet_mechanics ?
+                     matrix_yield_stress * (1.0 - phase_vf_particle[global_i]) :
+                     yield_base_particle[global_i]
+        hardening_base = organosheet_mechanics ?
+                         matrix_hardening * (1.0 - phase_vf_particle[global_i]) :
+                         hardening_base_particle[global_i]
         ys[i] = max(1.0e3,
-                (yield_base_particle[i] + hardening_base_particle[i] * alpha[i]) *
+                (yield_base + hardening_base * alpha[i]) *
                 thermal_softening)
         ys[i] *= orient_scale
-        hard[i] = hardening_base_particle[i] * thermal_softening * orient_scale
+        hard[i] = hardening_base * thermal_softening * orient_scale
     end
     rhs_time_property_update_ns[] += time_ns() - t_prop_start
 
@@ -6616,6 +9555,7 @@ function update_dual_phase_properties!(ys, hard, vis, temp, alpha,
 
     t_visc_start = time_ns()
     @inbounds for i in eachindex(temp)
+        global_i = source_indices === nothing ? i : source_indices[i]
         temp_i = temp[i]
         if !isfinite(temp_i)
             temp_i = matrix_temp_liq
@@ -6625,8 +9565,8 @@ function update_dual_phase_properties!(ys, hard, vis, temp, alpha,
         melt_softening = clamp((temp_i - 0.8 * matrix_tmelt) /
                        (0.4 * matrix_tmelt + eps(Float64)), 0.0, 1.0)
         solid_factor = 1.0 - melt_softening
-        orient_scale = 1.0 + phase_vf_particle[i] * orientation_coupling_gain *
-                             (orientation_scalar_particle[i] - 1.0)
+        orient_scale = 1.0 + phase_vf_particle[global_i] * orientation_coupling_gain *
+                             (orientation_scalar_particle[global_i] - 1.0)
         temp_shift = temp_i - cross_wlf_transition_temp
         wlf_denom = cross_wlf_A2 + temp_shift
         if abs(wlf_denom) < 1.0e-8
@@ -6648,7 +9588,8 @@ function update_dual_phase_properties!(ys, hard, vis, temp, alpha,
             cross_argument = eta_zero_shear * shear_rate / cross_wlf_critical_stress
             cross_denominator = 1.0 + cross_argument^
                                   (1.0 - cross_wlf_power_law_index)
-            concentration_base = max(1.0 - phase_vf_particle[i] / fiber_max_packing_fraction,
+            concentration_base = max(1.0 - phase_vf_particle[global_i] /
+                                     fiber_max_packing_fraction,
                                      eps(Float64))
             concentration_factor = concentration_base^
                                    (-fiber_intrinsic_viscosity * fiber_max_packing_fraction)
@@ -6723,10 +9664,77 @@ function clip_viscosity_update_on_step()
     return viscosity_step_count[] % interval == 1
 end
 
+function update_implicit_stress_cache_separate!(semi_local, v_ode, t)
+    fill!(v_stress_buf, 0.0)
+    fill!(v_stress_viscous_buf, 0.0)
+    fill!(v_stress_elastic_buf, 0.0)
+    update_viscosity = clip_viscosity_update_on_rhs()
+    caches = Dict{UInt64, TrixiParticles.StressTensorArray}()
+
+    clip_foreach_charge_system(semi_local) do system, source
+        ys = clip_charge_particle_view(ys_particle_buf, source)
+        hard = clip_charge_particle_view(hard_particle_buf, source)
+        vis = clip_charge_particle_view(vis_particle_buf, source)
+        thermal_soft = clip_charge_particle_view(thermal_softening_particle_buf, source)
+        liquid = clip_charge_particle_view(liquid_fraction_particle_buf, source)
+        solid = clip_charge_particle_view(solid_fraction_particle_buf, source)
+        alpha = clip_charge_particle_view(alpha_committed[], source)
+        velocity_gradient = clip_charge_particle_view(vel_grad_buf, source)
+        stress = clip_charge_particle_view(v_stress_buf, source)
+        stress_viscous = clip_charge_particle_view(v_stress_viscous_buf, source)
+        stress_elastic = clip_charge_particle_view(v_stress_elastic_buf, source)
+        Fp = clip_charge_particle_view(Fp_committed[], source)
+
+        update_dual_phase_properties!(ys, hard, vis, system.temp, alpha,
+                                      thermal_soft, liquid, solid;
+                                      vel_grad_buf=velocity_gradient,
+                                      update_viscosity, source_indices=source)
+        stress_visc = if retraction_solid_mechanics_only()
+            fill!(stress_viscous, 0.0)
+        else
+            viscous_stress_from_cached_grad!(
+                system, vis; v_vis_buf=stress_viscous,
+                vel_grad_buf=velocity_gradient,
+                include_bulk_term=enable_elastic_stress,
+                solid_fraction_buf=solid,
+                skip_solid_fraction=viscous_skip_solid_fraction)
+        end
+
+        if !enable_elastic_stress
+            stress .= stress_visc
+            caches[objectid(system)] = Array(stress)
+            return
+        end
+
+        stress_elas = elastic_stress3d_trial_skip_liquid!(
+            system, ys, hard, vis, trial_dt_state[], alpha, Fp, semi_local;
+            solid_fraction_buf=solid,
+            skip_solid_fraction=elastic_skip_solid_fraction,
+            v_elas_buf=stress_elastic,
+            source_indices=source)
+
+        @inbounds for particle in TrixiParticles.each_integrated_particle(system)
+            elas_ok = all(isfinite, @view stress_elas[:, :, particle])
+            mech_w = (organosheet_mechanics && organosheet_active_in_melt) ? 1.0 : solid_mechanics_weight(solid[particle])
+            for j in 1:3, i in 1:3
+                stress[i, j, particle] =
+                    elas_ok ? mech_w * stress_elas[i, j, particle] : 0.0
+            end
+        end
+        caches[objectid(system)] = Array(stress)
+    end
+    refresh_retraction_solid_phase_buffers!()
+    TrixiParticles.STRESS_TENSOR_CACHE[] = caches
+    return nothing
+end
+
 function update_implicit_stress_cache!(semi_local, v_ode, t)
+    if separate_charge_plies
+        return update_implicit_stress_cache_separate!(semi_local, v_ode, t)
+    end
     cyl_sys   = semi_local.systems[1]
-    floor_sys = semi_local.systems[2]
-    mold_sys  = semi_local.systems[3]
+    floor_sys = clip_floor_system(semi_local)
+    mold_sys  = clip_mold_system(semi_local)
     v_cyl = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
 
     # ===== Properties + constitutive stress cache =====
@@ -6799,11 +9807,17 @@ function update_implicit_stress_cache!(semi_local, v_ode, t)
             mech_w = retraction_solid_mechanics_only() ? 1.0 :
                      solid_mechanics_weight(solid_fraction_particle_buf[particle])
             if mech_w <= 1.0e-10
-                # Mushy/latent/liquid: mechanics is liquid-only (WCSPH branch).
-                # Keep TLSPH constitutive stress fully off to avoid mixed-state
-                # history coupling (Fp/J_ref/plasticity) that collapses TRBDF2 dt.
-                for j in 1:3, i in 1:3
-                    v_stress_buf[i, j, particle] = 0.0
+                if organosheet_mechanics && organosheet_active_in_melt
+                    for j in 1:3, i in 1:3
+                        v_stress_buf[i, j, particle] = stress_elas[i, j, particle]
+                    end
+                else
+                    # Mushy/latent/liquid: mechanics is liquid-only (WCSPH branch).
+                    # Keep TLSPH constitutive stress fully off to avoid mixed-state
+                    # history coupling (Fp/J_ref/plasticity) that collapses TRBDF2 dt.
+                    for j in 1:3, i in 1:3
+                        v_stress_buf[i, j, particle] = 0.0
+                    end
                 end
             elseif mech_w >= 1.0 - 1.0e-10
                 # Fully solid: use solid constitutive stress.
@@ -6813,8 +9827,14 @@ function update_implicit_stress_cache!(semi_local, v_ode, t)
             else
                 # Smooth handover in the semi-solid window to avoid stiffness
                 # spikes when particles first re-enter solid mechanics.
-                for j in 1:3, i in 1:3
-                    v_stress_buf[i, j, particle] = mech_w * stress_elas[i, j, particle]
+                if organosheet_mechanics && organosheet_active_in_melt
+                    for j in 1:3, i in 1:3
+                        v_stress_buf[i, j, particle] = stress_elas[i, j, particle]
+                    end
+                else
+                    for j in 1:3, i in 1:3
+                        v_stress_buf[i, j, particle] = mech_w * stress_elas[i, j, particle]
+                    end
                 end
             end
             # # Pressure floor: only for fully softened (viscous) particles — molten material
@@ -6943,7 +9963,8 @@ function kick_implicit_cfrp_retraction!(dv_ode, v_ode, u_ode, semi_local, t)
             nhs_updated_at_t[] = t
         end
 
-        TrixiParticles.TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM[] = objectid(cyl_sys)
+        TrixiParticles.TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM[] =
+            clip_deformation_only_selector(semi_local)
 
         TrixiParticles.foreach_system(semi_local) do system
             v = TrixiParticles.wrap_v(v_ode, system, semi_local)
@@ -6951,7 +9972,7 @@ function kick_implicit_cfrp_retraction!(dv_ode, v_ode, u_ode, semi_local, t)
             TrixiParticles.update_quantities!(system, v, u, v_ode, u_ode, semi_local, t)
         end
 
-        apply_charge_plane_strain_F_fix!(cyl_sys)
+        apply_all_charge_plane_strain_F_fixes!(semi_local)
 
         TrixiParticles.update_implicit_sph!(semi_local, v_ode, u_ode, t)
 
@@ -6982,28 +10003,31 @@ function kick_implicit_cfrp_retraction!(dv_ode, v_ode, u_ode, semi_local, t)
         TrixiParticles.STRESS_TENSOR_CACHE[] = nothing
     end
 
-    floor_sys = semi_local.systems[2]
-    mold_sys  = semi_local.systems[3]
-    contact_heat_flux = compute_contact_heat_flux!(contact_heat_flux_buf, cyl_sys,
-                                                   floor_sys, mold_sys, particle_spacing)
+    floor_sys = clip_floor_system(semi_local)
+    mold_sys  = clip_mold_system(semi_local)
+    contact_heat_flux = if retraction_post_eject_phase()
+        fill!(contact_heat_flux_buf, 0.0)
+    else
+        compute_contact_heat_flux!(contact_heat_flux_buf, cyl_sys,
+                                   floor_sys, mold_sys, particle_spacing, t)
+    end
     dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
     dx = particle_spacing
     rho_cyl = cyl_sys.material_density[1]
+    rho_thermal = physical_thermal_density(cyl_sys, 1)
     cp_cyl = cyl_sys.cp
     TrixiParticles.thermal_rhs_sph3d!(cyl_sys, dv_cyl, v_cyl, 0.0,
                                       particle_spacing, bound_coordinate_thermal, semi_local)
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
         if contact_heat_flux[particle] > 0.0
             dv_cyl[NDIMS_CYL + 1, particle] -= contact_heat_flux[particle] /
-                                                (rho_cyl * cp_cyl * dx)
+                                                (rho_thermal * cp_cyl * dx)
         end
-        if use_ambient_heat_loss
-            exposure = charge_boundary_exposure[particle]
+        if ambient_heat_loss_active_now()
+            exposure = free_cool_ambient_exposure(particle)
             if exposure > 0.0
                 T_i = cyl_sys.temp[particle]
-                flux_conv = h_ambient * (T_i - temp_ambient)
-                flux_rad = stefan_boltzmann * emissivity_charge * (T_i^4 - temp_ambient^4)
-                dT_dt_loss = exposure * (flux_conv + flux_rad) / (rho_cyl * cp_cyl * dx)
+                dT_dt_loss = compute_ambient_cooling_rate(T_i, exposure, rho_thermal, cp_cyl, dx, t)
                 dv_cyl[NDIMS_CYL + 1, particle] -= dT_dt_loss
             end
         end
@@ -7020,10 +10044,17 @@ function kick_implicit_cfrp_retraction!(dv_ode, v_ode, u_ode, semi_local, t)
 
     apply_retraction_charge_accel_caps!(dv_cyl, cyl_sys, t)
     update_retraction_deep_contact_kick_flag!(cyl_sys, floor_sys, mold_sys)
+    if retraction_post_eject_phase() && retraction_gravity_after_eject != 0.0
+        g = retraction_gravity_after_eject
+        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+            dv_cyl[3, particle] -= g
+        end
+    end
     apply_retraction_visco_rayleigh_damping!(dv_cyl, v_cyl, cyl_sys, floor_sys, mold_sys, t)
     apply_retraction_explicit_kick_soft_limit!(dv_cyl, cyl_sys, t)
     apply_retraction_deep_contact_velocity_hard_clamp!(v_cyl, cyl_sys)
     apply_retraction_full3d_y_accel_cap!(dv_cyl, cyl_sys, t)
+    apply_charge_flyaway_freeze!(dv_cyl, v_cyl, cyl_sys)
 
     if retraction_diag_enabled && retraction_started[]
         retraction_diag_kick_max_dv[] = max_charge_kick_dv(dv_ode, cyl_sys, semi_local)
@@ -7033,7 +10064,8 @@ function kick_implicit_cfrp_retraction!(dv_ode, v_ode, u_ode, semi_local, t)
 end
 
 function commit_plastic_history_and_heat!(system, ys, hard, vis, dt, _alpha, _Fp;
-                                          skip_heat::Bool=false, hold_creep::Bool=false)
+                                          skip_heat::Bool=false, hold_creep::Bool=false,
+                                          source_indices=nothing)
     (; deformation_grad, young_modulus, poisson_ratio, temp, tmelt, hardening,
        material_density, cp, temp_ref) = system
 
@@ -7042,6 +10074,7 @@ function commit_plastic_history_and_heat!(system, ys, hard, vis, dt, _alpha, _Fp
     H_theta = 1.0 / (tmelt - temp_ref[1])
 
     @inbounds for particle in TrixiParticles.eachparticle(system)
+        global_particle = source_indices === nothing ? particle : source_indices[particle]
         # Mirror the early-skip used in elastic_stress3d_trial_skip_liquid!:
         # liquid particles (sf ≤ 0) contribute no elastic stress to the physics
         # RHS, so they must also produce no plastic dissipation here.
@@ -7050,7 +10083,7 @@ function commit_plastic_history_and_heat!(system, ys, hard, vis, dt, _alpha, _Fp
         # at its last solid value while F keeps compressing → J_e→0.675 → K*log(J_e)
         # produces GPa-scale elastic stress the instant the particle re-solidifies,
         # collapsing Δt to femtoseconds.
-        sf_particle = solid_fraction_particle_buf[particle]
+        sf_particle = solid_fraction_particle_buf[global_particle]
         if sf_particle < solid_mechanics_solid_fraction_start
             # Reset Fp ← F so elastic strain is zeroed for liquid particles.
             F_liq = TrixiParticles.deformation_gradient(system, particle)
@@ -7061,7 +10094,7 @@ function commit_plastic_history_and_heat!(system, ys, hard, vis, dt, _alpha, _Fp
                     _Fp[ii, jj, particle] = F_liq_iso[ii, jj]
                 end
                 use_volumetric_plasticity &&
-                    (J_p_particle_buf[particle] = max(det_F_liq, 1e-6))
+                    (J_p_particle_buf[global_particle] = max(det_F_liq, 1e-6))
             end
             continue
         end
@@ -7091,7 +10124,7 @@ function commit_plastic_history_and_heat!(system, ys, hard, vis, dt, _alpha, _Fp
         Fp_inv = inv(Fp_sm)
         Fe = F_reg * Fp_inv
         J_e = max(det(Fe), 1e-6)
-        J_e_vol = elastic_volumetric_J(F_reg, particle, Fp_sm)
+        J_e_vol = elastic_volumetric_J(F_reg, particle, Fp_sm; global_particle)
         # Skip particles with implausibly large elastic volumetric strain.
         J_e_check = use_volumetric_plasticity ? J_e_vol : J_e
         if J_e_check < 0.7 || J_e_check > 2.0
@@ -7102,7 +10135,7 @@ function commit_plastic_history_and_heat!(system, ys, hard, vis, dt, _alpha, _Fp
                     _Fp[ii, jj, particle] = F_iso[ii, jj]
                 end
                 use_volumetric_plasticity &&
-                    (J_p_particle_buf[particle] = max(det_Freg, 1e-6))
+                    (J_p_particle_buf[global_particle] = max(det_Freg, 1e-6))
             end
             continue
         end
@@ -7112,8 +10145,8 @@ function commit_plastic_history_and_heat!(system, ys, hard, vis, dt, _alpha, _Fp
         # Per-particle Lamé constants: Halpin–Tsai transverse E2 as isotropic base.
         # (Matches elastic_stress3d_trial_skip_liquid!; the sf protection comes
         # from the early-skip above, not from scaling.)
-        mu = E2_particle[particle] / (2 + 2 * poisson_ratio)
-        K  = E2_particle[particle] / (3 - 6 * poisson_ratio)
+        mu = E2_particle[global_particle] / (2 + 2 * poisson_ratio)
+        K  = E2_particle[global_particle] / (3 - 6 * poisson_ratio)
         # While semi-solid (commit_blend_vol < 1), WCSPH carries volumetric load:
         # track J_ref = J_e so elastic bulk pressure stays zero until fully solid.
         # Uses matrix_blend_half_K (module-level const, same as the RHS blend window)
@@ -7122,30 +10155,36 @@ function commit_plastic_history_and_heat!(system, ys, hard, vis, dt, _alpha, _Fp
                                  (2 * matrix_blend_half_K), 0.0, 1.0)
         matrix_blend = clamp((matrix_tmelt + matrix_blend_half_K - temp[particle]) /
                                (2 * matrix_blend_half_K), 0.0, 1.0)
-        J_ref_p = max(J_ref_particle_buf[particle], 1e-6)
+        J_ref_p = max(J_ref_particle_buf[global_particle], 1e-6)
         if use_volumetric_plasticity
             commit_blend_vol < 1.0 - 1e-6 &&
-                (J_p_particle_buf[particle] = particle_J_total(F_reg))
+                (J_p_particle_buf[global_particle] = particle_J_total(F_reg))
         elseif commit_blend_vol < 1.0 - 1e-6
             J_ref_p = J_e
-            J_ref_particle_buf[particle] = J_e
+            J_ref_particle_buf[global_particle] = J_e
         end
-        bulk_log = matrix_bulk_log_J(F_reg, particle, Fp_sm, matrix_blend, J_ref_p)
+        bulk_log = matrix_bulk_log_J(F_reg, particle, Fp_sm, matrix_blend, J_ref_p;
+                                     global_particle)
         # Matrix Kirchhoff only for yield / plastic flow / heating. Spencer stays
         # hyperelastic (on total F) and must not rewrite Fp (matches elastic RHS split).
         tau_matrix = K * bulk_log * I + mu * dev_be
 
         # Spencer (1984) transversely isotropic fiber reinforcement.
-        n_ref_p = StaticArrays.SVector{3}(fiber_direction[1, particle],
-                                          fiber_direction[2, particle],
-                                          fiber_direction[3, particle])
+        n_ref_p = StaticArrays.SVector{3}(fiber_direction[1, global_particle],
+                                          fiber_direction[2, global_particle],
+                                          fiber_direction[3, global_particle])
         Fn_p = F_reg * n_ref_p
         I4_p = dot(Fn_p, Fn_p)
-        spencer_tau_p = (2 * k_fiber_particle[particle] * (I4_p - 1.0)) .* (Fn_p * Fn_p')
+        I4_tensile = max(I4_p - 1.0, 0.0)
+        reinforcement_tau_p = organosheet_mechanics ?
+            clip_organosheet_reinforcement_stress(F_reg, n_ref_p, organosheet_ply_model,
+                                                  organosheet_architecture) :
+            (2 * k_fiber_particle[global_particle] * I4_tensile) .*
+                (Fn_p * Fn_p')
 
         # Guard: skip return mapping and heating if stress is non-finite
         # (e.g. Spencer term overflow from near-singular F at corners).
-        if !all(isfinite, tau_matrix) || !all(isfinite, spencer_tau_p)
+        if !all(isfinite, tau_matrix) || !all(isfinite, reinforcement_tau_p)
             continue
         end
 
@@ -7176,11 +10215,12 @@ function commit_plastic_history_and_heat!(system, ys, hard, vis, dt, _alpha, _Fp
             yf = -1.0  # fully molten: no plastic work injection
         end
 
-        # hold_creep: always track J_p→det(F). (Post-peel jpTrack REJECTED: delayed abort
-        # but max_dev_be still exploded; do not accumulate that guard.)
-        vol_relax = hold_creep || yf > 1e-6
+        # hold_creep: always track J_p→det(F), except while F_th is putting thermal
+        # volume into F (hold cool / closed-die cool). J2 must not eat 3αΔT.
+        vol_relax = !thermal_Fth_skip_Jp[] && (hold_creep || yf > 1e-6)
         commit_volumetric_plastic_relax!(F_reg, particle;
-            active=vol_relax, commit_blend=commit_blend, matrix_blend=matrix_blend)
+            active=vol_relax, commit_blend=commit_blend, matrix_blend=matrix_blend,
+            global_particle)
 
         if yf > 1e-6
             H_alpha_theta = hardening * (1 - H_theta * (temp[particle] - temp_ref[1]))
@@ -7225,11 +10265,13 @@ function commit_plastic_history_and_heat!(system, ys, hard, vis, dt, _alpha, _Fp
                 be = Fe * Fe'
                 be_bar = be / (J_e^(2 / 3))
                 dev_be = be_bar - 1 / 3 * tr(be_bar) * I
-                J_ref_p2 = max(J_ref_particle_buf[particle], 1e-6)
-                bulk_log = matrix_bulk_log_J(F_reg, particle, Fp_sm, matrix_blend, J_ref_p2)
+                J_ref_p2 = max(J_ref_particle_buf[global_particle], 1e-6)
+                bulk_log = matrix_bulk_log_J(F_reg, particle, Fp_sm, matrix_blend,
+                                             J_ref_p2; global_particle)
                 tau_matrix = K * bulk_log * I + mu * dev_be
                 commit_volumetric_plastic_relax!(F_reg, particle;
-                    active=true, commit_blend=commit_blend, matrix_blend=matrix_blend)
+                    active=!thermal_Fth_skip_Jp[], commit_blend=commit_blend,
+                    matrix_blend=matrix_blend, global_particle)
                 _alpha[particle] += delta_gamma
 
                 dFp_total = Fp_sm - Fp_old
@@ -7757,27 +10799,51 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         end
     end
 
-    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-        if apply_velocity_safety_clamps()
-            v_cyl[1, particle] = soft_limit(v_cyl[1, particle], max_cylinder_speed)
-            v_cyl[3, particle] = soft_limit(v_cyl[3, particle], max_cylinder_speed)
+    if separate_charge_plies
+        clip_foreach_charge_system(semi_local) do system, _
+            v_charge = TrixiParticles.wrap_v(v_ode, system, semi_local)
+            ndims_charge = TrixiParticles.ndims(system)
+            @inbounds for particle in TrixiParticles.each_integrated_particle(system)
+                if apply_velocity_safety_clamps()
+                    v_charge[1, particle] = soft_limit(v_charge[1, particle],
+                                                       max_cylinder_speed)
+                    v_charge[3, particle] = soft_limit(v_charge[3, particle],
+                                                       max_cylinder_speed)
+                end
+                T_floor = ambient_heat_loss_active_now() ? max(temp_ambient, temp_min_clip) : temp_min_clip
+                t_trial = v_charge[ndims_charge + 1, particle]
+                if !isfinite(t_trial)
+                    t_trial = system.temp[particle]
+                end
+                t_clamped = clamp(t_trial, T_floor, temp_max_clip)
+                system.temp[particle] = t_clamped
+                v_charge[ndims_charge + 1, particle] = t_clamped
+            end
+        end
+    else
+        T_floor = ambient_heat_loss_active_now() ? max(temp_ambient, temp_min_clip) : temp_min_clip
+        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+            if apply_velocity_safety_clamps()
+                v_cyl[1, particle] = soft_limit(v_cyl[1, particle], max_cylinder_speed)
+                v_cyl[3, particle] = soft_limit(v_cyl[3, particle], max_cylinder_speed)
+            end
+            t_trial = v_cyl[NDIMS_CYL + 1, particle]
+            if !isfinite(t_trial)
+                t_trial = cyl_sys.temp[particle]
+            end
+            t_clamped = clamp(t_trial, T_floor, temp_max_clip)
+            cyl_sys.temp[particle] = t_clamped
+            v_cyl[NDIMS_CYL + 1, particle] = t_clamped
         end
     end
     apply_retraction_full3d_y_velocity_cap!(v_cyl, cyl_sys)
-    @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-        t_trial = v_cyl[NDIMS_CYL + 1, particle]
-        if !isfinite(t_trial)
-            t_trial = cyl_sys.temp[particle]
-        end
-        cyl_sys.temp[particle] = clamp(t_trial, temp_min_clip, temp_max_clip)
-    end
 
     if charge_hold_thermal_only(t)
         return apply_charge_hold_rhs!(dv_ode, v_ode, u_ode, semi_local, t)
     end
 
-    floor_sys = semi_local.systems[2]
-    mold_sys  = semi_local.systems[3]
+    floor_sys = clip_floor_system(semi_local)
+    mold_sys  = clip_mold_system(semi_local)
 
     force_stage_diag = force_stage_diag_enabled &&
                        t > diag_force_stage_start_t &&
@@ -7802,7 +10868,7 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         for (sys_idx, system) in enumerate(semi_local.systems)
             v = TrixiParticles.wrap_v(v_ode, system, semi_local)
             u = TrixiParticles.wrap_u(u_ode, system, semi_local)
-            if sys_idx == 1 || do_tool_pos
+            if clip_is_charge_system_index(sys_idx) || do_tool_pos
                 TrixiParticles.update_positions!(system, v, u, v_ode, u_ode, semi_local, t)
             end
         end
@@ -7810,7 +10876,7 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         # Ensure peel floor/die open shift is present even if PrescribedMotion AD path misfires.
         if retraction_peel_floor_open &&
            (retraction_floor_open_active[] || retraction_floor_open_z_shift[] != 0.0)
-            apply_floor_open_z_shift!(semi_local.systems[2])
+            apply_floor_open_z_shift!(clip_floor_system(semi_local))
         end
 
         # Safety clamp for charge coordinates during nonlinear iterations.
@@ -7851,6 +10917,10 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
                             " s (CONTACT settle: kin ACTIVE, σ=0, contact ON; punch lift later)" :
                         creep_free ?
                             " s (σ/contact/kin INSTANT; mold fixed; hold_creep ON; punch lift later)" :
+                        retraction_cool_before_lift ?
+                            (" s (σ/contact over " *
+                             string(round(retraction_pre_lift_creep_s * retraction_pre_lift_elastic_frac; digits=4)) *
+                             " s; kin FROZEN until punch lift; mold fixed; hold_creep ON)") :
                             (" s (σ/contact over " *
                              string(round(retraction_pre_lift_creep_s * retraction_pre_lift_elastic_frac; digits=4)) *
                              " s; kin over " * string(round(retraction_pre_lift_creep_s; digits=4)) *
@@ -7882,21 +10952,22 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         end
         rhs_time_nhs_ns[] += time_ns() - t_nhs_start
 
-        TrixiParticles.TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM[] = objectid(cyl_sys)
+        TrixiParticles.TLSPH_DEFORMATION_GRAD_ONLY_SYSTEM[] =
+            clip_deformation_only_selector(semi_local)
 
         t_quant_start = time_ns()
         do_tool_quant = !clip_tool_pos_quant_cache || (t != clip_tool_quant_updated_at_t[])
         for (sys_idx, system) in enumerate(semi_local.systems)
             v = TrixiParticles.wrap_v(v_ode, system, semi_local)
             u = TrixiParticles.wrap_u(u_ode, system, semi_local)
-            if sys_idx == 1 || do_tool_quant
+            if clip_is_charge_system_index(sys_idx) || do_tool_quant
                 TrixiParticles.update_quantities!(system, v, u, v_ode, u_ode, semi_local, t)
             end
         end
         do_tool_quant && (clip_tool_quant_updated_at_t[] = t)
         rhs_time_quant_ns[] += time_ns() - t_quant_start
 
-        apply_charge_plane_strain_F_fix!(cyl_sys)
+        apply_all_charge_plane_strain_F_fixes!(semi_local)
 
         # In pure-viscous mode the deformation gradient is only an auxiliary quantity
         # used by TLSPH internals; it carries no elastic history that must be preserved.
@@ -8237,11 +11308,15 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
 
     contact_damp_dist = 0.8 * smoothing_length
     dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
-    floor_sys = semi_local.systems[2]
-    mold_sys  = semi_local.systems[3]
-    if retraction_explicit_active() && retraction_explicit_freeze_t
-        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-            dv_cyl[NDIMS_CYL + 1, particle] = 0.0
+    floor_sys = clip_floor_system(semi_local)
+    mold_sys  = clip_mold_system(semi_local)
+    if retraction_thermal_frozen_now()
+        clip_foreach_charge_system(semi_local) do system, _
+            dv_sys = TrixiParticles.wrap_v(dv_ode, system, semi_local)
+            nd = TrixiParticles.ndims(system)
+            @inbounds for particle in TrixiParticles.each_integrated_particle(system)
+                dv_sys[nd + 1, particle] = 0.0
+            end
         end
     else
         t_thermal_start = time_ns()
@@ -8252,44 +11327,68 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
             end
             rhs_time_thermal_ns[] += time_ns() - t_thermal_start
         else
-            # Tool–charge HTC (floor + punch faces): always on; active when particle–tool gap ≤ ps.
+            # Tool–charge HTC is off after eject: mechanically removed tools must not
+            # reheat the freely cooling workpiece.
             t_contact_heat_start = time_ns()
-            contact_heat_flux = compute_contact_heat_flux!(contact_heat_flux_buf, cyl_sys,
-                                                           floor_sys, mold_sys, particle_spacing)
+            if !retraction_skip_sph_conduction_now() && !retraction_post_eject_phase()
+                if separate_charge_plies
+                    fill!(contact_heat_flux_buf, 0.0)
+                    clip_foreach_charge_system(semi_local) do system, source
+                        compute_contact_heat_flux!(contact_heat_flux_buf, system,
+                                                   floor_sys, mold_sys, particle_spacing, t;
+                                                   source_indices=source, reset=false)
+                    end
+                    contact_heat_flux = contact_heat_flux_buf
+                else
+                    contact_heat_flux = compute_contact_heat_flux!(contact_heat_flux_buf, cyl_sys,
+                                                                   floor_sys, mold_sys, particle_spacing, t)
+                end
+            else
+                fill!(contact_heat_flux_buf, 0.0)
+                contact_heat_flux = contact_heat_flux_buf
+            end
             rhs_time_contact_heat_ns[] += time_ns() - t_contact_heat_start
 
             t_thermal_sph_start = time_ns()
-            TrixiParticles.thermal_rhs_sph3d!(cyl_sys, dv_cyl, v_cyl, 0.0,
-                                              particle_spacing, bound_coordinate_thermal, semi_local)
+            if !retraction_skip_sph_conduction_now()
+                clip_foreach_charge_system(semi_local) do system, _
+                    dv_sys = TrixiParticles.wrap_v(dv_ode, system, semi_local)
+                    v_sys = TrixiParticles.wrap_v(v_ode, system, semi_local)
+                    TrixiParticles.thermal_rhs_sph3d!(system, dv_sys, v_sys, 0.0,
+                                                      particle_spacing, bound_coordinate_thermal, semi_local)
+                end
+            end
             rhs_time_thermal_sph_ns[] += time_ns() - t_thermal_sph_start
             if use_nakamura_kinetics && !retraction_solid_mechanics_only()
                 t_nak_rhs_start = time_ns()
             end
-            @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-                T_i    = cyl_sys.temp[particle]
-                cp_eff = effective_heat_capacity_particle(T_i, particle)
-                dv_cyl[NDIMS_CYL + 1, particle] *= cyl_sys.cp / cp_eff
-                # Nakamura latent heat off during solid retraction (α ≈ 1 already).
-                if use_nakamura_kinetics && !retraction_solid_mechanics_only()
-                    α_i    = crystallinity_particle_buf[particle]
-                    dα_dt  = nakamura_dalpha_dt(clamp(T_i, temp_min_clip, temp_max_clip), α_i)
-                    L_i    = latent_heat_particle[particle]
-                    cp_i   = cp_particle[particle]
-                    dv_cyl[NDIMS_CYL + 1, particle] += L_i * dα_dt / cp_i
-                end
-                if contact_heat_flux[particle] != 0.0
-                    rho_i = cyl_sys.material_density[particle]
-                    dv_cyl[NDIMS_CYL + 1, particle] -= contact_heat_flux[particle] /
-                                                      (rho_i * cp_eff * particle_spacing)
-                end
-                if use_ambient_heat_loss
-                    exposure = charge_boundary_exposure[particle]
-                    if exposure > 0.0
-                        rho_i = cyl_sys.material_density[particle]
-                        flux_conv = h_ambient * (T_i - temp_ambient)
-                        flux_rad = stefan_boltzmann * emissivity_charge * (T_i^4 - temp_ambient^4)
-                        dT_dt_loss = exposure * (flux_conv + flux_rad) / (rho_i * cp_eff * particle_spacing)
-                        dv_cyl[NDIMS_CYL + 1, particle] -= dT_dt_loss
+            clip_foreach_charge_system(semi_local) do system, source
+                dv_sys = TrixiParticles.wrap_v(dv_ode, system, semi_local)
+                nd = TrixiParticles.ndims(system)
+                @inbounds for particle in TrixiParticles.each_integrated_particle(system)
+                    g = source[particle]
+                    T_i = system.temp[particle]
+                    cp_eff = effective_heat_capacity_particle(T_i, g)
+                    dv_sys[nd + 1, particle] *= system.cp / cp_eff
+                    if use_nakamura_kinetics && !retraction_solid_mechanics_only()
+                        α_i = crystallinity_particle_buf[g]
+                        dα_dt = nakamura_dalpha_dt(clamp(T_i, temp_min_clip, temp_max_clip), α_i)
+                        L_i = latent_heat_particle[g]
+                        cp_i = cp_particle[g]
+                        dv_sys[nd + 1, particle] += L_i * dα_dt / cp_i
+                    end
+                    if contact_heat_flux[g] != 0.0
+                        rho_i = physical_thermal_density(system, particle)
+                        dv_sys[nd + 1, particle] -= contact_heat_flux[g] /
+                                                    (rho_i * cp_eff * particle_spacing)
+                    end
+                    if ambient_heat_loss_active_now()
+                        exposure = free_cool_ambient_exposure(g)
+                        if exposure > 0.0
+                            rho_i = physical_thermal_density(system, particle)
+                            dT_dt_loss = compute_ambient_cooling_rate(T_i, exposure, rho_i, cp_eff, particle_spacing, t)
+                            dv_sys[nd + 1, particle] -= dT_dt_loss
+                        end
                     end
                 end
             end
@@ -8310,6 +11409,7 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
         bh_sys = blankholder_neighbor_system[]
         resting_buf = charge_resting_on_shelf_buf[]
         @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+            charge_particle_is_flyaway(particle) && continue
             x_i = cyl_sys.current_coordinates[1, particle]
             z_i = cyl_sys.current_coordinates[3, particle]
             gap_floor_drag = tool_surface_gap(floor_sys, x_i, z_i, particle_spacing; side=:lower)
@@ -8368,9 +11468,12 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
                     p_n      = max(0.0, -v_stress_buf[3, 3, particle])
                     rho_i    = cyl_sys.material_density[particle]
                     a_fric   = mu_eff * p_n / (rho_i * particle_spacing)
-                    v_rel_x  = v_cyl[1, particle]
-                    if abs(v_rel_x) > 1.0e-12
-                        dv_cyl[1, particle] -= a_fric * sign(v_rel_x)
+                    vx       = v_cyl[1, particle]
+                    vy       = v_cyl[2, particle]
+                    v_tan    = hypot(vx, vy)
+                    if v_tan > 1.0e-12
+                        dv_cyl[1, particle] -= a_fric * (vx / v_tan)
+                        dv_cyl[2, particle] -= a_fric * (vy / v_tan)
                     end
                 end
             end
@@ -8385,10 +11488,17 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
 
     apply_retraction_charge_accel_caps!(dv_cyl, cyl_sys, t)
     update_retraction_deep_contact_kick_flag!(cyl_sys, floor_sys, mold_sys)
+    if retraction_post_eject_phase() && retraction_gravity_after_eject != 0.0
+        g = retraction_gravity_after_eject
+        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+            dv_cyl[3, particle] -= g
+        end
+    end
     apply_retraction_visco_rayleigh_damping!(dv_cyl, v_cyl, cyl_sys, floor_sys, mold_sys, t)
     apply_retraction_explicit_kick_soft_limit!(dv_cyl, cyl_sys, t)
     apply_retraction_deep_contact_velocity_hard_clamp!(v_cyl, cyl_sys)
     apply_retraction_full3d_y_accel_cap!(dv_cyl, cyl_sys, t)
+    apply_charge_flyaway_freeze!(dv_cyl, v_cyl, cyl_sys)
     @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
         # Liquid/mushy-only acceleration guard: keep WCSPH force spikes from
         # forcing TRBDF2 into nanosecond dt around the melt transition.
@@ -8438,9 +11548,21 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
             v_cyl_z = TrixiParticles.wrap_v(v_ode, cyl_sys, semi_local)
             u_cyl_z = TrixiParticles.wrap_u(u_ode, cyl_sys, semi_local)
             z0 = TrixiParticles.initial_coordinates(cyl_sys)
+            r_shelf = if haskey(ENV, "TP_CLIP_SHELF_R_MIN_MM")
+                env_float("TP_CLIP_SHELF_R_MIN_MM", 21.125) * 1.0e-3
+            elseif haskey(ENV, "TP_CLIP_CAD_DIR") && occursin("hemisphere", ENV["TP_CLIP_CAD_DIR"])
+                21.125e-3
+            else
+                0.0
+            end
+            is_circular = r_shelf > 0.0
             @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
                 particle > length(resting_buf) && continue
                 resting_buf[particle] || continue
+                if is_circular
+                    r_curr = hypot(u_cyl_z[1, particle], u_cyl_z[2, particle])
+                    r_curr < r_shelf && continue
+                end
                 dz = u_cyl_z[3, particle] - z0[3, particle]
                 dv_cyl[3, particle] += -z_damp * v_cyl_z[3, particle] - z_spring * dz
             end
@@ -8478,6 +11600,16 @@ function kick_implicit_visible!(dv_ode, v_ode, u_ode, semi_local, t)
             dv_cyl[2, particle] = 0.0
             dv_cyl[3, particle] = 0.0
         end
+    elseif sim_phase != "retraction" && hold_tlsph_tail_active(t)
+        tail_k = hold_tlsph_tail_kinematics_scale(t)
+        if tail_k < 1.0 - 1.0e-8
+            dv_cyl = TrixiParticles.wrap_v(dv_ode, cyl_sys, semi_local)
+            @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+                dv_cyl[1, particle] *= tail_k
+                dv_cyl[2, particle] *= tail_k
+                dv_cyl[3, particle] *= tail_k
+            end
+        end
     end
 
     if retraction_diag_enabled && retraction_started[]
@@ -8491,7 +11623,9 @@ function drift_implicit_visible!(du_ode, v_ode, u_ode, semi_local, t)
     TrixiParticles.drift!(du_ode, v_ode, u_ode, semi_local, t)
     retraction_cfrp_style_active() && return du_ode
 
-    kin_scale = if hold_kinematics_frozen(t)
+    kin_scale = if sim_phase != "retraction" && hold_tlsph_tail_active(t)
+        hold_tlsph_tail_kinematics_scale(t)
+    elseif hold_kinematics_frozen(t)
         0.0
     elseif retraction_started[]
         retraction_kinematics_scale(t)
@@ -8499,12 +11633,24 @@ function drift_implicit_visible!(du_ode, v_ode, u_ode, semi_local, t)
         1.0
     end
     if kin_scale < 1.0 - 1.0e-8
-        cyl_sys = semi_local.systems[1]
-        du_cyl = TrixiParticles.wrap_u(du_ode, cyl_sys, semi_local)
-        NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
-        @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-            for d in 1:NDIMS_CYL
-                du_cyl[d, particle] *= kin_scale
+        if separate_charge_plies
+            clip_foreach_charge_system(semi_local) do system, _
+                du_charge = TrixiParticles.wrap_u(du_ode, system, semi_local)
+                ndims_charge = TrixiParticles.ndims(system)
+                @inbounds for particle in TrixiParticles.each_integrated_particle(system)
+                    for d in 1:ndims_charge
+                        du_charge[d, particle] *= kin_scale
+                    end
+                end
+            end
+        else
+            cyl_sys = semi_local.systems[1]
+            du_cyl = TrixiParticles.wrap_u(du_ode, cyl_sys, semi_local)
+            NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
+            @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
+                for d in 1:NDIMS_CYL
+                    du_cyl[d, particle] *= kin_scale
+                end
             end
         end
     end
@@ -8553,8 +11699,11 @@ if sim_phase == "retraction" && hold_checkpoint_restore !== nothing
     cyl_sys = semi.systems[1]
     t_ret = hold_checkpoint_restore["t"]
     arm_retraction_phase!(t_ret)
+    if retraction_from_preeject[]
+        arm_retraction_from_preeject!(t_ret)
+    end
     capture_retraction_reference_span!(cyl_sys)
-    if retraction_prepare_state
+    if retraction_prepare_state && !retraction_from_preeject[]
         prepare_charge_state_for_retraction!(cyl_sys, semi, v0_ode, u0_ode,
                                              Fp_committed[], J_ref_particle_buf, J_p_particle_buf,
                                              vel_grad_buf, charge_dv_mech_marker_buf)
@@ -8563,7 +11712,7 @@ if sim_phase == "retraction" && hold_checkpoint_restore !== nothing
                                       label="retraction_load")
     end
     retraction_state_prepared[] = true
-    if retraction_pre_lift_creep_s > 0.0
+    if retraction_pre_lift_creep_s > 0.0 && !retraction_from_preeject[]
         retraction_pre_lift_creep_announced[] = true
         creep_kin_freeze = env_int("TP_CLIP_RETRACTION_CREEP_KINEMATICS_FREEZE", 0) != 0
         creep_kin_after_sigma = env_int("TP_CLIP_RETRACTION_CREEP_KIN_AFTER_SIGMA", 1) != 0
@@ -8593,6 +11742,10 @@ if sim_phase == "retraction" && hold_checkpoint_restore !== nothing
                 retraction_kinematic_peel ?
                     "; punch lifts while charge frozen" :
                     "; punch lift with charge kin ON",
+                retraction_pre_lift_settle_s > 0.0 ?
+                    "; extra pre-lift settle " *
+                    string(round(retraction_pre_lift_settle_s; digits=4)) *
+                    " s (kin ON, T fixed)" : "",
                 !retraction_kinematic_peel && retraction_post_lift_kin_freeze_s > 0.0 ?
                     " [WARNING: post-lift freeze " *
                     string(retraction_post_lift_kin_freeze_s) * " s overrides]" : "",
@@ -8613,6 +11766,55 @@ if sim_phase == "retraction" && hold_checkpoint_restore !== nothing
         println(">>> Post-lift springback dwell: up to ", retraction_springback_dwell_s,
                 " s (equil max_speed<", retraction_springback_equil_max_speed,
                 " m/s, span_z rate<", retraction_springback_equil_span_rate_mm_s, " mm/s)")
+    if retraction_cool_until_active
+        freeze_t_policy = if retraction_cool_before_lift
+            "demold frozen (FREEZE_T=$(retraction_explicit_freeze_t)); ON during closed-die cool, then after punch lift"
+        elseif retraction_unfreeze_t_after_punch_lift
+            "demold frozen (FREEZE_T=$(retraction_explicit_freeze_t)); ON after punch lift"
+        elseif retraction_unfreeze_t_after_eject
+            "demold frozen (FREEZE_T=$(retraction_explicit_freeze_t)); ON after eject only"
+        elseif retraction_explicit_freeze_t
+            "always (T will NOT cool)"
+        else
+            "off"
+        end
+        cool_where = if retraction_cool_before_lift && retraction_eject_after_cool
+            "closed die to $(retraction_cool_before_lift_C) °C, then punch lift + air cool, then eject"
+        elseif retraction_eject_after_cool
+            "in die after punch lift, then eject"
+        else
+            "after eject"
+        end
+        println(">>> Cool until mean charge T ≤ ",
+                retraction_cool_until_temp_C, " °C (", cool_where,
+                "; ambient heat loss=", use_ambient_heat_loss,
+                ", h=", h_ambient, " W/m²K, T_amb=",
+                round(temp_ambient - 273.15; digits=1), " °C",
+                ", freeze T=", freeze_t_policy,
+                retraction_cool_before_lift ?
+                    (retraction_closed_die_cool_plastic ?
+                        ", plastic ON in closed die (hold_creep); OFF after punch lift" :
+                        ", plastic OFF in closed die (elastic+CTE only); OFF after punch lift") :
+                    ", plastic OFF",
+                ", freeze mech after eject=", retraction_freeze_mech_after_eject,
+                retraction_tool_temp_after_punch_lift_active ?
+                    ", tool T after punch lift=" *
+                    string(retraction_tool_temp_after_punch_lift_C) * " °C" : "",
+                ", demold dt=", retraction_explicit_dt,
+                " s, free-cool dt=", retraction_explicit_dt_springback, " s)")
+        if retraction_explicit_freeze_t &&
+           !retraction_unfreeze_t_after_eject && !retraction_unfreeze_t_after_punch_lift
+            @warn "TP_CLIP_RETRACTION_COOL_UNTIL_TEMP_C set but FREEZE_T=1 without UNFREEZE — T will not evolve"
+        end
+        if !use_ambient_heat_loss
+            @warn "TP_CLIP_RETRACTION_COOL_UNTIL_TEMP_C set but USE_AMBIENT_HEAT_LOSS=0 — enable ambient convection"
+        end
+    elseif use_ambient_heat_loss
+        println(">>> Ambient heat loss ON: h=", h_ambient, " W/m²K, T_amb=",
+                round(temp_ambient - 273.15; digits=1), " °C, ε=", emissivity_charge,
+                retraction_unfreeze_t_after_punch_lift ? " (applied after punch lift)" :
+                (retraction_unfreeze_t_after_eject ? " (applied after eject only)" : ""))
+    end
     flush(stdout)
 end
 
@@ -8666,6 +11868,100 @@ else
     nothing
 end
 
+const clip_updated_lagrange_last_t = Ref(-1.0)
+
+function clip_recompute_correction_matrix!(system, semi)
+    TrixiParticles.set_zero!(system.correction_matrix)
+    initial_coords = TrixiParticles.initial_coordinates(system)
+
+    TrixiParticles.foreach_point_neighbor(system, system, initial_coords, initial_coords,
+                                          semi;
+                                          parallelization_backend=semi.parallelization_backend) do particle, neighbor, pos_diff, distance
+        grad_kernel = TrixiParticles.smoothing_kernel_grad(system, pos_diff, distance, particle)
+        iszero(grad_kernel) && return
+        volume = system.mass[neighbor] / system.material_density[neighbor]
+        result = volume * grad_kernel * pos_diff'
+        for j in 1:3, i in 1:3
+            system.correction_matrix[i, j, particle] -= result[i, j]
+        end
+    end
+    for particle in TrixiParticles.eachparticle(system)
+        L = TrixiParticles.extract_smatrix(system.correction_matrix, system, particle)
+        L_inv = clip_invert_correction_matrix(L)
+        for j in 1:3, i in 1:3
+            system.correction_matrix[i, j, particle] = L_inv[i, j]
+        end
+    end
+    return nothing
+end
+
+function clip_apply_updated_lagrange_reference_update!(system, source, semi, t)
+    n_part = TrixiParticles.nparticles(system)
+    # 1. Update fiber orientation in physical space using current deformation gradient
+    for p in 1:n_part
+        global_p = source === nothing ? p : source[p]
+        F_p = TrixiParticles.deformation_gradient(system, p)
+        a_old = StaticArrays.SVector{3, Float64}(fiber_direction[1, global_p],
+                                                 fiber_direction[2, global_p],
+                                                 fiber_direction[3, global_p])
+        a_new = F_p * a_old
+        n_a = norm(a_new)
+        if n_a > 1e-12
+            a_unit = a_new / n_a
+            fiber_direction[1, global_p] = a_unit[1]
+            fiber_direction[2, global_p] = a_unit[2]
+            fiber_direction[3, global_p] = a_unit[3]
+        end
+    end
+
+    # 2. Update reference coordinates to current coordinates
+    system.initial_coordinates .= system.current_coordinates
+
+    # 3. Dynamic neighborhood search update on new reference coordinates
+    PointNeighbors.update!(system.self_interaction_nhs, system.initial_coordinates, system.initial_coordinates)
+
+    # 4. Recompute geometry-adapted kernel correction matrix
+    clip_recompute_correction_matrix!(system, semi)
+
+    # 5. Reset relative deformation gradient to identity
+    for p in 1:n_part
+        for j in 1:3, i in 1:3
+            system.deformation_grad[i, j, p] = (i == j ? 1.0 : 0.0)
+        end
+    end
+    return nothing
+end
+
+function clip_maybe_updated_lagrange_step!(integrator)
+    clip_updated_lagrange || return nothing
+    integrator.t >= t_compress && return nothing
+
+    if clip_updated_lagrange_last_t[] < 0.0
+        clip_updated_lagrange_last_t[] = integrator.t
+        return nothing
+    end
+
+    if integrator.t - clip_updated_lagrange_last_t[] >= clip_updated_lagrange_interval
+        println(">>> [UPDATED LAGRANGE] Re-referencing configuration at t = ",
+                round(integrator.t; digits=4), " s (interval = ",
+                clip_updated_lagrange_interval, " s)")
+        flush(stdout)
+
+        if separate_charge_plies
+            clip_foreach_charge_system(integrator.p) do system, source
+                clip_apply_updated_lagrange_reference_update!(system, source, integrator.p, integrator.t)
+            end
+        else
+            cyl_sys = integrator.p.systems[1]
+            clip_apply_updated_lagrange_reference_update!(cyl_sys, nothing, integrator.p, integrator.t)
+        end
+
+        clip_reset_jacobian_coloring!()
+        clip_updated_lagrange_last_t[] = integrator.t
+    end
+    return nothing
+end
+
 const clip_last_synced_integrator_dt = Ref(-1.0)
 
 # Sync trial_dt_state when the integrator changes Δt (init, rejects, controller) — not every callback poll.
@@ -8676,6 +11972,7 @@ clip_trial_dt_sync_callback = DiscreteCallback(
     function(integrator)
         clip_last_synced_integrator_dt[] = integrator.dt
         clip_sync_trial_dt_from_integrator!(integrator)
+        u_modified!(integrator, false)
         return nothing
     end;
     save_positions=(false, false))
@@ -8688,8 +11985,8 @@ accepted_step_callback = DiscreteCallback(
             enforce_explicit_retraction_dt!(integrator)
 
             cyl_sys = integrator.p.systems[1]
-            floor_sys = integrator.p.systems[2]
-            mold_sys = integrator.p.systems[3]
+            floor_sys = clip_floor_system(integrator.p)
+            mold_sys = clip_mold_system(integrator.p)
             v_ode_state, u_ode_state = clip_integrator_vu(integrator)
             v_wrap_state = TrixiParticles.wrap_v(v_ode_state, cyl_sys, integrator.p)
 
@@ -8714,11 +12011,38 @@ accepted_step_callback = DiscreteCallback(
             end
 
             if hold_kinematics_frozen(integrator.t)
-                freeze_charge_mechanical_state!(v_wrap_state, cyl_sys)
+                if separate_charge_plies
+                    clip_foreach_charge_system(integrator.p) do system, _
+                        freeze_charge_mechanical_state!(
+                            TrixiParticles.wrap_v(v_ode_state, system, integrator.p),
+                            system)
+                    end
+                else
+                    freeze_charge_mechanical_state!(v_wrap_state, cyl_sys)
+                end
             else
                 update_retraction_deep_contact_kick_flag!(cyl_sys, floor_sys, mold_sys)
                 apply_retraction_deep_contact_velocity_hard_clamp!(v_wrap_state, cyl_sys)
             end
+            thermal_Fth_skip_Jp[] =
+                retraction_closed_die_cool_active[] ||
+                (retraction_lift_first_after_frozen_cool &&
+                 retraction_qs_cte_scale[] < 1.0 - 1.0e-12)
+
+            # Keep J_min ≥ compress_J_floor during punch-down (accepted steps only).
+            if separate_charge_plies
+                clip_foreach_charge_system(integrator.p) do system, source
+                    apply_compress_j_floor_accepted!(
+                        system, clip_charge_particle_view(J_p_particle_buf, source),
+                        integrator.t)
+                end
+            else
+                apply_compress_j_floor_accepted!(cyl_sys, J_p_particle_buf, integrator.t)
+            end
+            # Keep J_min ≥ retraction_J_floor through demold (stops creep re-crush).
+            apply_retraction_j_floor_accepted!(cyl_sys, J_p_particle_buf, integrator.t)
+
+            clip_maybe_updated_lagrange_step!(integrator)
 
     # IMEX split: apply wall drag + Coulomb friction explicitly on accepted steps
     # so the implicit Newton/JVP system only sees stiff contact + TLSPH mechanics.
@@ -8731,18 +12055,33 @@ accepted_step_callback = DiscreteCallback(
 
             if hold_tlsph_tail_active(integrator.t) && !hold_tlsph_tail_announced[]
                 hold_tlsph_tail_announced[] = true
+                hold_tail_dtmax = env_float("TP_CLIP_HOLD_TAIL_DTMAX", 1.0e-3)
+                integrator.opts.dtmax = min(integrator.opts.dtmax, hold_tail_dtmax)
+                integrator.dt = 1.0e-4
                 println(">>> TLSPH equilibration tail: WCSPH off, full TLSPH+contact, ",
                         hold_kinematics_mode == :frozen ?
                             ("kinematics frozen for " * string(round(hold_tlsph_tail_s; digits=4)) * " s") :
-                            ("kinematics active for " * string(round(hold_tlsph_tail_s; digits=4)) * " s"))
+                            ("kinematics active for " * string(round(hold_tlsph_tail_s; digits=4)) * " s"),
+                        "; dtmax=", integrator.opts.dtmax, " s")
                 flush(stdout)
             end
             t_vel_grad_start = time_ns()
-            refresh_velocity_gradient_cache!(cyl_sys, v_wrap_state, integrator.p, vel_grad_buf)
+            if separate_charge_plies
+                clip_foreach_charge_system(integrator.p) do system, source
+                    v_local = TrixiParticles.wrap_v(v_ode_state, system, integrator.p)
+                    refresh_velocity_gradient_cache!(
+                        system, v_local, integrator.p,
+                        clip_charge_particle_view(vel_grad_buf, source))
+                end
+            else
+                refresh_velocity_gradient_cache!(cyl_sys, v_wrap_state, integrator.p,
+                                                 vel_grad_buf)
+            end
             rhs_time_callback_vel_grad_ns[] += time_ns() - t_vel_grad_start
 
-            if !charge_hold_thermal_only(integrator.t) && !retraction_solid_mechanics_only() &&
-               !hold_tlsph_tail_active(integrator.t) && !retraction_pre_lift_creep_active(integrator.t)
+            # Orientation stays on in retraction (Jeffery/RSC): fiber alignment can still
+            # evolve under demold shear. WCSPH / Nakamura / molten drag remain off.
+            if !charge_hold_thermal_only(integrator.t) && !hold_tlsph_tail_active(integrator.t)
                 t_orient_start = time_ns()
                 update_flow_orientation_kinetics!(orientation_tensor_state[],
                                                   orientation_scalar_particle,
@@ -8876,61 +12215,118 @@ accepted_step_callback = DiscreteCallback(
                    !hold_tlsph_tail_active(integrator.t) &&
                    !retraction_pre_lift_creep_active(integrator.t)
                     t_nak_acc_start = time_ns()
-                    step_nakamura_crystallinity!(crystallinity_particle_buf,
-                                                 cyl_sys.temp,
-                                                 liquid_fraction_particle_buf,
-                                                 solid_fraction_particle_buf,
-                                                 integrator.dt)
+                    if separate_charge_plies
+                        clip_foreach_charge_system(integrator.p) do system, source
+                            step_nakamura_crystallinity!(
+                                clip_charge_particle_view(crystallinity_particle_buf, source),
+                                system.temp,
+                                clip_charge_particle_view(liquid_fraction_particle_buf, source),
+                                clip_charge_particle_view(solid_fraction_particle_buf, source),
+                                integrator.dt)
+                        end
+                    else
+                        step_nakamura_crystallinity!(crystallinity_particle_buf,
+                                                     cyl_sys.temp,
+                                                     liquid_fraction_particle_buf,
+                                                     solid_fraction_particle_buf,
+                                                     integrator.dt)
+                    end
                     rhs_time_nakamura_accepted_ns[] += time_ns() - t_nak_acc_start
                 end
 
-                update_dual_phase_properties!(ys_particle_buf, hard_particle_buf, vis_particle_buf,
-                                              cyl_sys.temp, alpha_committed[],
-                                              thermal_softening_particle_buf,
-                                              liquid_fraction_particle_buf,
-                                              solid_fraction_particle_buf;
-                                              vel_grad_buf=vel_grad_buf,
-                                              update_viscosity=clip_viscosity_update_on_step())
+                update_viscosity = clip_viscosity_update_on_step()
+                if separate_charge_plies
+                    clip_foreach_charge_system(integrator.p) do system, source
+                        update_dual_phase_properties!(
+                            clip_charge_particle_view(ys_particle_buf, source),
+                            clip_charge_particle_view(hard_particle_buf, source),
+                            clip_charge_particle_view(vis_particle_buf, source),
+                            system.temp,
+                            clip_charge_particle_view(alpha_committed[], source),
+                            clip_charge_particle_view(thermal_softening_particle_buf, source),
+                            clip_charge_particle_view(liquid_fraction_particle_buf, source),
+                            clip_charge_particle_view(solid_fraction_particle_buf, source);
+                            vel_grad_buf=clip_charge_particle_view(vel_grad_buf, source),
+                            update_viscosity, source_indices=source)
+                    end
+                else
+                    update_dual_phase_properties!(
+                        ys_particle_buf, hard_particle_buf, vis_particle_buf,
+                        cyl_sys.temp, alpha_committed[],
+                        thermal_softening_particle_buf,
+                        liquid_fraction_particle_buf,
+                        solid_fraction_particle_buf;
+                        vel_grad_buf=vel_grad_buf, update_viscosity)
+                end
                 refresh_retraction_solid_phase_buffers!()
 
                 hold_active = hold_plastic_relax_active(integrator.t)
-                skip_heat_commit = hold_active ||
-                    (retraction_explicit_active() && retraction_explicit_freeze_t)
+                skip_heat_commit = hold_active || retraction_skip_plastic_heat_now()
                 n_commit = hold_active ? hold_relax_substeps : 1
                 dt_commit = integrator.dt / n_commit
                 t_plastic_start = time_ns()
-                for _ in 1:n_commit
-                    commit_plastic_history_and_heat!(cyl_sys,
-                                                       ys_particle_buf,
-                                                       hard_particle_buf,
-                                                       vis_particle_buf,
-                                                       dt_commit,
-                                                       alpha_committed[],
-                                                       Fp_committed[];
-                                                       skip_heat=skip_heat_commit,
-                                                       hold_creep=hold_active)
+                # CLOSED_DIE_COOL_PLASTIC=0: elastic+CTE only while tools stay closed.
+                skip_plastic_closed_cool = retraction_closed_die_cool_active[] &&
+                    !retraction_closed_die_cool_plastic
+                if !retraction_thermal_shrinkage_only_now() && !skip_plastic_closed_cool
+                    for _ in 1:n_commit
+                        if separate_charge_plies
+                            clip_foreach_charge_system(integrator.p) do system, source
+                                commit_plastic_history_and_heat!(
+                                    system,
+                                    clip_charge_particle_view(ys_particle_buf, source),
+                                    clip_charge_particle_view(hard_particle_buf, source),
+                                    clip_charge_particle_view(vis_particle_buf, source),
+                                    dt_commit,
+                                    clip_charge_particle_view(alpha_committed[], source),
+                                    clip_charge_particle_view(Fp_committed[], source);
+                                    skip_heat=skip_heat_commit,
+                                    hold_creep=hold_active,
+                                    source_indices=source)
+                            end
+                        else
+                            commit_plastic_history_and_heat!(
+                                cyl_sys, ys_particle_buf, hard_particle_buf,
+                                vis_particle_buf, dt_commit, alpha_committed[],
+                                Fp_committed[]; skip_heat=skip_heat_commit,
+                                hold_creep=hold_active)
+                        end
+                    end
                 end
                 rhs_time_plastic_commit_ns[] += time_ns() - t_plastic_start
 
-                v_wrap = TrixiParticles.wrap_v(v_ode_state, cyl_sys, integrator.p)
-                NDIMS_CYL = TrixiParticles.ndims(cyl_sys)
-                @inbounds for particle in TrixiParticles.each_integrated_particle(cyl_sys)
-                    v_wrap[NDIMS_CYL + 1, particle] = cyl_sys.temp[particle]
+                clip_foreach_charge_system(integrator.p) do system, _
+                    v_wrap = TrixiParticles.wrap_v(v_ode_state, system, integrator.p)
+                    ndims_charge = TrixiParticles.ndims(system)
+                    @inbounds for particle in TrixiParticles.each_integrated_particle(system)
+                        v_wrap[ndims_charge + 1, particle] = system.temp[particle]
+                    end
                 end
             end
 
             if retraction_cfrp_style_active()
                 # F + plastic commit handled in CFRP-style branch above.
             elseif charge_hold_thermal_only(integrator.t)
-                # F frozen during solidification hold.
+                # Mechanical F frozen during solidification hold; F_th may still scale F.
             elseif retraction_started[] && !hold_kinematics_frozen(integrator.t)
                 kin = retraction_kinematics_scale(integrator.t)
                 if kin > 1.0e-10
                     advance_F_from_vel_grad!(cyl_sys, vel_grad_buf, integrator.dt * kin)
                 end
             else
-                advance_F_from_vel_grad!(cyl_sys, vel_grad_buf, integrator.dt)
+                if separate_charge_plies
+                    clip_foreach_charge_system(integrator.p) do system, source
+                        advance_F_from_vel_grad!(
+                            system, clip_charge_particle_view(vel_grad_buf, source),
+                            integrator.dt)
+                    end
+                else
+                    advance_F_from_vel_grad!(cyl_sys, vel_grad_buf, integrator.dt)
+                end
             end
+            thermal_Fth_u_modified[] = apply_frozen_thermal_contraction!(
+                cyl_sys, u_ode_state, integrator.p, integrator.t;
+                v_ode=v_ode_state)
 
             if wcsph_mechanics_active() && enable_wcsph_liquid_viscosity &&
                lag_wcsph_liquid_viscosity
@@ -8978,8 +12374,25 @@ accepted_step_callback = DiscreteCallback(
                 hold_elapsed = integrator.t - t_compress
                 max_hold_reached = isfinite(solidification_hold_max) &&
                     hold_elapsed >= solidification_hold_max
-                if solidified_fraction >= solidification_fraction_target || max_hold_reached
-                    if solidified_fraction >= solidification_fraction_target
+                mean_T_C = mean(cyl_sys.temp) - 273.15
+                temp_target_reached = isfinite(hold_until_temp_C) &&
+                    mean_T_C <= hold_until_temp_C
+                hold_complete = if isfinite(hold_until_temp_C)
+                    temp_target_reached || max_hold_reached
+                else
+                    solidified_fraction >= solidification_fraction_target || max_hold_reached
+                end
+                if hold_complete
+                    if isfinite(hold_until_temp_C) && temp_target_reached
+                        println(">>> Hold temperature target reached at t=",
+                                round(integrator.t; digits=6), " s (hold ",
+                                round(hold_elapsed; digits=3), " s; mean charge T=",
+                                round(mean_T_C; digits=1), " °C ≤ ",
+                                round(hold_until_temp_C; digits=1), " °C; ",
+                                round(100 * solidified_fraction; digits=1),
+                                "% with sf>=",
+                                round(solidification_fraction_threshold; digits=3), ")")
+                    elseif solidified_fraction >= solidification_fraction_target
                         println(">>> All charge particles solidified at t=",
                                 round(integrator.t; digits=6), " s (hold ",
                                 round(hold_elapsed; digits=3), " s; ",
@@ -9008,7 +12421,68 @@ accepted_step_callback = DiscreteCallback(
             end
 
             if solidification_complete[] && !retraction_started[]
-                if hold_tlsph_checkpoint_ready(integrator.t)
+                # Track stress relaxation rate during hold
+                curr_stress_mean = 0.0
+                n_charge_pts = length(TrixiParticles.each_integrated_particle(cyl_sys))
+                @inbounds for p_idx in TrixiParticles.each_integrated_particle(cyl_sys)
+                    s11 = v_stress_buf[1, 1, p_idx]
+                    s22 = v_stress_buf[2, 2, p_idx]
+                    s33 = v_stress_buf[3, 3, p_idx]
+                    s12 = v_stress_buf[1, 2, p_idx]
+                    s13 = v_stress_buf[1, 3, p_idx]
+                    s23 = v_stress_buf[2, 3, p_idx]
+                    vm = sqrt(max(0.0, 0.5 * ((s11 - s22)^2 + (s22 - s33)^2 + (s33 - s11)^2 + 6.0 * (s12^2 + s13^2 + s23^2))))
+                    curr_stress_mean += vm
+                end
+                curr_stress_mean /= max(1, n_charge_pts)
+                if isfinite(hold_prev_stress_t[]) && (integrator.t - hold_prev_stress_t[]) >= 1.0e-5
+                    dt_stress = integrator.t - hold_prev_stress_t[]
+                    hold_stress_rate_current[] = abs(curr_stress_mean - hold_prev_stress_mean[]) / dt_stress
+                    hold_prev_stress_mean[] = curr_stress_mean
+                    hold_prev_stress_t[] = integrator.t
+                elseif !isfinite(hold_prev_stress_t[])
+                    hold_prev_stress_mean[] = curr_stress_mean
+                    hold_prev_stress_t[] = integrator.t
+                end
+
+                dwell_elapsed = integrator.t - solidification_reached_time[]
+                if isfinite(hold_stress_rate_threshold) &&
+                   dwell_elapsed >= (post_solidification_dwell + hold_tlsph_tail_min_s) &&
+                   hold_stress_rate_current[] <= hold_stress_rate_threshold &&
+                   !hold_stress_rate_converged[]
+                    hold_stress_rate_converged[] = true
+                    println(">>> Hold stress relaxation converged at t=",
+                            round(integrator.t; digits=6), " s (dwell ",
+                            round(dwell_elapsed; digits=4), " s): ||dσ/dt|| = ",
+                            round(hold_stress_rate_current[] / 1e6; digits=4), " MPa/s ≤ ",
+                            round(hold_stress_rate_threshold / 1e6; digits=4), " MPa/s")
+                    flush(stdout)
+                end
+
+                mean_T_C_hold = mean(cyl_sys.temp) - 273.15
+                hold_time_elapsed = integrator.t - t_compress
+                max_hold_time_reached = isfinite(solidification_hold_max) &&
+                    hold_time_elapsed >= solidification_hold_max
+                cool_target_pending = isfinite(hold_until_temp_C) &&
+                    mean_T_C_hold > hold_until_temp_C &&
+                    !max_hold_time_reached
+                if cool_target_pending
+                    if !hold_cool_continue_announced[]
+                        hold_cool_continue_announced[] = true
+                        println(">>> Continuing closed-die cool: mean charge T=",
+                                round(mean_T_C_hold; digits=1), " °C → target ≤ ",
+                                round(hold_until_temp_C; digits=1),
+                                " °C (tools closed; sf already complete)")
+                        flush(stdout)
+                    end
+                elseif hold_tlsph_checkpoint_ready(integrator.t)
+                    if isfinite(hold_until_temp_C)
+                        println(">>> Hold cool target reached at t=",
+                                round(integrator.t; digits=6),
+                                " s (mean charge T=", round(mean_T_C_hold; digits=1),
+                                " °C ≤ ", round(hold_until_temp_C; digits=1), " °C)")
+                        flush(stdout)
+                    end
                     if !retraction_state_prepared[]
                         prepare_charge_state_for_retraction!(cyl_sys, integrator.p,
                             v_ode_state, u_ode_state,
@@ -9086,16 +12560,27 @@ accepted_step_callback = DiscreteCallback(
                !retraction_dv_mech_ramping(integrator.t)
                 charge_mechanics_release_announced[] = true
                 if charge_hold_dtmax_active[]
-                    integrator.opts.dtmax = solver_dtmax_before_hold[]
+                    # Still in demold (creep/lift/eject): keep demold dt, not free-cool dt.
+                    restored_dtmax = retraction_use_explicit ?
+                        retraction_explicit_target_dt(integrator.t) :
+                        solver_dtmax_before_hold[]
+                    integrator.opts.dtmax = restored_dtmax
+                    integrator.dt = min(integrator.dt, restored_dtmax)
+                    try
+                        SciMLBase.set_proposed_dt!(integrator, integrator.dt)
+                    catch
+                    end
                     charge_hold_dtmax_active[] = false
                 end
                 println(">>> Retraction contact/σ-dv ramp complete at t=",
                         round(integrator.t; digits=6),
-                        " s; dtmax restored to ", solver_dtmax_before_hold[], " s")
+                        " s; dtmax restored to ", integrator.opts.dtmax, " s")
                 retraction_use_explicit &&
                     println(">>> Explicit retraction: mech ramp complete at t=",
-                            round(integrator.t; digits=6), " s (dt=",
-                            retraction_explicit_dt_springback, " s throughout)")
+                            round(integrator.t; digits=6),
+                            " s (demold dt=", retraction_explicit_dt,
+                            " s until eject; free-cool dt=",
+                            retraction_explicit_dt_springback, " s after)")
                 flush(stdout)
             end
 
@@ -9109,16 +12594,380 @@ accepted_step_callback = DiscreteCallback(
             end
 
             if retraction_started[] && retraction_pre_lift_creep_active(integrator.t) &&
-               integrator.t >= retraction_creep_audit_next_t[]
+               integrator.t >= retraction_creep_audit_next_t[] &&
+               (integrator.t - retraction_start_time[]) <= retraction_pre_lift_creep_s + 1.0e-6
                 creep_elapsed = integrator.t - retraction_start_time[]
                 enforce_charge_plastic_audit!(cyl_sys, Fp_committed[], J_p_particle_buf;
                     label="creep_mid_t=$(round(creep_elapsed; digits=4))s")
                 retraction_creep_audit_next_t[] = integrator.t + retraction_creep_audit_dt
             end
 
+            if retraction_started[] && retraction_pre_lift_settle_s > 0.0 &&
+               !retraction_lift_started_announced[]
+                settle_t0 = retraction_start_time[] + retraction_pre_lift_creep_s
+                if !retraction_pre_lift_settle_announced[] &&
+                   integrator.t >= settle_t0 - 1.0e-14
+                    retraction_pre_lift_settle_announced[] = true
+                    println(">>> Pre-lift settle start at t=",
+                            round(integrator.t; digits=6),
+                            " s: punch+floor fixed, kin ON, T fixed, no lift/cooling for ",
+                            round(retraction_pre_lift_settle_s; digits=4), " s")
+                    flush(stdout)
+                end
+                if !retraction_pre_lift_settle_done[] &&
+                   integrator.t >= settle_t0 + retraction_pre_lift_settle_s - 1.0e-14
+                    retraction_pre_lift_settle_done[] = true
+                    snap_settle = build_retraction_diag_snapshot(integrator, cyl_sys, floor_sys,
+                                                                 mold_sys, v_wrap_state)
+                    println(">>> Pre-lift settle done at t=",
+                            round(integrator.t; digits=6),
+                            " s: span_z=", round(snap_settle.span_z_mm; digits=4),
+                            " mm J_min=", round(snap_settle.J_min; sigdigits=4),
+                            " min_floor_gap=",
+                            round(snap_settle.min_floor_gap_mm; digits=4),
+                            " mm rms_speed=", round(snap_settle.rms_speed; sigdigits=4))
+                    flush(stdout)
+                    save_vtu_snapshot!(integrator)
+                end
+            end
+
             if retraction_started[] && !retraction_lift_started_announced[]
                 maybe_finish_closed_die_contact_settle!(integrator.t, cyl_sys, floor_sys, mold_sys)
                 maybe_postpone_lift_for_floor_settle!(integrator.t, cyl_sys, floor_sys, mold_sys)
+            end
+
+            if retraction_started[] && retraction_cool_before_lift &&
+               !retraction_lift_started_announced[] && !retraction_closed_die_cool_done[] &&
+               !retraction_pre_lift_settle_active(integrator.t)
+                creep_elapsed = integrator.t - retraction_start_time[]
+                if creep_elapsed >= retraction_pre_lift_creep_s - 1.0e-14
+                    Tmean_C = mean(cyl_sys.temp) - 273.15
+                    if !retraction_closed_die_cool_active[]
+                        if retraction_qs_cool && retraction_lift_first_after_frozen_cool &&
+                           isfinite(retraction_qs_kin_after_C) &&
+                           retraction_qs_skip_cte_until_kin &&
+                           Tmean_C > retraction_qs_kin_after_C + 1.0e-8
+                            if clip_fth_die_aware
+                                apply_frozen_thermal_contraction!(
+                                    cyl_sys, u_ode_state, integrator.p, integrator.t;
+                                    v_ode=v_ode_state, force=true)
+                            end
+                            delta_C = Tmean_C - retraction_qs_kin_after_C
+                            apply_charge_temperature_delta!(cyl_sys, integrator.p,
+                                                            v_ode_state, -delta_C)
+                            thermal_Fth_u_modified[] = apply_frozen_thermal_contraction!(
+                                cyl_sys, u_ode_state, integrator.p, integrator.t;
+                                v_ode=v_ode_state, force=true)
+                            apply_tool_temp_after_punch_lift!(integrator;
+                                when="at frozen T drop (punch DOWN)")
+                            println(">>> QS frozen T drop: Tmean ",
+                                    round(Tmean_C; digits=2), " → ",
+                                    round(Tmean_C - delta_C; digits=2),
+                                    " °C; kin frozen; τ_th=0; ",
+                                    clip_fth_die_aware ?
+                                        "aniso die-aware F_th on F+positions (Fig.4 n)" :
+                                        "packing unchanged")
+                            flush(stdout)
+                            save_vtu_snapshot!(integrator)
+                            Tmean_C -= delta_C
+                        end
+                        if retraction_lift_first_after_frozen_cool
+                            retraction_closed_die_cool_active[] = false
+                            retraction_closed_die_cool_done[] = true
+                            retraction_closed_die_cool_start_t[] = integrator.t
+                            retraction_qs_cte_scale[] = 0.0
+                            retraction_qs_stage_index[] = 0
+                            retraction_lift_start_time[] = integrator.t
+                            println(">>> Lift-first controller: Tmean=",
+                                    round(Tmean_C; digits=2),
+                                    " °C, τ_th=0, charge FROZEN; starting punch lift. ",
+                                    "Release at mold gap ≥",
+                                    round(retraction_peel_gap_ps * particle_spacing * 1e3;
+                                          digits=3),
+                                    " mm",
+                                    clip_fth_skip_post_peel_cte ?
+                                        "; overlay CTE stays off (F_th already absorbed ΔT)" :
+                                        ("; then restore CTE in " *
+                                         string(retraction_qs_cool_step_C) * " K stages"))
+                            save_vtu_snapshot!(integrator)
+                        else
+                            apply_tool_temp_after_punch_lift!(integrator;
+                                when="at closed-die cool start (punch DOWN)")
+                            retraction_closed_die_cool_active[] = true
+                            retraction_closed_die_cool_start_t[] = integrator.t
+                            retraction_qs_cte_scale[] =
+                                retraction_qs_cte_ramp ? 0.0 : 1.0
+                            if retraction_qs_cool
+                                retraction_qs_stage_index[] = 0
+                                retraction_qs_stage_start_t[] = integrator.t
+                                retraction_qs_stage_target_C[] = Tmean_C
+                                retraction_qs_equil_streak[] = 0
+                                retraction_qs_prev_snap[] =
+                                    build_retraction_diag_snapshot(integrator, cyl_sys,
+                                        floor_sys, mold_sys, v_wrap_state)
+                                retraction_qs_next_sample_t[] =
+                                    integrator.t + retraction_qs_sample_s
+                                println(">>> Quasi-static closed-die cool: tools FIXED, kin ON at Tmean=",
+                                        round(Tmean_C; digits=2), " °C; cte_scale=",
+                                        round(retraction_qs_cte_scale[]; sigdigits=3),
+                                        retraction_qs_cte_ramp ? " (2 K ramp)" : " (bang)",
+                                        "; ΔT=", retraction_qs_cool_step_C,
+                                        " K; sample=", retraction_qs_sample_s,
+                                        " s; require rms|v|<",
+                                        retraction_qs_equil_rms_speed,
+                                        " m/s, max|v|<",
+                                        retraction_qs_equil_max_speed,
+                                        " m/s, |dspan_z/dt|<",
+                                        retraction_springback_equil_span_rate_mm_s,
+                                        " mm/s, J-floor≤",
+                                        retraction_qs_max_j_floor_n,
+                                        " before target ",
+                                        retraction_cool_before_lift_C, " °C")
+                            else
+                                println(">>> Closed-die cool (punch+floor ON, convection OFF, kin ON, CTE volumetric, no F_th teleport, ",
+                                        retraction_closed_die_cool_plastic ?
+                                            "hold_creep plastic ON, heat OFF" :
+                                            "plastic OFF (elastic+CTE), heat OFF",
+                                        "): t=",
+                                        round(integrator.t; digits=6),
+                                        " s  Tmean=", round(Tmean_C; digits=1),
+                                        " °C → lift when ≤ ",
+                                        retraction_cool_before_lift_C, " °C")
+                            end
+                        end
+                        flush(stdout)
+                    end
+                    if retraction_lift_first_after_frozen_cool
+                        # Punch motion + kinematic peel now own the transition.
+                    elseif retraction_qs_cool
+                        stage_elapsed = integrator.t - retraction_qs_stage_start_t[]
+                        snap_qs = nothing
+                        if integrator.t + 1.0e-12 >= retraction_qs_next_sample_t[]
+                            snap_qs = build_retraction_diag_snapshot(integrator, cyl_sys,
+                                                                    floor_sys, mold_sys,
+                                                                    v_wrap_state)
+                            prev_qs = retraction_qs_prev_snap[]
+                            sample_dt = prev_qs === nothing ? 0.0 :
+                                snap_qs.t - prev_qs.t
+                            span_rate = sample_dt > 0.0 ?
+                                abs((snap_qs.span_z_mm - prev_qs.span_z_mm) / sample_dt) :
+                                Inf
+                            sample_healthy =
+                                stage_elapsed >= retraction_qs_equil_min_s &&
+                                sample_dt >= 0.5 * retraction_qs_sample_s &&
+                                snap_qs.rms_speed <= retraction_qs_equil_rms_speed &&
+                                snap_qs.max_speed <= retraction_qs_equil_max_speed &&
+                                span_rate <= retraction_springback_equil_span_rate_mm_s &&
+                                retraction_last_J_floor_n[] <= retraction_qs_max_j_floor_n &&
+                                snap_qs.nonfinite_n == 0
+                            if sample_healthy
+                                retraction_qs_equil_streak[] += 1
+                            else
+                                retraction_qs_equil_streak[] = 0
+                            end
+                            println(">>> QS equilibrium sample: stage=",
+                                    retraction_qs_stage_index[], " Tmean=",
+                                    round(Tmean_C; digits=2), " °C cte=",
+                                    round(retraction_thermal_cte_scale(); sigdigits=3),
+                                    " rms|v|=",
+                                    round(snap_qs.rms_speed; sigdigits=4),
+                                    " max|v|=", round(snap_qs.max_speed; sigdigits=4),
+                                    " m/s |dspan_z/dt|=",
+                                    round(span_rate; sigdigits=4), " mm/s span_z=",
+                                    round(snap_qs.span_z_mm; digits=3),
+                                    " mm J_min=", round(snap_qs.J_min; sigdigits=3),
+                                    " J-floor=",
+                                    retraction_last_J_floor_n[], " streak=",
+                                    retraction_qs_equil_streak[], "/",
+                                    retraction_qs_equil_patience,
+                                    sample_healthy ? " ✓" : "")
+                            flush(stdout)
+                            if (retraction_qs_abort_span_z_active &&
+                                snap_qs.span_z_mm > retraction_qs_abort_span_z_mm) ||
+                               (retraction_qs_abort_on_j_min &&
+                                snap_qs.J_min < retraction_qs_abort_j_min)
+                                println(stderr,
+                                        ">>> QS COOL ABORT: span_z=",
+                                        round(snap_qs.span_z_mm; digits=3),
+                                        " mm J_min=", round(snap_qs.J_min; sigdigits=4),
+                                        " (limits span_z≤",
+                                        retraction_qs_abort_span_z_mm,
+                                        " mm, J_min≥",
+                                        retraction_qs_abort_j_min, "). Punch remains closed; no lift.")
+                                flush(stderr)
+                                save_vtu_snapshot!(integrator)
+                                terminate!(integrator)
+                            end
+                            retraction_qs_prev_snap[] = snap_qs
+                            retraction_qs_next_sample_t[] =
+                                integrator.t + retraction_qs_sample_s
+                        end
+
+                        stage_converged =
+                            retraction_qs_equil_streak[] >= retraction_qs_equil_patience
+                        if retraction_closed30_ckpt_saved[]
+                            settle_elapsed = integrator.t -
+                                retraction_closed30_settle_start_t[]
+                            if settle_elapsed + 1.0e-12 >= retraction_closed30_settle_s
+                                snap_b = build_retraction_diag_snapshot(integrator,
+                                    cyl_sys, floor_sys, mold_sys, v_wrap_state)
+                                shape_ok = snap_b.J_min >= max(retraction_qs_abort_j_min, 0.0) &&
+                                    (!retraction_qs_abort_span_z_active ||
+                                     snap_b.span_z_mm <= retraction_qs_abort_span_z_mm) &&
+                                    snap_b.nonfinite_n == 0
+                                if !shape_ok
+                                    println(stderr,
+                                            ">>> CLOSED30 SETTLE ABORT: span_z=",
+                                            round(snap_b.span_z_mm; digits=3),
+                                            " mm J_min=",
+                                            round(snap_b.J_min; sigdigits=4),
+                                            " — no checkpoint B, punch stays closed.")
+                                    flush(stderr)
+                                    save_vtu_snapshot!(integrator)
+                                    terminate!(integrator)
+                                else
+                                    save_named_retraction_checkpoint!(integrator,
+                                        retraction_closed30_settle_checkpoint_path,
+                                        "closed30_settle")
+                                    retraction_closed_die_cool_active[] = false
+                                    retraction_closed_die_cool_done[] = true
+                                    retraction_lift_start_time[] = integrator.t
+                                    println(">>> Checkpoint B OK (span_z=",
+                                            round(snap_b.span_z_mm; digits=3),
+                                            " mm J_min=",
+                                            round(snap_b.J_min; sigdigits=4),
+                                            "); starting punch lift")
+                                    flush(stdout)
+                                    save_vtu_snapshot!(integrator)
+                                end
+                            elseif integrator.t - retraction_indie_cool_last_print_t[] >= 0.5
+                                println(">>> Closed-die 30 °C settle: t=",
+                                        round(integrator.t; digits=3),
+                                        " s  elapsed=",
+                                        round(settle_elapsed; digits=3),
+                                        "/", retraction_closed30_settle_s,
+                                        " s  punch DOWN")
+                                flush(stdout)
+                                retraction_indie_cool_last_print_t[] = integrator.t
+                            end
+                        elseif stage_converged
+                            cte_now = retraction_thermal_cte_scale()
+                            if retraction_qs_cte_ramp && cte_now < 1.0 - 1.0e-12
+                                T_sf_C = T_stress_free - 273.15
+                                dT_full = max(abs(Tmean_C - T_sf_C),
+                                              retraction_qs_cool_step_C)
+                                d_scale = min(1.0 - retraction_qs_cte_scale[],
+                                              retraction_qs_cool_step_C / dT_full)
+                                scale_from = retraction_qs_cte_scale[]
+                                retraction_qs_cte_scale[] = scale_from + d_scale
+                                retraction_qs_stage_index[] += 1
+                                retraction_qs_stage_target_C[] = Tmean_C
+                                retraction_qs_stage_start_t[] = integrator.t
+                                retraction_qs_equil_streak[] = 0
+                                retraction_qs_prev_snap[] =
+                                    build_retraction_diag_snapshot(integrator, cyl_sys,
+                                        floor_sys, mold_sys, v_wrap_state)
+                                retraction_qs_next_sample_t[] =
+                                    integrator.t + retraction_qs_sample_s
+                                println(">>> QS CTE ramp stage ",
+                                        retraction_qs_stage_index[], ": cte_scale ",
+                                        round(scale_from; sigdigits=3), " → ",
+                                        round(retraction_qs_cte_scale[]; sigdigits=3),
+                                        " (≈", retraction_qs_cool_step_C, " K of ",
+                                        round(dT_full; digits=1),
+                                        " K vs T_stress_free); Tmean=",
+                                        round(Tmean_C; digits=2),
+                                        " °C; kin ON; tools fixed")
+                                flush(stdout)
+                                save_vtu_snapshot!(integrator)
+                            elseif Tmean_C <= retraction_cool_before_lift_C + 1.0e-8
+                                save_named_retraction_checkpoint!(integrator,
+                                    retraction_closed30_checkpoint_path,
+                                    "closed30")
+                                retraction_closed30_ckpt_saved[] = true
+                                retraction_closed30_settle_start_t[] = integrator.t
+                                println(">>> Checkpoint A (closed-die ",
+                                        round(Tmean_C; digits=1),
+                                        " °C, punch DOWN) at t=",
+                                        round(integrator.t; digits=6), " s")
+                                flush(stdout)
+                                save_vtu_snapshot!(integrator)
+                            else
+                                delta_C = min(retraction_qs_cool_step_C,
+                                              Tmean_C -
+                                              retraction_cool_before_lift_C)
+                                apply_charge_temperature_delta!(cyl_sys, integrator.p,
+                                                                v_ode_state, -delta_C)
+                                thermal_Fth_u_modified[] = true
+                                retraction_qs_stage_index[] += 1
+                                retraction_qs_stage_target_C[] = Tmean_C - delta_C
+                                retraction_qs_stage_start_t[] = integrator.t
+                                retraction_qs_equil_streak[] = 0
+                                retraction_qs_prev_snap[] =
+                                    build_retraction_diag_snapshot(integrator, cyl_sys,
+                                        floor_sys, mold_sys, v_wrap_state)
+                                retraction_qs_next_sample_t[] =
+                                    integrator.t + retraction_qs_sample_s
+                                println(">>> QS cool stage ",
+                                        retraction_qs_stage_index[], ": Tmean ",
+                                        round(Tmean_C; digits=2), " → ",
+                                        round(Tmean_C - delta_C; digits=2),
+                                        " °C; tools fixed; equilibrating")
+                                flush(stdout)
+                                save_vtu_snapshot!(integrator)
+                            end
+                        elseif stage_elapsed >= retraction_qs_equil_max_s
+                            snap_abort = snap_qs === nothing ?
+                                build_retraction_diag_snapshot(integrator, cyl_sys,
+                                    floor_sys, mold_sys, v_wrap_state) : snap_qs
+                            println(stderr,
+                                    ">>> QS COOL ABORT: stage ",
+                                    retraction_qs_stage_index[],
+                                    " did not equilibrate within ",
+                                    retraction_qs_equil_max_s,
+                                    " s at Tmean=", round(Tmean_C; digits=2),
+                                    " °C cte_scale=",
+                                    round(retraction_thermal_cte_scale(); sigdigits=3),
+                                    " (rms_speed=",
+                                    round(snap_abort.rms_speed; sigdigits=4),
+                                    ", max_speed=",
+                                    round(snap_abort.max_speed; sigdigits=4),
+                                    " m/s, span_z=", round(snap_abort.span_z_mm; digits=4),
+                                    " mm, J_min=", round(snap_abort.J_min; sigdigits=4),
+                                    ", J-floor=", retraction_last_J_floor_n[],
+                                    "). Punch remains closed; no lift.")
+                            flush(stderr)
+                            save_vtu_snapshot!(integrator)
+                            terminate!(integrator)
+                        end
+                    else
+                        cool_elapsed = integrator.t - retraction_closed_die_cool_start_t[]
+                        hit_T = Tmean_C <= retraction_cool_before_lift_C
+                        hit_dwell = cool_elapsed >= retraction_springback_dwell_s
+                        if hit_T || hit_dwell
+                            retraction_closed_die_cool_active[] = false
+                            retraction_closed_die_cool_done[] = true
+                            retraction_lift_start_time[] = integrator.t
+                            println(">>> Closed-die cool done at t=",
+                                    round(integrator.t; digits=6),
+                                    " s (Tmean=", round(Tmean_C; digits=1), " °C",
+                                    hit_T ? " ≤ " *
+                                            string(retraction_cool_before_lift_C) * " °C" :
+                                            "; dwell cap before T target",
+                                    "); starting punch lift")
+                            flush(stdout)
+                            save_vtu_snapshot!(integrator)
+                        elseif integrator.t - retraction_indie_cool_last_print_t[] >= 5.0
+                            println(">>> Closed-die cool: t=",
+                                    round(integrator.t; digits=3),
+                                    " s  Tmean=", round(Tmean_C; digits=1),
+                                    " °C  kin ON  (lift at ≤ ",
+                                    retraction_cool_before_lift_C, " °C)")
+                            flush(stdout)
+                            retraction_indie_cool_last_print_t[] = integrator.t
+                        end
+                    end
+                end
             end
 
             if retraction_started[] && !retraction_lift_started_announced[] &&
@@ -9142,6 +12991,7 @@ accepted_step_callback = DiscreteCallback(
 
             if retraction_started[] && retraction_lift_started_announced[]
                 maybe_update_kinematic_peel!(integrator, cyl_sys, floor_sys, mold_sys)
+                maybe_update_post_peel_cte_ramp!(integrator, cyl_sys)
             end
 
             if retraction_started[] && !mold_retraction_complete[]
@@ -9153,8 +13003,51 @@ accepted_step_callback = DiscreteCallback(
                 end
             end
 
+            if mold_retraction_complete[] && retraction_eject_enable &&
+               retraction_eject_after_cool &&
+               !retraction_eject_active[] && !retraction_eject_complete[] &&
+               !retraction_complete[]
+                Tmean_C = mean(cyl_sys.temp) - 273.15
+                cool_elapsed = integrator.t - mold_retraction_complete_time[]
+                hit_T = Tmean_C <= retraction_eject_at_temp_C
+                hit_dwell = cool_elapsed >= retraction_springback_dwell_s
+                cte_ready = clip_fth_skip_post_peel_cte ||
+                    !retraction_lift_first_after_frozen_cool ||
+                    retraction_qs_cte_scale[] >= 1.0 - 1.0e-12
+                if (hit_T || hit_dwell) && cte_ready
+                    println(">>> In-die cool done at t=", round(integrator.t; digits=6),
+                            " s (Tmean=", round(Tmean_C; digits=1), " °C",
+                            hit_T ? " ≤ " * string(retraction_eject_at_temp_C) * " °C" :
+                                    "; dwell cap before T target",
+                            "; CTE ready=", cte_ready, "); starting eject")
+                    flush(stdout)
+                    start_retraction_eject!(integrator)
+                elseif integrator.t - retraction_indie_cool_last_print_t[] >= 5.0
+                    println(">>> In-die cool: t=", round(integrator.t; digits=3),
+                            " s  Tmean=", round(Tmean_C; digits=1),
+                            " °C  (eject at ≤ ", retraction_eject_at_temp_C,
+                            " °C after CTE ready; cte_scale=",
+                            round(retraction_qs_cte_scale[]; sigdigits=4), ")")
+                    flush(stdout)
+                    retraction_indie_cool_last_print_t[] = integrator.t
+                end
+            end
+
+            if mold_retraction_complete[] && retraction_eject_enable &&
+               !retraction_eject_complete[]
+                maybe_update_retraction_eject!(integrator)
+            end
+
+            if mold_retraction_complete[] && retraction_eject_enable &&
+               retraction_eject_complete[] && !retraction_complete[] &&
+               retraction_springback_dwell_s <= 0.0
+                complete_retraction_simulation!(integrator;
+                    reason="demold eject complete (dwell=0)")
+            end
+
             if mold_retraction_complete[] && !retraction_complete[] &&
-               retraction_springback_dwell_s > 0.0
+               retraction_springback_dwell_s > 0.0 &&
+               (!retraction_eject_enable || retraction_eject_complete[])
                 # Charge still frozen after mold stroke: max_speed=0 is NOT springback
                 # equilibration. Wait until post-lift kin freeze ends, then dwell.
                 if retraction_charge_kinematics_gated(integrator.t)
@@ -9177,7 +13070,120 @@ accepted_step_callback = DiscreteCallback(
                         springback_equil_streak[] = 0
                     end
                     springback_equil_prev_snap[] = snap_eq
-                    if springback_equil_streak[] >= retraction_springback_equil_patience
+                    # Free-cool path: stop on mean T, not mechanical equilibration alone.
+                    # With FREEZE_MECH: cool thermal-only, then brief post-cool springback.
+                    if retraction_cool_until_active
+                        Tmean_C = mean(cyl_sys.temp) - 273.15
+                        if retraction_post_cool_springback_active[]
+                            sb_elapsed = integrator.t - retraction_post_cool_springback_start_t[]
+                            if retraction_post_cool_thermal_ramp_s > 0.0
+                                x_ramp = clamp(sb_elapsed / retraction_post_cool_thermal_ramp_s, 0.0, 1.0)
+                                retraction_post_cool_thermal_scale[] = x_ramp * x_ramp * (3.0 - 2.0 * x_ramp)
+                                if sb_elapsed < retraction_post_cool_thermal_ramp_s
+                                    # Nothing moves yet: do not count this as equilibrium.
+                                    springback_equil_streak[] = 0
+                                end
+                            end
+                            sb_dwell_target = retraction_post_cool_springback_s > 0.0 ?
+                                retraction_post_cool_springback_s : retraction_springback_dwell_s
+                            if springback_equil_streak[] >= retraction_springback_equil_patience ||
+                               sb_elapsed >= sb_dwell_target
+                                complete_retraction_simulation!(integrator;
+                                    reason=(springback_equil_streak[] >= retraction_springback_equil_patience ?
+                                            "post-cool springback equilibrated (Tmean=" :
+                                            "post-cool springback dwell timeout (Tmean=") *
+                                    string(round(Tmean_C; digits=1)) * " °C, span_z=" *
+                                    string(round(snap_eq.span_z_mm; digits=4)) * " mm, max_speed=" *
+                                    string(round(snap_eq.max_speed; sigdigits=3)) * " m/s)")
+                            end
+                        elseif Tmean_C <= retraction_cool_until_temp_C + 0.5
+                            post_eject_settle = retraction_eject_enable &&
+                                retraction_eject_complete[] &&
+                                (dwell_elapsed < max(retraction_post_eject_dwell_s, 0.05) &&
+                                 springback_equil_streak[] < retraction_springback_equil_patience)
+                            if post_eject_settle
+                                if integrator.t - retraction_indie_cool_last_print_t[] >= 0.05
+                                    println(">>> Post-eject live mechanics: t=",
+                                            round(integrator.t; digits=3),
+                                            " s  Tmean=", round(Tmean_C; digits=1),
+                                            " °C  span_z=", round(snap_eq.span_z_mm; digits=3),
+                                            " mm  (dwell ", round(dwell_elapsed; digits=3),
+                                            "/", retraction_post_eject_dwell_s, " s)")
+                                    flush(stdout)
+                                    retraction_indie_cool_last_print_t[] = integrator.t
+                                end
+                            elseif retraction_bang_t_after_eject &&
+                               (!retraction_post_eject_bang_done[] ||
+                                integrator.t < retraction_post_eject_bang_t[] +
+                                    retraction_post_eject_dwell_s - 1.0e-14)
+                                # Wait for post-eject mechanical response at room T.
+                            elseif retraction_freeze_mech_after_eject &&
+                               retraction_post_cool_springback_s > 0.0
+                                retraction_post_cool_springback_active[] = true
+                                retraction_post_cool_springback_start_t[] = integrator.t
+                                retraction_post_cool_thermal_scale[] =
+                                    retraction_post_cool_thermal_ramp_s > 0.0 ? 0.0 : 1.0
+                                springback_equil_streak[] = 0
+                                enforce_explicit_retraction_dt!(integrator)
+                                if !retraction_post_cool_springback_announced[]
+                                    println(">>> Cool target reached (Tmean=",
+                                            round(Tmean_C; digits=1),
+                                            " °C): releasing mechanics for post-cool springback ",
+                                            retraction_post_cool_springback_s,
+                                            " s (T re-frozen, dt=",
+                                            retraction_explicit_dt, " s)")
+                                    flush(stdout)
+                                    retraction_post_cool_springback_announced[] = true
+                                    save_vtu_snapshot!(integrator)
+                                end
+                            elseif springback_equil_streak[] >= retraction_springback_equil_patience
+                                complete_retraction_simulation!(integrator;
+                                    reason="free cool target reached and springback equilibrated (Tmean=" *
+                                    string(round(Tmean_C; digits=1)) * " °C ≤ " *
+                                    string(retraction_cool_until_temp_C) * " °C, max_speed=" *
+                                    string(round(snap_eq.max_speed; sigdigits=3)) * " m/s, span_z=" *
+                                    string(round(snap_eq.span_z_mm; digits=4)) * " mm)")
+                            elseif dwell_elapsed >= retraction_springback_dwell_s
+                                complete_retraction_simulation!(integrator;
+                                    reason="springback dwell timeout reached at cool target (Tmean=" *
+                                    string(round(Tmean_C; digits=1)) * " °C, max_speed=" *
+                                    string(round(snap_eq.max_speed; sigdigits=3)) * " m/s, span_z=" *
+                                    string(round(snap_eq.span_z_mm; digits=4)) * " mm)")
+                            else
+                                if integrator.t - retraction_indie_cool_last_print_t[] >= 0.1
+                                    println(">>> Post-cool equilibrating: t=",
+                                            round(integrator.t; digits=3),
+                                            " s  Tmean=", round(Tmean_C; digits=1),
+                                            " °C  span_z=", round(snap_eq.span_z_mm; digits=3),
+                                            " mm  max_speed=", round(snap_eq.max_speed; sigdigits=3),
+                                            " m/s  equil streak=", springback_equil_streak[], "/", retraction_springback_equil_patience)
+                                    flush(stdout)
+                                    retraction_indie_cool_last_print_t[] = integrator.t
+                                end
+                            end
+                        else
+                            print_dt = max(retraction_explicit_target_dt(integrator.t), 1.0)
+                            if integrator.t - retraction_indie_cool_last_print_t[] >= print_dt
+                                println(">>> Free cool: t=", round(integrator.t; digits=3),
+                                        " s  Tmean=", round(Tmean_C; digits=1),
+                                        " °C  span_x=", round(snap_eq.span_x_mm; digits=2),
+                                        " mm span_z=", round(snap_eq.span_z_mm; digits=2),
+                                        " mm J_min=", round(snap_eq.J_min; sigdigits=3),
+                                        "  (stop at ≤ ", retraction_cool_until_temp_C,
+                                        " °C; dt=", retraction_explicit_target_dt(integrator.t), " s",
+                                        retraction_freeze_mech_after_eject ? "; mech frozen" : "",
+                                        ")")
+                                flush(stdout)
+                                retraction_indie_cool_last_print_t[] = integrator.t
+                            end
+                            if dwell_elapsed >= retraction_springback_dwell_s
+                                complete_retraction_simulation!(integrator;
+                                    reason="springback dwell time reached before cool target (Tmean=" *
+                                    string(round(Tmean_C; digits=1)) * " °C, span_z=" *
+                                    string(round(snap_eq.span_z_mm; digits=4)) * " mm)")
+                            end
+                        end
+                    elseif springback_equil_streak[] >= retraction_springback_equil_patience
                         complete_retraction_simulation!(integrator;
                             reason="springback equilibrated (max_speed=" *
                             string(round(snap_eq.max_speed; sigdigits=3)) * " m/s, span_z=" *
@@ -9304,26 +13310,57 @@ accepted_step_callback = DiscreteCallback(
                 diag_prev_nnonliniter[] = stats.nnonliniter
                 diag_prev_nreject[]     = stats.nreject
             end
+            clip_commit_reduced_accepted_state!(integrator, v_ode_state, u_ode_state)
+            u_modified!(integrator, thermal_Fth_u_modified[])
+            thermal_Fth_u_modified[] = false
         end)
 
 const retraction_save_final = sim_phase == "retraction" &&
     env_int("TP_CLIP_RETRACTION_SAVE_FINAL", 1) != 0
-vtu_save_callback = if sim_phase == "retraction"
+vtu_save_callback = if clip_reduced_ode_active()
+    # The stock callback assumes integrator.u=[v,u]. The reduced state is [u,T],
+    # so route output through the compatibility reconstruction helper.
+    let save_index = Ref(1)
+        DiscreteCallback(
+            (u, t, integrator) ->
+                save_index[] <= length(compress_hold_vtu_save_times) &&
+                t + 1.0e-12 >= compress_hold_vtu_save_times[save_index[]],
+            integrator -> begin
+                save_vtu_snapshot!(integrator)
+                while save_index[] <= length(compress_hold_vtu_save_times) &&
+                      integrator.t + 1.0e-12 >=
+                          compress_hold_vtu_save_times[save_index[]]
+                    save_index[] += 1
+                end
+                u_modified!(integrator, false)
+            end;
+            save_positions=(false, false))
+    end
+elseif sim_phase == "retraction"
     SolutionSavingCallback(dt=retraction_vtu_save_dt,
+                           output_directory=clip_out_dir,
                            prefix=vtu_output_prefix,
                            save_final_solution=retraction_save_final,
                            max_coordinates=Inf,
-                           fiber_vf=vtu_fiber_vf_quantity)
+                           fiber_vf=vtu_fiber_vf_quantity,
+                           a11=vtu_a11_quantity,
+                           a22=vtu_a22_quantity,
+                           a33=vtu_a33_quantity)
 else
     SolutionSavingCallback(save_times=compress_hold_vtu_save_times,
+                           output_directory=clip_out_dir,
                            prefix=vtu_output_prefix,
                            save_final_solution=true,
                            max_coordinates=Inf,
-                           fiber_vf=vtu_fiber_vf_quantity)
+                           fiber_vf=vtu_fiber_vf_quantity,
+                           a11=vtu_a11_quantity,
+                           a22=vtu_a22_quantity,
+                           a33=vtu_a33_quantity)
 end
 info_callback = InfoCallback(interval=retraction_info_interval)
 const peak_punch_force_z = Ref(0.0)
 const force_print_counter = Ref(0)
+const force_print_interval = max(1, env_int("TP_CLIP_FORCE_PRINT_INTERVAL", 100))
 
 press_force_limit_callback = DiscreteCallback(
     (u, t, integrator) -> begin
@@ -9332,7 +13369,7 @@ press_force_limit_callback = DiscreteCallback(
                 peak_punch_force_z[] = punch_contact_force_z[]
             end
             force_print_counter[] += 1
-            if force_print_counter[] % 100 == 0
+            if force_print_counter[] % force_print_interval == 0
                 println(">>> [t=", round(t; digits=5), " s] Current punch force: ", round(punch_contact_force_z[]; digits=2), " N (Peak so far: ", round(peak_punch_force_z[]; digits=2), " N)")
                 flush(stdout)
             end
@@ -9387,17 +13424,22 @@ retraction_dtmax  = env_float("TP_CLIP_DTMAX",  phase_dtmax)
 if sim_phase in ("full", "hold") && charge_hold_dtmax_active[]
     retraction_dtmax = charge_hold_phase_dtmax
 end
+if sim_phase == "hold" && hold_checkpoint_restore !== nothing && hold_tlsph_tail_active(hold_checkpoint_restore["t"])
+    retraction_dtmax = env_float("TP_CLIP_HOLD_TAIL_DTMAX", 1.0e-3)
+end
 
 
 # Offline gap / penetration audit from a hold checkpoint (no ODE solve).
-#   TP_CLIP_AUDIT_CHECKPOINT_GAPS=1 TP_CLIP_CHECKPOINT=out/...dat julia ... implicit.jl
-if env_int("TP_CLIP_AUDIT_CHECKPOINT_GAPS", 0) != 0
+# Opt-in ONLY via TP_CLIP_RUN_GAP_AUDIT_ONLY=1 (TP_CLIP_AUDIT_CHECKPOINT_GAPS is
+# force-cleared by the 3d driver — leaked =1 aborted real retractions via exit(0)).
+#   TP_CLIP_RUN_GAP_AUDIT_ONLY=1 TP_CLIP_CHECKPOINT=out/...dat julia ... implicit.jl
+if env_int("TP_CLIP_RUN_GAP_AUDIT_ONLY", 0) != 0
     let
         ck_aud = load_hold_checkpoint(checkpoint_path)
         restore_hold_checkpoint_state!(ck_aud, semi)
         cyl_sys = semi.systems[1]
-        floor_sys = semi.systems[2]
-        mold_sys = semi.systems[3]
+        floor_sys = clip_floor_system(semi)
+        mold_sys = clip_mold_system(semi)
         local n_floor_pen = 0
         local n_mold_pen = 0
         local min_floor_g = Inf
@@ -9509,7 +13551,8 @@ sol = clip_gpu_allowscalar() do
     if clip_use_explicit_solver()
         explicit_alg, explicit_scheme_name = clip_explicit_euler_algorithm()
         explicit_dt = compression_use_explicit ? compression_explicit_dt :
-            (retraction_pre_lift_creep_s > 0.0 ? retraction_explicit_dt : retraction_explicit_dt_springback)
+            (retraction_pre_lift_creep_s > 0.0 ? retraction_explicit_dt_mech_off :
+                retraction_explicit_dt_springback)
         explicit_phase = compression_use_explicit ? "compression" : "retraction"
         explicit_ignore_unstable = compression_use_explicit ?
             compression_explicit_ignore_unstable : retraction_explicit_ignore_unstable
@@ -9517,7 +13560,7 @@ sol = clip_gpu_allowscalar() do
                 ", ", explicit_phase, " solver=explicit ", explicit_scheme_name,
                 ", dt=", explicit_dt,
                 compression_use_explicit ? "" :
-                    ", freeze T=$(retraction_explicit_freeze_t)", ")")
+                    ", freeze T=$(retraction_unfreeze_t_after_punch_lift ? "demold-frozen→unfreeze after punch lift" : (retraction_unfreeze_t_after_eject ? "demold-frozen→unfreeze after eject" : (retraction_explicit_freeze_t ? "always" : "off")))", ")")
         flush(stdout)
         if explicit_ignore_unstable
             solve(ode, explicit_alg;
@@ -9554,7 +13597,8 @@ sol = clip_gpu_allowscalar() do
         jacobian_autodiff = (use_matrix_free || use_custom_jac) ? nothing :
             (retraction_cfrp_style && !haskey(ENV, "TP_CLIP_JACOBIAN_MODE") ?
                 AutoFiniteDiff() : clip_jacobian_autodiff(clip_jacobian_mode()))
-        n_ode_dof = length(v0_ode) + length(u0_ode)
+        n_ode_dof = clip_ode_reduced[] ? length(ode.u0) :
+            length(v0_ode) + length(u0_ode)
         linsolve_default = use_matrix_free ? "gmres" :
             ((retraction_cfrp_style && n_ode_dof >= 500) ? "gmres" : "dense")
         linsolve_solver = clip_linsolve_solver(n_ode_dof;
@@ -9579,7 +13623,9 @@ sol = clip_gpu_allowscalar() do
         nlsolve = retraction_cfrp_style ? NLNewton() :
             NLNewton(κ=env_float("TP_CLIP_NEWTON_KAPPA", 0.1),
                      max_iter=env_int("TP_CLIP_NEWTON_MAX_ITER", 20),
-                     fast_convergence_cutoff=0.9, always_new=false)
+                     fast_convergence_cutoff=env_float("TP_CLIP_NEWTON_FAST_CUTOFF", 0.9),
+                     new_W_dt_cutoff=env_float("TP_CLIP_NEWTON_NEW_W_DT_CUTOFF", 1 / 5),
+                     always_new=env_int("TP_CLIP_NEWTON_ALWAYS_NEW", 0) != 0)
         implicit_alg = clip_build_implicit_algorithm(integrator_mode;
                                                      linsolve_solver=linsolve_solver,
                                                      use_matrix_free=use_matrix_free,
@@ -9590,6 +13636,9 @@ sol = clip_gpu_allowscalar() do
                 ", jacobian_strategy=", jacobian_strategy,
                 ", jacobian=", jacobian_mode,
                 ", linsolve=", linsolve_name, ", n_dof=", n_ode_dof,
+                clip_jac_reuse_entries ?
+                    ", jac_entry_reuse=every_$(clip_jac_reuse_max_steps)_requests" :
+                    ", jac_entry_reuse=off",
                 env_int("TP_CLIP_ADAPTIVE", 1) == 0 ?
                     ", adaptive=false, fixed_dt=$(env_float("TP_CLIP_FIXED_DT",
                         env_float("TP_CLIP_DT0", 1.0e-6)))" :
@@ -9599,7 +13648,8 @@ sol = clip_gpu_allowscalar() do
         # Guard against OrdinaryDiffEq auto-initial-dt producing NaN when the initial RHS
         # has NaNs in a Newton trial (e.g. stiff contact/packing transients). A finite dt0
         # keeps the integrator well-posed; adaptivity will quickly adjust it.
-        dt0 = env_float("TP_CLIP_DT0", 1.0e-6)
+        default_dt0 = (sim_phase == "hold" && hold_checkpoint_restore !== nothing && hold_tlsph_tail_active(hold_checkpoint_restore["t"])) ? 1.0e-4 : 1.0e-6
+        dt0 = env_float("TP_CLIP_DT0", default_dt0)
         dtmin0 = env_float("TP_CLIP_DTMIN", 1.0e-12)
         clip_last_synced_integrator_dt[] = -1.0
         clip_integrator_dt[] = dt0
